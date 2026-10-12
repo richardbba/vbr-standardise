@@ -308,6 +308,244 @@ function Write-AtomicJson {
 #endregion Core
 
 #region Outcome
+# The RMM report (spec 6.4). Its key order is the order of the fields on the
+# summary line. Status fields start as UNKNOWN and text fields as ''.
+function New-RunReport {
+    param([Parameter(Mandatory)][string] $Mode)
+    return [ordered]@{
+        Computer       = $env:COMPUTERNAME
+        Timestamp      = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssK', [System.Globalization.CultureInfo]::InvariantCulture)
+        Mode           = $Mode
+        VbrVersion     = ''
+        PgMajor        = ''
+        SvcAccount     = 'UNKNOWN'
+        DbAuth         = 'UNKNOWN'
+        PgHba          = 'UNKNOWN'
+        PgIdent        = 'UNKNOWN'
+        PgPassword     = 'UNKNOWN'
+        Stage          = 'UNTOUCHED'
+        Outcome        = 'UNKNOWN'
+        ExitCode       = ''
+        IssueCode      = ''
+        ActionRequired = ''
+        Detail         = ''
+        LogPath        = ''
+    }
+}
+
+# Records one issue for this run in $script:Issues (an ArrayList, created when
+# missing). Every check reports here; Complete-Run picks the exit code from the
+# whole list (spec 6.2).
+function Add-RunIssue {
+    param(
+        [Parameter(Mandatory)][string] $Code,
+        [Parameter(Mandatory)][int] $ExitCode,
+        [string] $Detail = '',
+        [string] $Action = ''
+    )
+    $list = Get-Variable -Name Issues -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if (-not ($list -is [System.Collections.ArrayList])) {
+        $newList = New-Object System.Collections.ArrayList
+        if ($null -ne $list) {
+            foreach ($oldIssue in @($list)) {
+                if ($null -ne $oldIssue) { [void]$newList.Add($oldIssue) }
+            }
+        }
+        $script:Issues = $newList
+        $list = $newList
+    }
+    [void]$list.Add([pscustomobject]@{
+        Code     = $Code
+        ExitCode = $ExitCode
+        Detail   = $Detail
+        Action   = $Action
+    })
+    $level = 'WARN'
+    if ($ExitCode -ge 40) { $level = 'ERROR' }
+    Write-Log ('Issue {0} (exit {1}): {2}' -f $Code, $ExitCode, $Detail) $level
+}
+
+# Default ActionRequired text for each exit code (spec 6.2).
+function Get-RmmActionForExitCode {
+    param([Parameter(Mandatory)][int] $ExitCode)
+    switch ($ExitCode) {
+        0  { return 'None' }
+        5  { return 'Read Detail. Fix the drift by re-running with -Apply, or do what the issue asks, then re-run.' }
+        10 { return 'Retry this script later.' }
+        11 { return 'This server is outside the scope of this script. Handle it by hand.' }
+        20 { return 'Fix the preflight failure in Detail, then re-run.' }
+        40 { return 'PAGE AN OPERATOR. A change failed and the script restored the server. Read Detail and the run folder before any re-run.' }
+        50 { return 'PAGE AN OPERATOR NOW. VBR may be down. Follow the manual recovery steps in the README.' }
+        default { return 'Investigate the undocumented exit code.' }
+    }
+}
+
+# Picks the run result from all issues: the highest ExitCode wins, and on a tie the
+# earliest issue wins. Detail lists every issue as 'CODE: detail' (just 'CODE' when
+# the issue has no detail), joined by ' | '. Issues may be objects or hashtables.
+function Resolve-RunOutcome {
+    param([AllowNull()][AllowEmptyCollection()][object[]] $Issues = @())
+    $winner = $null
+    $winnerCode = -1
+    $parts = New-Object System.Collections.ArrayList
+    foreach ($issue in @($Issues)) {
+        if ($null -eq $issue) { continue }
+        $code = [string](Get-CfgValue -Object $issue -Name 'Code' -Default '')
+        $exitCode = [int](Get-CfgValue -Object $issue -Name 'ExitCode' -Default 0)
+        $detail = [string](Get-CfgValue -Object $issue -Name 'Detail' -Default '')
+        if ($detail) { [void]$parts.Add(('{0}: {1}' -f $code, $detail)) } else { [void]$parts.Add($code) }
+        if ($exitCode -gt $winnerCode) {
+            $winner = $issue
+            $winnerCode = $exitCode
+        }
+    }
+    if ($null -eq $winner) {
+        return [pscustomobject]@{ ExitCode = 0; IssueCode = ''; ActionRequired = 'None'; Detail = '' }
+    }
+    $action = [string](Get-CfgValue -Object $winner -Name 'Action' -Default '')
+    if (-not $action) { $action = Get-RmmActionForExitCode -ExitCode $winnerCode }
+    return [pscustomobject]@{
+        ExitCode       = $winnerCode
+        IssueCode      = [string](Get-CfgValue -Object $winner -Name 'Code' -Default '')
+        ActionRequired = $action
+        Detail         = ($parts.ToArray() -join ' | ')
+    }
+}
+
+# The RMM summary block (the updater's format): a header, one 'Key=Value; Key=Value' line
+# with every report field, the action and issue lines when they apply, a footer.
+function Format-RmmSummary {
+    param([Parameter(Mandatory)][System.Collections.IDictionary] $Report)
+    $pairs = New-Object System.Collections.ArrayList
+    foreach ($key in @($Report.Keys)) {
+        [void]$pairs.Add(('{0}={1}' -f $key, (Format-ShortText -Text ([string]$Report[$key]))))
+    }
+    $lines = New-Object System.Collections.ArrayList
+    [void]$lines.Add('=== RMM SUMMARY ===')
+    [void]$lines.Add(($pairs.ToArray() -join '; '))
+    $action = [string](Get-CfgValue -Object $Report -Name 'ActionRequired' -Default '')
+    if ($action -and $action -ne 'None') {
+        [void]$lines.Add(('RMM ACTION: {0}' -f (Format-ShortText -Text $action)))
+    }
+    $issueCode = [string](Get-CfgValue -Object $Report -Name 'IssueCode' -Default '')
+    if ($issueCode) {
+        $detail = [string](Get-CfgValue -Object $Report -Name 'Detail' -Default '')
+        [void]$lines.Add(('RMM ISSUE: {0} | {1}' -f $issueCode, (Format-ShortText -Text $detail)))
+    }
+    [void]$lines.Add('===================')
+    return [string[]]$lines.ToArray()
+}
+
+# What the trap does for an unexpected error, by stage (spec 7.6).
+function Get-TrapAction {
+    param([string] $Stage = '')
+    switch ($Stage) {
+        'PATH_A_WRITING'  { return 'RESTORE_PATH_A' }
+        'PATH_A_DONE'     { return 'NO_ROLLBACK' }
+        'VERIFIED'        { return 'NO_ROLLBACK' }
+        'PATH_B_CHANGING' { return 'ROLLBACK_PATH_B' }
+        default           { return 'EXIT_UNHANDLED' }
+    }
+}
+
+# Ends the run: resolves every issue, fills $script:Report, prints the RMM summary,
+# writes <WorkRoot>\logs\last-result.json (only when $script:WorkRootReady is $true),
+# stops the transcript, releases the run lock and exits. It never returns.
+# Script variables, all read defensively: Issues, Report, Stage, WorkRoot (the
+# script parameter), WorkRootReady, TranscriptStarted, RunLock. CompleteRunActive
+# guards against a second call from the trap. -ExitCode without -Code raises the
+# exit code to at least that value. -Detail without -Code is a note, not an issue:
+# it goes at the end of Detail, so a run that exits 0 can still list what it did
+# (spec 7.5 and 7.6 step 13: commented-out pg_hba.conf lines, roles that lost login).
+function Complete-Run {
+    param(
+        [int] $ExitCode = 0,
+        [string] $Code = '',
+        [string] $Detail = '',
+        [string] $Action = ''
+    )
+    if ((Get-Variable -Name CompleteRunActive -Scope Script -ValueOnly -ErrorAction SilentlyContinue) -eq $true) {
+        exit $ExitCode
+    }
+    $script:CompleteRunActive = $true
+
+    if ($Code) {
+        Add-RunIssue -Code $Code -ExitCode $ExitCode -Detail $Detail -Action $Action
+    }
+    $issues = @()
+    $issueList = Get-Variable -Name Issues -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $issueList) { $issues = @($issueList) }
+    $outcome = Resolve-RunOutcome -Issues $issues
+    $finalCode = [int]$outcome.ExitCode
+    $issueCode = [string]$outcome.IssueCode
+    $actionText = [string]$outcome.ActionRequired
+    if (-not $Code -and $PSBoundParameters.ContainsKey('ExitCode') -and $ExitCode -gt $finalCode) {
+        $finalCode = $ExitCode
+        $actionText = Get-RmmActionForExitCode -ExitCode $finalCode
+    }
+
+    $report = Get-Variable -Name Report -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if (-not ($report -is [System.Collections.IDictionary])) {
+        $report = New-RunReport -Mode 'UNKNOWN'
+        $script:Report = $report
+    }
+    $stage = [string](Get-Variable -Name Stage -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
+    if (-not $stage) { $stage = 'UNTOUCHED' }
+    $fullDetail = [string]$outcome.Detail
+    if (-not $Code -and $Detail) {
+        if ($fullDetail) { $fullDetail = '{0} | {1}' -f $fullDetail, $Detail } else { $fullDetail = $Detail }
+    }
+    if ($fullDetail.Length -gt 900) { Write-Log ('Full detail: {0}' -f $fullDetail) 'INFO' }
+
+    $report['Stage'] = $stage
+    $report['ExitCode'] = $finalCode
+    $report['IssueCode'] = $issueCode
+    $report['ActionRequired'] = $actionText
+    $report['Detail'] = Format-ShortText -Text $fullDetail -MaxLength 900
+    if ($finalCode -eq 0) {
+        $report['Outcome'] = 'OK'
+    } elseif ($issueCode) {
+        $report['Outcome'] = $issueCode
+    } else {
+        $report['Outcome'] = 'UNKNOWN'
+    }
+
+    Write-Host ''
+    foreach ($summaryLine in @(Format-RmmSummary -Report $report)) {
+        if ($summaryLine -like '=== RMM SUMMARY*') {
+            Write-Host $summaryLine -ForegroundColor Magenta
+        } elseif ($summaryLine -like 'RMM ACTION:*' -or $summaryLine -like 'RMM ISSUE:*') {
+            Write-Host $summaryLine -ForegroundColor Yellow
+        } else {
+            Write-Host $summaryLine
+        }
+    }
+
+    if ((Get-Variable -Name WorkRootReady -Scope Script -ValueOnly -ErrorAction SilentlyContinue) -eq $true) {
+        $root = [string](Get-Variable -Name WorkRoot -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
+        if ($root) {
+            try {
+                Write-AtomicJson -Path (Join-Path (Join-Path $root 'logs') 'last-result.json') -Object $report
+            } catch {
+                Write-Log ('Could not write last-result.json: {0}' -f $_.Exception.Message) 'WARN'
+            }
+        }
+    }
+
+    if ((Get-Variable -Name TranscriptStarted -Scope Script -ValueOnly -ErrorAction SilentlyContinue) -eq $true) {
+        try { Stop-Transcript | Out-Null } catch { Write-Log ('Could not stop the transcript: {0}' -f $_.Exception.Message) 'WARN' }
+        $script:TranscriptStarted = $false
+    }
+
+    $lock = Get-Variable -Name RunLock -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $lock) {
+        # Exit-RunLock (Task 3) never throws; the catch also covers a build without it.
+        try { Exit-RunLock -Mutex $lock } catch { Write-Log ('Could not release the run lock: {0}' -f $_.Exception.Message) 'WARN' }
+        $script:RunLock = $null
+    }
+
+    exit $finalCode
+}
 #endregion Outcome
 
 #region Preflight

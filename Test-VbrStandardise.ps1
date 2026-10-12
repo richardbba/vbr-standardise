@@ -290,6 +290,208 @@ Check 'T1 Write-AtomicJson string field' $t1Back.Name 'x'
 Check 'T1 Write-AtomicJson number field' $t1Back.Number 3
 Check 'T1 Write-AtomicJson keeps nested arrays' (@($t1Back.Nested.Inner) -join ',') '1,2'
 
+# --- Task 2: Run outcome, RMM summary and Complete-Run ---
+Write-Host '--- Task 2: Run outcome, RMM summary and Complete-Run ---'
+
+# New-RunReport
+$t2Report = New-RunReport -Mode 'AUDIT'
+Check 'T2 report is an ordered dictionary' ($t2Report -is [System.Collections.Specialized.OrderedDictionary]) 'True'
+Check 'T2 report key order' (@($t2Report.Keys) -join ',') 'Computer,Timestamp,Mode,VbrVersion,PgMajor,SvcAccount,DbAuth,PgHba,PgIdent,PgPassword,Stage,Outcome,ExitCode,IssueCode,ActionRequired,Detail,LogPath'
+Check 'T2 report Computer' $t2Report['Computer'] $env:COMPUTERNAME
+Check 'T2 report Timestamp format' ($t2Report['Timestamp'] -cmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})$') 'True'
+Check 'T2 report Mode' $t2Report['Mode'] 'AUDIT'
+Check 'T2 report Stage' $t2Report['Stage'] 'UNTOUCHED'
+Check 'T2 report ExitCode is an empty string' ($t2Report['ExitCode'] -is [string] -and $t2Report['ExitCode'] -eq '') 'True'
+foreach ($t2Key in @('SvcAccount', 'DbAuth', 'PgHba', 'PgIdent', 'PgPassword', 'Outcome')) {
+    Check "T2 report $t2Key starts UNKNOWN" $t2Report[$t2Key] 'UNKNOWN'
+}
+foreach ($t2Key in @('VbrVersion', 'PgMajor', 'IssueCode', 'ActionRequired', 'Detail', 'LogPath')) {
+    Check "T2 report $t2Key starts empty" ($t2Report[$t2Key] -is [string] -and $t2Report[$t2Key] -eq '') 'True'
+}
+
+# Add-RunIssue
+Remove-Variable -Name Issues -Scope Script -ErrorAction SilentlyContinue
+[void]$script:LogLines.Clear()
+Add-RunIssue -Code 'SVC_ACCOUNT_MISSING' -ExitCode 5 -Detail 'svc_veeam does not exist' -Action 'Set RMM secure variable VEEAM_SVC_PASSWORD and re-run with -CreateServiceAccount'
+Add-RunIssue -Code 'PG_HBA_NOT_STANDARD' -ExitCode 5
+Check 'T2 Add-RunIssue creates an ArrayList' ($script:Issues -is [System.Collections.ArrayList]) 'True'
+Check 'T2 Add-RunIssue appends' $script:Issues.Count 2
+Check 'T2 Add-RunIssue Code' $script:Issues[0].Code 'SVC_ACCOUNT_MISSING'
+Check 'T2 Add-RunIssue ExitCode is int' ($script:Issues[0].ExitCode -is [int]) 'True'
+Check 'T2 Add-RunIssue Detail' $script:Issues[0].Detail 'svc_veeam does not exist'
+Check 'T2 Add-RunIssue Action' $script:Issues[0].Action 'Set RMM secure variable VEEAM_SVC_PASSWORD and re-run with -CreateServiceAccount'
+Check 'T2 Add-RunIssue default Detail' $script:Issues[1].Detail ''
+Check 'T2 Add-RunIssue default Action' $script:Issues[1].Action ''
+Check 'T2 Add-RunIssue logs the issue' (@($script:LogLines | Where-Object { $_ -like '`[WARN`] Issue PG_HBA_NOT_STANDARD (exit 5)*' }).Count) 1
+$script:Issues = @([pscustomobject]@{ Code = 'OLD_ISSUE'; ExitCode = 5; Detail = ''; Action = '' })
+Add-RunIssue -Code 'NEW_ISSUE' -ExitCode 10
+Check 'T2 Add-RunIssue keeps items from a plain array' ((@($script:Issues) | ForEach-Object { $_.Code }) -join ',') 'OLD_ISSUE,NEW_ISSUE'
+Remove-Variable -Name Issues -Scope Script -ErrorAction SilentlyContinue
+[void]$script:LogLines.Clear()
+
+# Get-RmmActionForExitCode
+Check 'T2 action for 0 is None' (Get-RmmActionForExitCode -ExitCode 0) 'None'
+$t2Actions = @(5, 10, 11, 20, 40, 50 | ForEach-Object { Get-RmmActionForExitCode -ExitCode $_ })
+Check 'T2 each failure code has its own action' (@($t2Actions | Where-Object { $_ -and $_ -ne 'None' } | Select-Object -Unique).Count) 6
+Check 'T2 action for 40 pages an operator' ((Get-RmmActionForExitCode -ExitCode 40) -clike 'PAGE AN OPERATOR. *') 'True'
+Check 'T2 action for 50 pages an operator now' ((Get-RmmActionForExitCode -ExitCode 50) -clike 'PAGE AN OPERATOR NOW. *') 'True'
+Check 'T2 action for an unknown code' (Get-RmmActionForExitCode -ExitCode 99) 'Investigate the undocumented exit code.'
+
+# Resolve-RunOutcome
+$t2None = Resolve-RunOutcome -Issues @()
+Check 'T2 no issues' ('{0}|{1}|{2}|{3}' -f $t2None.ExitCode, $t2None.IssueCode, $t2None.ActionRequired, $t2None.Detail) '0||None|'
+$t2Null = Resolve-RunOutcome -Issues $null
+Check 'T2 null issues' ('{0}|{1}|{2}|{3}' -f $t2Null.ExitCode, $t2Null.IssueCode, $t2Null.ActionRequired, $t2Null.Detail) '0||None|'
+$t2Issues = @(
+    [pscustomobject]@{ Code = 'PG_HBA_NOT_STANDARD'; ExitCode = 5; Detail = 'two LAN lines'; Action = '' },
+    [pscustomobject]@{ Code = 'VEEAM_BUSY'; ExitCode = 10; Detail = 'VeeamAgent.exe is running'; Action = '' },
+    [pscustomobject]@{ Code = 'PG_IDENT_NOT_STANDARD'; ExitCode = 5; Detail = ''; Action = 'Custom action' }
+)
+$t2Outcome = Resolve-RunOutcome -Issues $t2Issues
+Check 'T2 highest exit code wins' $t2Outcome.ExitCode 10
+Check 'T2 outcome ExitCode is int' ($t2Outcome.ExitCode -is [int]) 'True'
+Check 'T2 winner IssueCode' $t2Outcome.IssueCode 'VEEAM_BUSY'
+Check 'T2 winner without Action gets the default' $t2Outcome.ActionRequired (Get-RmmActionForExitCode -ExitCode 10)
+Check 'T2 Detail lists every issue' $t2Outcome.Detail 'PG_HBA_NOT_STANDARD: two LAN lines | VEEAM_BUSY: VeeamAgent.exe is running | PG_IDENT_NOT_STANDARD'
+$t2Tie = Resolve-RunOutcome -Issues @($t2Issues[2], $t2Issues[0])
+Check 'T2 tie goes to the earliest issue' $t2Tie.IssueCode 'PG_IDENT_NOT_STANDARD'
+Check 'T2 winner Action is used' $t2Tie.ActionRequired 'Custom action'
+$t2Hash = Resolve-RunOutcome -Issues @(@{ Code = 'MARKER_PRESENT'; ExitCode = 50; Detail = 'C:\ProgramData\VeeamStandardise\CHANGES-IN-PROGRESS.marker' })
+Check 'T2 hashtable issues are accepted' ('{0} {1}' -f $t2Hash.ExitCode, $t2Hash.IssueCode) '50 MARKER_PRESENT'
+
+# Format-RmmSummary
+$t2Sum = [ordered]@{ Computer = 'HOST1'; Mode = 'AUDIT'; ExitCode = 5; IssueCode = 'PG_HBA_NOT_STANDARD'; ActionRequired = 'Run with -Apply'; Detail = "line one`r`n   line two" }
+$t2Lines = @(Format-RmmSummary -Report $t2Sum)
+Check 'T2 summary has 5 lines' $t2Lines.Count 5
+Check 'T2 summary header' $t2Lines[0] '=== RMM SUMMARY ==='
+Check 'T2 summary field line' $t2Lines[1] 'Computer=HOST1; Mode=AUDIT; ExitCode=5; IssueCode=PG_HBA_NOT_STANDARD; ActionRequired=Run with -Apply; Detail=line one line two'
+Check 'T2 summary action line' $t2Lines[2] 'RMM ACTION: Run with -Apply'
+Check 'T2 summary issue line' $t2Lines[3] 'RMM ISSUE: PG_HBA_NOT_STANDARD | line one line two'
+Check 'T2 summary footer' $t2Lines[4] '==================='
+$t2OkLines = @(Format-RmmSummary -Report ([ordered]@{ Computer = 'HOST1'; ExitCode = 0; IssueCode = ''; ActionRequired = 'None'; Detail = '' }))
+Check 'T2 clean summary has no action or issue line' $t2OkLines.Count 3
+Check 'T2 clean summary field line' $t2OkLines[1] 'Computer=HOST1; ExitCode=0; IssueCode=; ActionRequired=None; Detail='
+$t2LongLines = @(Format-RmmSummary -Report ([ordered]@{ Detail = ('y' * 2000) }))
+Check 'T2 summary values are capped at 900' $t2LongLines[1].Length 907
+Check 'T2 summary of a new report starts with Computer' (@(Format-RmmSummary -Report (New-RunReport -Mode 'AUDIT'))[1] -clike 'Computer=*; LogPath=') 'True'
+
+# Get-TrapAction
+Check 'T2 trap action UNTOUCHED' (Get-TrapAction -Stage 'UNTOUCHED') 'EXIT_UNHANDLED'
+Check 'T2 trap action PATH_A_WRITING' (Get-TrapAction -Stage 'PATH_A_WRITING') 'RESTORE_PATH_A'
+Check 'T2 trap action PATH_A_DONE' (Get-TrapAction -Stage 'PATH_A_DONE') 'NO_ROLLBACK'
+Check 'T2 trap action VERIFIED' (Get-TrapAction -Stage 'VERIFIED') 'NO_ROLLBACK'
+Check 'T2 trap action PATH_B_CHANGING' (Get-TrapAction -Stage 'PATH_B_CHANGING') 'ROLLBACK_PATH_B'
+Check 'T2 trap action unknown stage' (Get-TrapAction -Stage 'SOMETHING_ELSE') 'EXIT_UNHANDLED'
+Check 'T2 trap action empty stage' (Get-TrapAction -Stage '') 'EXIT_UNHANDLED'
+
+# Complete-Run exits the process, so it runs in a child powershell.exe. The driver
+# holds the real function texts from $ScriptAst plus a stand-in for Exit-RunLock
+# (Task 3) that records the release.
+$t2Fn = @{}
+foreach ($t2Statement in $ScriptAst.EndBlock.Statements) {
+    if ($t2Statement -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+        $t2Fn[$t2Statement.Name] = $t2Statement.Extent.Text
+    }
+}
+$t2Needed = @('Format-ShortText', 'Write-Log', 'Write-AtomicText', 'Write-AtomicJson', 'Get-CfgValue', 'New-RunReport', 'Add-RunIssue', 'Get-RmmActionForExitCode', 'Resolve-RunOutcome', 'Format-RmmSummary', 'Complete-Run')
+Check 'T2 driver functions exist in the script' (@($t2Needed | Where-Object { -not $t2Fn.ContainsKey($_) }) -join ',') ''
+$t2DriverHead = @'
+param([string] $Scenario, [string] $Root)
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+function Exit-RunLock {
+    param($Mutex)
+    [System.IO.File]::WriteAllText((Join-Path $Root 'lock-released.txt'), [string]$Mutex)
+}
+'@
+$t2DriverBody = @'
+$WorkRoot = $Root
+switch ($Scenario) {
+    'issues' {
+        $script:Report = New-RunReport -Mode 'APPLY'
+        $script:Stage = 'PATH_A_DONE'
+        $script:WorkRootReady = $true
+        $script:RunLock = 'fake-lock'
+        Start-Transcript -LiteralPath (Join-Path $Root 'transcript.log') | Out-Null
+        $script:TranscriptStarted = $true
+        Add-RunIssue -Code 'PG_HBA_NOT_STANDARD' -ExitCode 5 -Detail 'two LAN lines'
+        Complete-Run -ExitCode 10 -Code 'VEEAM_BUSY' -Detail 'VeeamAgent.exe is running' -Action 'Retry after the running job ends'
+    }
+    'bare' {
+        Complete-Run -ExitCode 20 -Code 'VBR_NOT_FOUND' -Detail 'No VBR server install found'
+    }
+    'clean' {
+        $script:Report = New-RunReport -Mode 'AUDIT'
+        $script:WorkRootReady = $true
+        Complete-Run
+    }
+}
+Write-Host 'AFTER-COMPLETE-RUN'
+'@
+$t2FunctionText = (@($t2Needed | Where-Object { $t2Fn.ContainsKey($_) } | ForEach-Object { $t2Fn[$_] }) -join "`r`n`r`n")
+$t2DriverDir = New-TestFolder 't2driver'
+$t2DriverPath = Join-Path $t2DriverDir 'driver.ps1'
+[System.IO.File]::WriteAllText($t2DriverPath, ($t2DriverHead + "`r`n" + $t2FunctionText + "`r`n" + $t2DriverBody), (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+$t2PowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+# Scenario 'issues': two issues, a transcript, a lock, a ready WorkRoot.
+$t2RootA = New-TestFolder 't2issues'
+$t2A = Invoke-Native -FilePath $t2PowerShell -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $t2DriverPath, '-Scenario', 'issues', '-Root', $t2RootA)
+$t2ALines = @($t2A.StdOut -split "`r?`n")
+$t2ASummary = @($t2ALines | Where-Object { $_ -clike 'Computer=*' })
+Check 'T2 issues: exit code is the highest issue' $t2A.ExitCode 10
+Check 'T2 issues: no errors on stderr' $t2A.StdErr ''
+Check 'T2 issues: one summary line' $t2ASummary.Count 1
+Check 'T2 issues: summary Mode' ($t2ASummary[0] -clike '*; Mode=APPLY; *') 'True'
+Check 'T2 issues: summary Stage from $script:Stage' ($t2ASummary[0] -clike '*; Stage=PATH_A_DONE; *') 'True'
+Check 'T2 issues: summary Outcome' ($t2ASummary[0] -clike '*; Outcome=VEEAM_BUSY; *') 'True'
+Check 'T2 issues: summary ExitCode' ($t2ASummary[0] -clike '*; ExitCode=10; *') 'True'
+Check 'T2 issues: summary IssueCode' ($t2ASummary[0] -clike '*; IssueCode=VEEAM_BUSY; *') 'True'
+Check 'T2 issues: header before the field line' ([array]::IndexOf($t2ALines, '=== RMM SUMMARY ===') -eq ([array]::IndexOf($t2ALines, $t2ASummary[0]) - 1)) 'True'
+Check 'T2 issues: RMM ACTION line' (@($t2ALines | Where-Object { $_ -ceq 'RMM ACTION: Retry after the running job ends' }).Count) 1
+Check 'T2 issues: RMM ISSUE line' (@($t2ALines | Where-Object { $_ -ceq 'RMM ISSUE: VEEAM_BUSY | PG_HBA_NOT_STANDARD: two LAN lines | VEEAM_BUSY: VeeamAgent.exe is running' }).Count) 1
+Check 'T2 issues: footer is the last summary line' ($t2ALines[-1]) '==================='
+Check 'T2 issues: Complete-Run exits and does not return' ('{0}|{1}' -f $t2A.ExitCode, ($t2A.StdOut -clike '*AFTER-COMPLETE-RUN*')) '10|False'
+$t2AJsonPath = Join-Path $t2RootA 'logs\last-result.json'
+Check 'T2 issues: last-result.json written' (Test-Path -LiteralPath $t2AJsonPath) 'True'
+Check 'T2 issues: last-result.json has no BOM' ([System.IO.File]::ReadAllBytes($t2AJsonPath)[0] -ne 0xEF) 'True'
+$t2AJson = [System.IO.File]::ReadAllText($t2AJsonPath) | ConvertFrom-Json
+Check 'T2 issues: last-result.json ExitCode' $t2AJson.ExitCode 10
+Check 'T2 issues: last-result.json IssueCode' $t2AJson.IssueCode 'VEEAM_BUSY'
+Check 'T2 issues: last-result.json Stage' $t2AJson.Stage 'PATH_A_DONE'
+Check 'T2 issues: lock released with $script:RunLock' ([System.IO.File]::ReadAllText((Join-Path $t2RootA 'lock-released.txt'))) 'fake-lock'
+$t2Transcript = [System.IO.File]::ReadAllText((Join-Path $t2RootA 'transcript.log'))
+Check 'T2 issues: summary is in the transcript' ($t2Transcript -like '*=== RMM SUMMARY ===*') 'True'
+Check 'T2 issues: transcript was stopped' ($t2Transcript -like '*transcript end*') 'True'
+
+# Scenario 'bare': no Report, Stage, Issues, WorkRootReady, transcript or lock exist.
+$t2RootB = New-TestFolder 't2bare'
+$t2B = Invoke-Native -FilePath $t2PowerShell -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $t2DriverPath, '-Scenario', 'bare', '-Root', $t2RootB)
+$t2BLines = @($t2B.StdOut -split "`r?`n")
+$t2BSummary = @($t2BLines | Where-Object { $_ -clike 'Computer=*' })
+Check 'T2 bare: exit code' $t2B.ExitCode 20
+Check 'T2 bare: no StrictMode errors on stderr' $t2B.StdErr ''
+Check 'T2 bare: one summary line' $t2BSummary.Count 1
+Check 'T2 bare: Mode UNKNOWN, Stage UNTOUCHED' ($t2BSummary[0] -clike '*; Mode=UNKNOWN; *; Stage=UNTOUCHED; Outcome=VBR_NOT_FOUND; ExitCode=20; IssueCode=VBR_NOT_FOUND; *') 'True'
+Check 'T2 bare: default action for 20' (@($t2BLines | Where-Object { $_ -ceq ('RMM ACTION: ' + (Get-RmmActionForExitCode -ExitCode 20)) }).Count) 1
+Check 'T2 bare: RMM ISSUE line' (@($t2BLines | Where-Object { $_ -ceq 'RMM ISSUE: VBR_NOT_FOUND | VBR_NOT_FOUND: No VBR server install found' }).Count) 1
+Check 'T2 bare: no last-result.json without a ready WorkRoot' ('{0}|{1}' -f $t2B.ExitCode, (Test-Path -LiteralPath (Join-Path $t2RootB 'logs\last-result.json'))) '20|False'
+Check 'T2 bare: no lock to release' ('{0}|{1}' -f $t2B.ExitCode, (Test-Path -LiteralPath (Join-Path $t2RootB 'lock-released.txt'))) '20|False'
+Check 'T2 bare: Complete-Run exits and does not return' ('{0}|{1}' -f $t2B.ExitCode, ($t2B.StdOut -clike '*AFTER-COMPLETE-RUN*')) '20|False'
+
+# Scenario 'clean': no issues.
+$t2RootC = New-TestFolder 't2clean'
+$t2C = Invoke-Native -FilePath $t2PowerShell -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $t2DriverPath, '-Scenario', 'clean', '-Root', $t2RootC)
+$t2CLines = @($t2C.StdOut -split "`r?`n")
+$t2CSummary = @($t2CLines | Where-Object { $_ -clike 'Computer=*' })
+Check 'T2 clean: exit code 0' $t2C.ExitCode 0
+Check 'T2 clean: one summary line' $t2CSummary.Count 1
+Check 'T2 clean: Outcome OK' ($t2CSummary[0] -clike '*; Outcome=OK; ExitCode=0; IssueCode=; ActionRequired=None; Detail=; *') 'True'
+Check 'T2 clean: no RMM ACTION or RMM ISSUE line' ('{0}|{1}' -f $t2CSummary.Count, @($t2CLines | Where-Object { $_ -clike 'RMM ACTION:*' -or $_ -clike 'RMM ISSUE:*' }).Count) '1|0'
+$t2CJsonPath = Join-Path $t2RootC 'logs\last-result.json'
+Check 'T2 clean: last-result.json written' (Test-Path -LiteralPath $t2CJsonPath) 'True'
+$t2CJson = [System.IO.File]::ReadAllText($t2CJsonPath) | ConvertFrom-Json
+Check 'T2 clean: last-result.json Outcome' ('{0} {1}' -f $t2CJson.Outcome, $t2CJson.ExitCode) 'OK 0'
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue
