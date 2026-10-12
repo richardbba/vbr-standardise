@@ -1245,6 +1245,392 @@ function Get-RegistryAuthMode {
 #endregion Vbr
 
 #region PgDiscovery
+# Copied from Update-VeeamPostgres.ps1 without changes: the service command must
+# start pg_ctl.exe or postgres.exe from the registry Base Directory.
+function Test-PgServiceExecutableMatchesBaseDir {
+    param(
+        [Parameter(Mandatory)][string] $PathName,
+        [Parameter(Mandatory)][string] $BaseDir
+    )
+
+    $commandLine = [Environment]::ExpandEnvironmentVariables($PathName).Trim()
+    $executable = $null
+    if ($commandLine -match '^\s*"([^"]+\.exe)"(?:\s|$)') {
+        $executable = $Matches[1]
+    } elseif ($commandLine -match '^\s*(.+?\.exe)(?:\s|$)') {
+        $executable = $Matches[1]
+    }
+    if (-not $executable) { return $false }
+
+    try {
+        $actual = [IO.Path]::GetFullPath($executable).TrimEnd('\')
+        $expected = @(
+            (Join-Path $BaseDir 'bin\pg_ctl.exe'),
+            (Join-Path $BaseDir 'bin\postgres.exe')
+        ) | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') }
+        return (@($expected | Where-Object { $_ -ieq $actual }).Count -eq 1)
+    } catch {
+        return $false
+    }
+}
+# Adapted from the updater's STEP 5. It returns a result instead of calling
+# Complete-Run, and takes the service list as a parameter so tests can inject it.
+# The main body maps the codes to exits: NO_PG_FOUND 20, PG_NOT_RUNNING 20, MULTIPLE_PG 11.
+function Find-PgInstall {
+    param(
+        [string] $InstallationsKey = 'HKLM:\SOFTWARE\PostgreSQL\Installations',
+        [AllowNull()][AllowEmptyCollection()][object[]] $Services
+    )
+
+    $result = [pscustomobject]@{
+        Ok          = $false
+        Code        = ''
+        Detail      = ''
+        Version     = $null
+        Major       = 0
+        BaseDir     = $null
+        DataDir     = $null
+        ServiceName = $null
+        Psql        = $null
+        HbaPath     = $null
+        IdentPath   = $null
+    }
+
+    $installs = @()
+    if (Test-Path -LiteralPath $InstallationsKey) {
+        foreach ($k in @(Get-ChildItem -LiteralPath $InstallationsKey -ErrorAction Stop)) {
+            $installs += [pscustomobject]@{
+                Key       = $k.PSChildName
+                Version   = Get-RegValue -Path $k.PSPath -Name 'Version'
+                BaseDir   = Get-RegValue -Path $k.PSPath -Name 'Base Directory'
+                DataDir   = Get-RegValue -Path $k.PSPath -Name 'Data Directory'
+                ServiceID = Get-RegValue -Path $k.PSPath -Name 'Service ID'
+            }
+        }
+    }
+    if ($installs.Count -eq 0) {
+        $result.Code = 'NO_PG_FOUND'
+        $result.Detail = "No PostgreSQL installation found under $InstallationsKey."
+        return $result
+    }
+    if ($installs.Count -gt 1) {
+        $list = @($installs | ForEach-Object { "$($_.Key): $($_.Version) at $($_.BaseDir)" }) -join ' | '
+        $result.Code = 'MULTIPLE_PG'
+        $result.Detail = "More than one PostgreSQL installation is registered ($list). Mapping one of them to VBR is ambiguous; handle manually."
+        return $result
+    }
+
+    $pg = $installs[0]
+    $result.Version = $pg.Version
+    $result.BaseDir = $pg.BaseDir
+    $result.DataDir = $pg.DataDir
+    $missing = @()
+    if (-not "$($pg.Version)".Trim()) { $missing += 'Version' }
+    if (-not "$($pg.BaseDir)".Trim()) { $missing += 'Base Directory' }
+    if (-not "$($pg.DataDir)".Trim()) { $missing += 'Data Directory' }
+    if ($missing.Count -gt 0) {
+        $result.Code = 'NO_PG_FOUND'
+        $result.Detail = "The PostgreSQL registry entry '$($pg.Key)' has no value for: $($missing -join ', '). Cannot proceed safely."
+        return $result
+    }
+    $majorMatch = [regex]::Match("$($pg.Version)", '^\s*(\d+)')
+    if (-not $majorMatch.Success) {
+        $result.Code = 'NO_PG_FOUND'
+        $result.Detail = "The PostgreSQL registry entry '$($pg.Key)' has Version '$($pg.Version)', which is not a version number."
+        return $result
+    }
+    $result.Major = [int]$majorMatch.Groups[1].Value
+
+    $all = @()
+    if ($PSBoundParameters.ContainsKey('Services')) {
+        $all = @($Services)
+    } else {
+        try {
+            $all = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop)
+        } catch {
+            $result.Code = 'NO_PG_FOUND'
+            $result.Detail = "Could not list Windows services to find the PostgreSQL service: $($_.Exception.Message)"
+            return $result
+        }
+    }
+    $rows = @()
+    foreach ($s in $all) {
+        if ($null -eq $s) { continue }
+        $rows += [pscustomobject]@{
+            Name     = "$(Get-CfgValue -Object $s -Name 'Name')"
+            State    = "$(Get-CfgValue -Object $s -Name 'State')"
+            PathName = "$(Get-CfgValue -Object $s -Name 'PathName')"
+        }
+    }
+    $candidates = @($rows | Where-Object {
+        $_.Name -like 'postgresql*' -or
+        $_.PathName -match '(?i)(?:^|[\\/"])(?:pg_ctl|postgres)\.exe(?:["\s]|$)'
+    })
+    # Some vendor wrappers hide pg_ctl.exe from PathName. Always include the exact
+    # registry Service ID when it exists, then still reject every multi-service case.
+    $serviceId = "$($pg.ServiceID)".Trim()
+    if ($serviceId) {
+        $byId = @($rows | Where-Object { $_.Name -ieq $serviceId })
+        if ($byId.Count -gt 0) { $candidates += $byId[0] }
+    }
+    $pgRows = @()
+    $seenNames = @{}
+    foreach ($row in $candidates) {
+        $nameKey = $row.Name.ToLowerInvariant()
+        if ($seenNames.ContainsKey($nameKey)) { continue }
+        $seenNames[$nameKey] = $true
+        $pgRows += $row
+    }
+    if ($pgRows.Count -gt 1) {
+        $list = @($pgRows | ForEach-Object { "$($_.Name) [$($_.PathName)]" }) -join ' | '
+        $result.Code = 'MULTIPLE_PG'
+        $result.Detail = "More than one PostgreSQL Windows service exists ($list). This script supports one local PostgreSQL cluster only."
+        return $result
+    }
+    if ($pgRows.Count -eq 0) {
+        $result.Code = 'NO_PG_FOUND'
+        $result.Detail = "PostgreSQL is registered at '$($pg.BaseDir)', but no PostgreSQL Windows service was found (Service ID '$serviceId')."
+        return $result
+    }
+
+    $svc = $pgRows[0]
+    $result.ServiceName = $svc.Name
+    if ($serviceId -and $svc.Name -ine $serviceId) {
+        $result.Code = 'NO_PG_FOUND'
+        $result.Detail = "The only PostgreSQL service is '$($svc.Name)', but the registry names service '$serviceId'. Refusing an ambiguous installation."
+        return $result
+    }
+    $binaryOk = $false
+    if ($svc.PathName) { $binaryOk = Test-PgServiceExecutableMatchesBaseDir -PathName $svc.PathName -BaseDir "$($pg.BaseDir)" }
+    if (-not $binaryOk) {
+        $result.Code = 'NO_PG_FOUND'
+        $result.Detail = "PostgreSQL service '$($svc.Name)' does not run pg_ctl.exe or postgres.exe from the registry Base Directory '$($pg.BaseDir)'. Service command: $($svc.PathName)"
+        return $result
+    }
+
+    $result.Psql = [IO.Path]::Combine("$($pg.BaseDir)", 'bin\psql.exe')
+    $result.HbaPath = [IO.Path]::Combine("$($pg.DataDir)", 'pg_hba.conf')
+    $result.IdentPath = [IO.Path]::Combine("$($pg.DataDir)", 'pg_ident.conf')
+    if (-not (Test-Path -LiteralPath $result.Psql -PathType Leaf)) {
+        $result.Code = 'NO_PG_FOUND'
+        $result.Detail = "psql.exe not found at '$($result.Psql)'."
+        return $result
+    }
+    if ($svc.State -ne 'Running') {
+        $result.Code = 'PG_NOT_RUNNING'
+        $result.Detail = "PostgreSQL service '$($svc.Name)' is $($svc.State). Start it and find out why it stopped, then re-run."
+        return $result
+    }
+
+    $result.Ok = $true
+    $result.Detail = "PostgreSQL $($pg.Version) at '$($pg.BaseDir)', data '$($pg.DataDir)', service '$($svc.Name)'."
+    return $result
+}
+# postmaster.pid lines: 1 PID, 2 data directory, 3 start time, 4 port, 5 socket
+# directory, 6 listen address, 7 shared memory key, 8 status. Throws when malformed.
+function ConvertFrom-PostmasterPid {
+    param([Parameter(Mandatory)][AllowEmptyString()][string] $Text)
+
+    $lines = @($Text -split "`n" | ForEach-Object { $_.TrimEnd([char]13) })
+    if ($lines.Count -lt 4) { throw "postmaster.pid has $($lines.Count) line(s); expected at least 4." }
+    $pidValue = 0
+    if (-not [int]::TryParse($lines[0].Trim(), [ref]$pidValue) -or $pidValue -le 0) {
+        throw "postmaster.pid line 1 is not a process ID: '$($lines[0])'"
+    }
+    $portValue = 0
+    if (-not [int]::TryParse($lines[3].Trim(), [ref]$portValue) -or $portValue -lt 1 -or $portValue -gt 65535) {
+        throw "postmaster.pid line 4 is not a TCP port: '$($lines[3])'"
+    }
+    $dir = $lines[1].Trim()
+    if (-not $dir) { throw 'postmaster.pid line 2 (data directory) is empty.' }
+    return [pscustomobject]@{ Pid = $pidValue; DataDir = $dir; Port = $portValue }
+}
+
+# Proves without SQL that the registry Data Directory is the live cluster:
+# its postmaster.pid names this folder, a running postgres.exe and the VBR port.
+function Test-PostmasterLive {
+    param(
+        [Parameter(Mandatory)][string] $DataDir,
+        [Parameter(Mandatory)][int] $ExpectedPort
+    )
+
+    $pidPath = [IO.Path]::Combine($DataDir, 'postmaster.pid')
+    if (-not (Test-Path -LiteralPath $pidPath -PathType Leaf)) {
+        return [pscustomobject]@{ Ok = $false; Detail = "No postmaster.pid in '$DataDir'. No running PostgreSQL uses the registry Data Directory." }
+    }
+    try {
+        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $stream = [IO.File]::Open($pidPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        try {
+            $reader = New-Object System.IO.StreamReader($stream, [Text.Encoding]::Default)
+            $text = $reader.ReadToEnd()
+        } finally {
+            $stream.Dispose()
+        }
+        $info = ConvertFrom-PostmasterPid -Text $text
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Detail = "Could not read '$pidPath': $($_.Exception.Message)" }
+    }
+
+    try {
+        $fromFile = [IO.Path]::GetFullPath(($info.DataDir -replace '/', '\')).TrimEnd('\')
+        $expected = [IO.Path]::GetFullPath(($DataDir -replace '/', '\')).TrimEnd('\')
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Detail = "Could not compare data directory '$($info.DataDir)' with '$DataDir': $($_.Exception.Message)" }
+    }
+    if ($fromFile -ine $expected) {
+        return [pscustomobject]@{ Ok = $false; Detail = "postmaster.pid in '$DataDir' names data directory '$($info.DataDir)'. It does not belong to this folder." }
+    }
+
+    $proc = $null
+    try { $proc = Get-Process -Id $info.Pid -ErrorAction SilentlyContinue } catch { $proc = $null }
+    if ($null -eq $proc) {
+        return [pscustomobject]@{ Ok = $false; Detail = "PID $($info.Pid) from postmaster.pid in '$DataDir' is not running. The file is stale." }
+    }
+    $procName = "$(@($proc)[0].ProcessName)"
+    if ($procName -ine 'postgres') {
+        return [pscustomobject]@{ Ok = $false; Detail = "PID $($info.Pid) from postmaster.pid in '$DataDir' is '$procName', not postgres.exe." }
+    }
+    if ($info.Port -ne $ExpectedPort) {
+        return [pscustomobject]@{ Ok = $false; Detail = "PostgreSQL for '$DataDir' uses port $($info.Port), but VBR uses port $ExpectedPort (SqlHostPort)." }
+    }
+    return [pscustomobject]@{ Ok = $true; Detail = "postgres.exe PID $($info.Pid) runs '$DataDir' on port $($info.Port)." }
+}
+# postgresql.conf syntax: name [=] value, '#' starts a comment outside quotes,
+# single-quoted values with '' or \' for a quote. Returns the last active value.
+function Get-PgConfSetting {
+    param(
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]] $Lines,
+        [Parameter(Mandatory)][string] $Name
+    )
+
+    $pattern = "^\s*([A-Za-z_][A-Za-z0-9_.\-]*)\s*(?:=\s*)?('(?:[^'\\]|''|\\.)*'|[^\s#']+)"
+    $value = $null
+    foreach ($line in @($Lines)) {
+        if ($null -eq $line) { continue }
+        $m = [regex]::Match($line, $pattern)
+        if (-not $m.Success) { continue }
+        if ($m.Groups[1].Value -ine $Name) { continue }
+        $raw = $m.Groups[2].Value
+        if ($raw.Length -ge 2 -and $raw.StartsWith("'") -and $raw.EndsWith("'")) {
+            $raw = $raw.Substring(1, $raw.Length - 2)
+            $raw = $raw -replace "''", "'"
+            $raw = [regex]::Replace($raw, '\\(.)', '$1')
+        }
+        $value = $raw
+    }
+    return $value
+}
+
+# Returns the names among hba_file and ident_file that postgresql.conf,
+# postgresql.auto.conf or a file they include sets. Fails closed: when the
+# files cannot be read as PostgreSQL would, both names are returned.
+function Test-PgConfOverride {
+    param([Parameter(Mandatory)][string] $DataDir)
+
+    $watched = @('hba_file', 'ident_file')
+    $mainConf = [IO.Path]::Combine($DataDir, 'postgresql.conf')
+    if (-not (Test-Path -LiteralPath $mainConf -PathType Leaf)) {
+        Write-Log "No postgresql.conf in '$DataDir'. PostgreSQL reads its settings from elsewhere, so pg_hba.conf and pg_ident.conf in the data directory may not be the live files." WARN
+        return $watched
+    }
+    $latin1 = [Text.Encoding]::GetEncoding(28591)
+    $bom = "$([char]0xEF)$([char]0xBB)$([char]0xBF)"
+    $found = New-Object System.Collections.ArrayList
+    $seen = @{}
+    $pending = New-Object System.Collections.ArrayList
+    [void]$pending.Add([pscustomobject]@{ Path = $mainConf; Depth = 0 })
+    $autoConf = [IO.Path]::Combine($DataDir, 'postgresql.auto.conf')
+    if (Test-Path -LiteralPath $autoConf -PathType Leaf) { [void]$pending.Add([pscustomobject]@{ Path = $autoConf; Depth = 0 }) }
+
+    while ($pending.Count -gt 0) {
+        $item = $pending[0]
+        $pending.RemoveAt(0)
+        $full = [IO.Path]::GetFullPath($item.Path)
+        $fileKey = $full.ToLowerInvariant()
+        if ($seen.ContainsKey($fileKey)) { continue }
+        $seen[$fileKey] = $true
+        try {
+            $text = $latin1.GetString([IO.File]::ReadAllBytes($full))
+        } catch {
+            Write-Log "Could not read '$full': $($_.Exception.Message). Treating hba_file and ident_file as overridden." WARN
+            return $watched
+        }
+        if ($text.StartsWith($bom)) { $text = $text.Substring(3) }
+        $lines = @($text -split "`n" | ForEach-Object { $_.TrimEnd([char]13) })
+        foreach ($settingName in $watched) {
+            if ($null -ne (Get-PgConfSetting -Lines $lines -Name $settingName) -and -not $found.Contains($settingName)) {
+                Write-Log "'$full' sets $settingName." WARN
+                [void]$found.Add($settingName)
+            }
+        }
+        $folder = [IO.Path]::GetDirectoryName($full)
+        foreach ($line in $lines) {
+            if ($line -notmatch '^\s*include') { continue }
+            foreach ($directive in @('include', 'include_if_exists', 'include_dir')) {
+                $target = Get-PgConfSetting -Lines @($line) -Name $directive
+                if ($null -eq $target) { continue }
+                if ($item.Depth -ge 10) {
+                    Write-Log "Configuration files included from '$full' nest more than 10 deep. Treating hba_file and ident_file as overridden." WARN
+                    return $watched
+                }
+                $targetPath = $target -replace '/', '\'
+                if (-not [IO.Path]::IsPathRooted($targetPath)) { $targetPath = [IO.Path]::Combine($folder, $targetPath) }
+                if ($directive -eq 'include_dir') {
+                    if (-not (Test-Path -LiteralPath $targetPath -PathType Container)) {
+                        Write-Log "Folder '$targetPath' named by include_dir in '$full' does not exist. Treating hba_file and ident_file as overridden." WARN
+                        return $watched
+                    }
+                    foreach ($f in @(Get-ChildItem -LiteralPath $targetPath -File | Where-Object { $_.Name -like '*.conf' -and $_.Name -notlike '.*' } | Sort-Object Name)) {
+                        [void]$pending.Add([pscustomobject]@{ Path = $f.FullName; Depth = $item.Depth + 1 })
+                    }
+                } elseif (Test-Path -LiteralPath $targetPath -PathType Leaf) {
+                    [void]$pending.Add([pscustomobject]@{ Path = $targetPath; Depth = $item.Depth + 1 })
+                } elseif ($directive -eq 'include') {
+                    Write-Log "File '$targetPath' named by include in '$full' does not exist. Treating hba_file and ident_file as overridden." WARN
+                    return $watched
+                }
+            }
+        }
+    }
+    return @($watched | Where-Object { $found.Contains($_) })
+}
+# Which loopback addresses listen on the port. A wildcard listener counts for its
+# family: 0.0.0.0 for 127.0.0.1 and :: for ::1. Output order: 127.0.0.1, ::1.
+function Select-ListeningLoopback {
+    param(
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][object[]] $Listeners,
+        [Parameter(Mandatory)][int] $Port
+    )
+
+    $v4 = $false
+    $v6 = $false
+    foreach ($l in @($Listeners)) {
+        if ($null -eq $l) { continue }
+        $localPort = Get-CfgValue -Object $l -Name 'LocalPort'
+        if ($null -eq $localPort -or [int]$localPort -ne $Port) { continue }
+        $address = "$(Get-CfgValue -Object $l -Name 'LocalAddress')".Trim()
+        if ($address -eq '127.0.0.1' -or $address -eq '0.0.0.0') { $v4 = $true }
+        elseif ($address -eq '::1' -or $address -eq '::') { $v6 = $true }
+    }
+    $out = @()
+    if ($v4) { $out += '127.0.0.1' }
+    if ($v6) { $out += '::1' }
+    return $out
+}
+
+function Get-ListeningLoopback {
+    param([Parameter(Mandatory)][int] $Port)
+
+    $listeners = @()
+    try {
+        $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
+    } catch {
+        Write-Log "Could not list TCP listeners on port ${Port}: $($_.Exception.Message)" WARN
+        $listeners = @()
+    }
+    return Select-ListeningLoopback -Listeners $listeners -Port $Port
+}
 #endregion PgDiscovery
 
 #region Names

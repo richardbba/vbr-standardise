@@ -1075,6 +1075,253 @@ Check 'Get-RegistryAuthMode: null user, no password' (Get-RegistryAuthMode -User
 Check 'Get-RegistryAuthMode: user and password' (Get-RegistryAuthMode -UserName 'postgres' -PasswordSet $true) 'NATIVE'
 Check 'Get-RegistryAuthMode: user only' (Get-RegistryAuthMode -UserName 'postgres' -PasswordSet $false) 'NATIVE'
 Check 'Get-RegistryAuthMode: password only' (Get-RegistryAuthMode -UserName '' -PasswordSet $true) 'NATIVE'
+# --- Task 5: PostgreSQL discovery ---
+# Service binary check (copied from the updater, same cases as its Test-Helpers.ps1).
+$t5Base = 'C:\Program Files\PostgreSQL\17'
+Check 'T5 quoted pg_ctl service matches BaseDir' (Test-PgServiceExecutableMatchesBaseDir -PathName '"C:\Program Files\PostgreSQL\17\bin\pg_ctl.exe" runservice -N postgresql-x64-17' -BaseDir $t5Base) 'True'
+Check 'T5 unquoted pg_ctl service matches BaseDir' (Test-PgServiceExecutableMatchesBaseDir -PathName 'C:\Program Files\PostgreSQL\17\bin\pg_ctl.exe runservice' -BaseDir $t5Base) 'True'
+Check 'T5 postgres.exe service binary matches BaseDir' (Test-PgServiceExecutableMatchesBaseDir -PathName '"C:\Program Files\PostgreSQL\17\bin\postgres.exe" -D data' -BaseDir $t5Base) 'True'
+Check 'T5 BaseDir with a trailing backslash matches' (Test-PgServiceExecutableMatchesBaseDir -PathName '"C:\Program Files\PostgreSQL\17\bin\pg_ctl.exe" runservice' -BaseDir 'C:\Program Files\PostgreSQL\17\') 'True'
+Check 'T5 other major service binary rejected' (Test-PgServiceExecutableMatchesBaseDir -PathName '"C:\Program Files\PostgreSQL\16\bin\pg_ctl.exe" runservice' -BaseDir $t5Base) 'False'
+Check 'T5 wrapper service binary rejected' (Test-PgServiceExecutableMatchesBaseDir -PathName '"C:\Vendor\wrapper.exe" run' -BaseDir $t5Base) 'False'
+
+# postmaster.pid as PostgreSQL writes it on Windows: PID, data directory (forward
+# slashes), start time (epoch), port, socket directory (empty on Windows), first
+# listen address, shared memory key, status.
+$t5PidText = "6164`nC:/Program Files/PostgreSQL/15/data`n1728701532`n5432`n`nlocalhost`n  5432001         0`nready   `n"
+$t5Pm = ConvertFrom-PostmasterPid -Text $t5PidText
+Check 'T5 postmaster.pid PID (line 1)' $t5Pm.Pid '6164'
+Check 'T5 postmaster.pid data directory (line 2)' $t5Pm.DataDir 'C:/Program Files/PostgreSQL/15/data'
+Check 'T5 postmaster.pid port (line 4)' $t5Pm.Port '5432'
+$t5PmCrlf = ConvertFrom-PostmasterPid -Text ($t5PidText -replace "`n", "`r`n")
+Check 'T5 postmaster.pid with CRLF: data directory has no CR' $t5PmCrlf.DataDir 'C:/Program Files/PostgreSQL/15/data'
+Check 'T5 postmaster.pid with CRLF: port' $t5PmCrlf.Port '5432'
+Throws 'T5 postmaster.pid with fewer than 4 lines throws' { ConvertFrom-PostmasterPid -Text "6164`nC:/PG/data" }
+Throws 'T5 postmaster.pid with a bad PID throws' { ConvertFrom-PostmasterPid -Text "abc`nC:/PG/data`n1728701532`n5432`n" }
+Throws 'T5 postmaster.pid with a bad port throws' { ConvertFrom-PostmasterPid -Text "6164`nC:/PG/data`n1728701532`n`n" }
+
+# Test-PostmasterLive: a temp data folder holds the postmaster.pid; Get-Process is mocked.
+$t5Data = New-TestFolder 'pgdata'
+$t5DataFwd = $t5Data -replace '\\', '/'
+[IO.File]::WriteAllText((Join-Path $t5Data 'postmaster.pid'), "6164`n$t5DataFwd`n1728701532`n5432`n`nlocalhost`n  5432001         0`nready   `n")
+& {
+    function Get-Process { [CmdletBinding()] param([int] $Id) if ($Id -eq 6164) { [pscustomobject]@{ Id = 6164; ProcessName = 'postgres' } } }
+    $t5R = Test-PostmasterLive -DataDir $t5Data -ExpectedPort 5432
+    Check 'T5 live postmaster with matching port accepted' $t5R.Ok 'True'
+    Check 'T5 data folder with a trailing backslash accepted' (Test-PostmasterLive -DataDir ($t5Data + '\') -ExpectedPort 5432).Ok 'True'
+    $t5R = Test-PostmasterLive -DataDir $t5Data -ExpectedPort 5433
+    Check 'T5 port different from SqlHostPort rejected' $t5R.Ok 'False'
+    Check 'T5 port mismatch detail names both ports' ($t5R.Detail -like '*5432*' -and $t5R.Detail -like '*5433*') 'True'
+}
+& {
+    function Get-Process { [CmdletBinding()] param([int] $Id) [pscustomobject]@{ Id = $Id; ProcessName = 'notepad' } }
+    Check 'T5 PID that is not postgres.exe rejected' (Test-PostmasterLive -DataDir $t5Data -ExpectedPort 5432).Ok 'False'
+}
+& {
+    function Get-Process { [CmdletBinding()] param([int] $Id) }
+    $t5R = Test-PostmasterLive -DataDir $t5Data -ExpectedPort 5432
+    Check 'T5 stale PID rejected' $t5R.Ok 'False'
+    Check 'T5 stale PID detail names the PID' ($t5R.Detail -like '*6164*') 'True'
+}
+[IO.File]::WriteAllText((Join-Path $t5Data 'postmaster.pid'), "$PID`n$t5DataFwd`n1728701532`n5432`n`nlocalhost`n`nready   `n")
+Check 'T5 real running process that is not postgres.exe rejected' (Test-PostmasterLive -DataDir $t5Data -ExpectedPort 5432).Ok 'False'
+$t5Other = New-TestFolder 'pgother'
+[IO.File]::WriteAllText((Join-Path $t5Other 'postmaster.pid'), "6164`nD:/Elsewhere/data`n1728701532`n5432`n`nlocalhost`n`nready   `n")
+& {
+    function Get-Process { [CmdletBinding()] param([int] $Id) [pscustomobject]@{ Id = $Id; ProcessName = 'postgres' } }
+    Check 'T5 postmaster.pid naming another data directory rejected' (Test-PostmasterLive -DataDir $t5Other -ExpectedPort 5432).Ok 'False'
+}
+$t5Empty = New-TestFolder 'pgempty'
+Check 'T5 missing postmaster.pid rejected' (Test-PostmasterLive -DataDir $t5Empty -ExpectedPort 5432).Ok 'False'
+[IO.File]::WriteAllText((Join-Path $t5Empty 'postmaster.pid'), 'garbage')
+Check 'T5 malformed postmaster.pid rejected' (Test-PostmasterLive -DataDir $t5Empty -ExpectedPort 5432).Ok 'False'
+
+# Get-PgConfSetting: postgresql.conf syntax.
+$t5Conf = @(
+    "# hba_file = 'ConfigDir/pg_hba.conf'`t`t# host-based authentication file",
+    "listen_addresses = 'localhost'`t`t# what IP address(es) to listen on;",
+    "port = 5432`t`t`t`t# (change requires restart)",
+    '',
+    "  HBA_FILE='C:/PG/conf/first.conf'  # moved",
+    "hba_file = 'C:/PG/conf/it''s.conf'",
+    'shared_buffers 512MB',
+    "log_line_prefix = '%m [%p] # kept '"
+)
+Check 'T5 conf setting: unquoted value' (Get-PgConfSetting -Lines $t5Conf -Name 'port') '5432'
+Check 'T5 conf setting: quotes removed' (Get-PgConfSetting -Lines $t5Conf -Name 'listen_addresses') 'localhost'
+Check 'T5 conf setting: last active line wins, doubled quote unescaped' (Get-PgConfSetting -Lines $t5Conf -Name 'hba_file') "C:/PG/conf/it's.conf"
+Check 'T5 conf setting: name and value without an equals sign' (Get-PgConfSetting -Lines $t5Conf -Name 'shared_buffers') '512MB'
+Check 'T5 conf setting: # inside quotes is kept' (Get-PgConfSetting -Lines $t5Conf -Name 'log_line_prefix') '%m [%p] # kept '
+Check 'T5 conf setting: absent setting is null' ($null -eq (Get-PgConfSetting -Lines $t5Conf -Name 'ident_file')) 'True'
+Check 'T5 conf setting: commented-out setting is null' ($null -eq (Get-PgConfSetting -Lines @("#ident_file = 'C:/x'") -Name 'ident_file')) 'True'
+Check 'T5 conf setting: empty file is null' ($null -eq (Get-PgConfSetting -Lines @() -Name 'port')) 'True'
+
+# Test-PgConfOverride: real files in temp folders.
+$t5Cfg = New-TestFolder 'pgconf'
+[IO.File]::WriteAllText((Join-Path $t5Cfg 'postgresql.conf'), "#hba_file = 'ConfigDir/pg_hba.conf'`r`n#ident_file = 'ConfigDir/pg_ident.conf'`r`nport = 5432`r`n#include_dir = 'conf.d'`r`n")
+[IO.File]::WriteAllText((Join-Path $t5Cfg 'postgresql.auto.conf'), "# Do not edit this file manually!`n# It will be overwritten by the ALTER SYSTEM command.`nmax_connections = '200'`n")
+Check 'T5 no override in default conf files' (@(Test-PgConfOverride -DataDir $t5Cfg) -join ',') ''
+[IO.File]::AppendAllText((Join-Path $t5Cfg 'postgresql.conf'), "hba_file = 'D:/pgconf/pg_hba.conf'`r`n")
+Check 'T5 hba_file set in postgresql.conf found' (@(Test-PgConfOverride -DataDir $t5Cfg) -join ',') 'hba_file'
+[IO.File]::AppendAllText((Join-Path $t5Cfg 'postgresql.auto.conf'), "ident_file = 'D:/pgconf/pg_ident.conf'`n")
+Check 'T5 ident_file set in postgresql.auto.conf found' (@(Test-PgConfOverride -DataDir $t5Cfg) -join ',') 'hba_file,ident_file'
+$t5Bom = New-TestFolder 'pgbom'
+[IO.File]::WriteAllBytes((Join-Path $t5Bom 'postgresql.conf'), [byte[]](@(0xEF, 0xBB, 0xBF) + [Text.Encoding]::ASCII.GetBytes("ident_file = 'D:/x/pg_ident.conf'`n")))
+Check 'T5 override on the first line after a BOM found' (@(Test-PgConfOverride -DataDir $t5Bom) -join ',') 'ident_file'
+$t5Inc = New-TestFolder 'pginc'
+New-Item -ItemType Directory -Path (Join-Path $t5Inc 'conf.d') | Out-Null
+[IO.File]::WriteAllText((Join-Path $t5Inc 'postgresql.conf'), "include_dir = 'conf.d'`ninclude_if_exists = 'missing.conf'`ninclude 'extra.conf'`n")
+[IO.File]::WriteAllText((Join-Path $t5Inc 'conf.d\10-tuning.conf'), "work_mem = '8MB'`n")
+[IO.File]::WriteAllText((Join-Path $t5Inc 'conf.d\.hidden.conf'), "hba_file = 'D:/x/hidden.conf'`n")
+[IO.File]::WriteAllText((Join-Path $t5Inc 'conf.d\readme.txt'), "hba_file = 'D:/x/readme.conf'`n")
+[IO.File]::WriteAllText((Join-Path $t5Inc 'extra.conf'), "port = 5432`n")
+Check 'T5 included files without overrides' (@(Test-PgConfOverride -DataDir $t5Inc) -join ',') ''
+[IO.File]::WriteAllText((Join-Path $t5Inc 'conf.d\20-paths.conf'), "ident_file = 'D:/x/pg_ident.conf'`n")
+Check 'T5 override inside include_dir found' (@(Test-PgConfOverride -DataDir $t5Inc) -join ',') 'ident_file'
+[IO.File]::WriteAllText((Join-Path $t5Inc 'extra.conf'), "hba_file = 'D:/x/pg_hba.conf'`n")
+Check 'T5 override inside an include file found' (@(Test-PgConfOverride -DataDir $t5Inc) -join ',') 'hba_file,ident_file'
+$t5Loop = New-TestFolder 'pgloop'
+[IO.File]::WriteAllText((Join-Path $t5Loop 'postgresql.conf'), "include 'a.conf'`n")
+[IO.File]::WriteAllText((Join-Path $t5Loop 'a.conf'), "include 'postgresql.conf'`n")
+Check 'T5 include loop ends' (@(Test-PgConfOverride -DataDir $t5Loop) -join ',') ''
+$t5NoConf = New-TestFolder 'pgnoconf'
+Check 'T5 missing postgresql.conf counts as both overridden' (@(Test-PgConfOverride -DataDir $t5NoConf) -join ',') 'hba_file,ident_file'
+$t5BadInc = New-TestFolder 'pgbadinc'
+[IO.File]::WriteAllText((Join-Path $t5BadInc 'postgresql.conf'), "include 'gone.conf'`n")
+Check 'T5 missing include file counts as both overridden' (@(Test-PgConfOverride -DataDir $t5BadInc) -join ',') 'hba_file,ident_file'
+
+# Select-ListeningLoopback: pure selection over listener objects.
+$t5L = @(
+    [pscustomobject]@{ LocalAddress = '127.0.0.1'; LocalPort = 5432 },
+    [pscustomobject]@{ LocalAddress = '::1'; LocalPort = 5432 },
+    [pscustomobject]@{ LocalAddress = '192.168.10.5'; LocalPort = 5432 },
+    [pscustomobject]@{ LocalAddress = '127.0.0.1'; LocalPort = 9392 }
+)
+Check 'T5 both loopback listeners' (@(Select-ListeningLoopback -Listeners $t5L -Port 5432) -join ',') '127.0.0.1,::1'
+Check 'T5 listeners on another port ignored' (@(Select-ListeningLoopback -Listeners $t5L -Port 5433) -join ',') ''
+Check 'T5 only ::1 listens' (@(Select-ListeningLoopback -Listeners @([pscustomobject]@{ LocalAddress = '::1'; LocalPort = 5432 }) -Port 5432) -join ',') '::1'
+Check 'T5 0.0.0.0 counts as 127.0.0.1' (@(Select-ListeningLoopback -Listeners @([pscustomobject]@{ LocalAddress = '0.0.0.0'; LocalPort = 5432 }) -Port 5432) -join ',') '127.0.0.1'
+Check 'T5 :: counts as ::1' (@(Select-ListeningLoopback -Listeners @([pscustomobject]@{ LocalAddress = '::'; LocalPort = 5432 }) -Port 5432) -join ',') '::1'
+Check 'T5 wildcard and loopback listed once' (@(Select-ListeningLoopback -Listeners @([pscustomobject]@{ LocalAddress = '0.0.0.0'; LocalPort = 5432 }, [pscustomobject]@{ LocalAddress = '127.0.0.1'; LocalPort = 5432 }) -Port 5432) -join ',') '127.0.0.1'
+Check 'T5 LAN-only listener gives nothing' (@(Select-ListeningLoopback -Listeners @([pscustomobject]@{ LocalAddress = '192.168.10.5'; LocalPort = 5432 }) -Port 5432) -join ',') ''
+Check 'T5 no listeners gives nothing' (@(Select-ListeningLoopback -Listeners @() -Port 5432) -join ',') ''
+
+# Get-ListeningLoopback: mocked Get-NetTCPConnection, then one real loopback listener.
+& {
+    function Get-NetTCPConnection {
+        [CmdletBinding()] param([string] $State, [int] $LocalPort)
+        if ($State -eq 'Listen') { @([pscustomobject]@{ LocalAddress = '0.0.0.0'; LocalPort = $LocalPort }) }
+    }
+    Check 'T5 Get-ListeningLoopback asks for listeners on the port' (@(Get-ListeningLoopback -Port 5432) -join ',') '127.0.0.1'
+}
+& {
+    function Get-NetTCPConnection { [CmdletBinding()] param([string] $State, [int] $LocalPort) throw 'CIM query failed' }
+    Check 'T5 Get-ListeningLoopback returns nothing when the query fails' (@(Get-ListeningLoopback -Port 5432).Count) '0'
+}
+$t5Listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+$t5Listener.Start()
+try {
+    $t5Port = ([System.Net.IPEndPoint]$t5Listener.LocalEndpoint).Port
+    Check 'T5 real 127.0.0.1 listener found' (@(Get-ListeningLoopback -Port $t5Port) -contains '127.0.0.1') 'True'
+} finally {
+    $t5Listener.Stop()
+}
+
+# Find-PgInstall: a throwaway HKCU installations key and fake service objects.
+$t5Root = "HKCU:\Software\VbrStdTest-PgInstall-$PID"
+$t5Pg = New-TestFolder 'pgbase'
+New-Item -ItemType Directory -Path (Join-Path $t5Pg 'bin') | Out-Null
+[IO.File]::WriteAllText((Join-Path $t5Pg 'bin\psql.exe'), '')
+$t5PgData = Join-Path $t5Pg 'data'
+$t5SvcPg = [pscustomobject]@{ Name = 'postgresql-x64-15'; State = 'Running'; PathName = "`"$t5Pg\bin\pg_ctl.exe`" runservice -N `"postgresql-x64-15`" -D `"$t5PgData`" -w" }
+$t5SvcVeeam = [pscustomobject]@{ Name = 'VeeamBackupSvc'; State = 'Running'; PathName = '"C:\Program Files\Veeam\Backup and Replication\Backup\Veeam.Backup.Service.exe"' }
+$t5SvcNoPath = [pscustomobject]@{ Name = 'Spooler'; State = 'Running' }
+try {
+    $t5R = Find-PgInstall -InstallationsKey "$t5Root-absent" -Services @($t5SvcPg)
+    Check 'T5 no installations key gives NO_PG_FOUND' $t5R.Code 'NO_PG_FOUND'
+    Check 'T5 no installations key is not Ok' $t5R.Ok 'False'
+    New-Item -Path $t5Root -Force | Out-Null
+    Check 'T5 empty installations key gives NO_PG_FOUND' (Find-PgInstall -InstallationsKey $t5Root -Services @($t5SvcPg)).Code 'NO_PG_FOUND'
+
+    $t5Inst = Join-Path $t5Root 'postgresql-x64-15'
+    New-Item -Path $t5Inst -Force | Out-Null
+    New-ItemProperty -Path $t5Inst -Name 'Version' -Value '15.8' -PropertyType String | Out-Null
+    New-ItemProperty -Path $t5Inst -Name 'Base Directory' -Value $t5Pg -PropertyType String | Out-Null
+    New-ItemProperty -Path $t5Inst -Name 'Data Directory' -Value $t5PgData -PropertyType String | Out-Null
+    New-ItemProperty -Path $t5Inst -Name 'Service ID' -Value 'postgresql-x64-15' -PropertyType String | Out-Null
+
+    $t5R = Find-PgInstall -InstallationsKey $t5Root -Services @($t5SvcVeeam, $t5SvcNoPath, $t5SvcPg)
+    Check 'T5 one install with a running service is Ok' $t5R.Ok 'True'
+    Check 'T5 Ok result has no code' $t5R.Code ''
+    Check 'T5 version from the registry' $t5R.Version '15.8'
+    Check 'T5 major version' $t5R.Major '15'
+    Check 'T5 base directory' $t5R.BaseDir $t5Pg
+    Check 'T5 data directory' $t5R.DataDir $t5PgData
+    Check 'T5 service name' $t5R.ServiceName 'postgresql-x64-15'
+    Check 'T5 psql path' $t5R.Psql (Join-Path $t5Pg 'bin\psql.exe')
+    Check 'T5 pg_hba.conf path' $t5R.HbaPath (Join-Path $t5PgData 'pg_hba.conf')
+    Check 'T5 pg_ident.conf path' $t5R.IdentPath (Join-Path $t5PgData 'pg_ident.conf')
+
+    $t5RealPgServices = @(Get-CimInstance -ClassName Win32_Service | Where-Object { "$($_.Name)" -like 'postgresql*' -or "$($_.PathName)" -match '(?i)(?:^|[\\/"])(?:pg_ctl|postgres)\.exe(?:["\s]|$)' })
+    if ($t5RealPgServices.Count -eq 0) {
+        $t5R = Find-PgInstall -InstallationsKey $t5Root
+        Check 'T5 without -Services the real service list is read' ($t5R.Code -eq 'NO_PG_FOUND' -and $t5R.Detail -like '*no PostgreSQL Windows service*') 'True'
+    } else {
+        Skip 'T5 without -Services the real service list is read' 'this machine has a PostgreSQL service'
+    }
+
+    $t5Stopped = [pscustomobject]@{ Name = 'postgresql-x64-15'; State = 'Stopped'; PathName = $t5SvcPg.PathName }
+    $t5R = Find-PgInstall -InstallationsKey $t5Root -Services @($t5Stopped)
+    Check 'T5 stopped service gives PG_NOT_RUNNING' $t5R.Code 'PG_NOT_RUNNING'
+    Check 'T5 stopped service still names the service' $t5R.ServiceName 'postgresql-x64-15'
+
+    $t5Svc16 = [pscustomobject]@{ Name = 'postgresql-x64-16'; State = 'Running'; PathName = '"C:\Program Files\PostgreSQL\16\bin\pg_ctl.exe" runservice -N "postgresql-x64-16"' }
+    Check 'T5 two PostgreSQL services give MULTIPLE_PG' (Find-PgInstall -InstallationsKey $t5Root -Services @($t5SvcPg, $t5Svc16)).Code 'MULTIPLE_PG'
+    Check 'T5 no PostgreSQL service gives NO_PG_FOUND' (Find-PgInstall -InstallationsKey $t5Root -Services @($t5SvcVeeam)).Code 'NO_PG_FOUND'
+
+    $t5Elsewhere = [pscustomobject]@{ Name = 'postgresql-x64-15'; State = 'Running'; PathName = '"C:\Program Files\PostgreSQL\16\bin\pg_ctl.exe" runservice -N "postgresql-x64-15"' }
+    $t5R = Find-PgInstall -InstallationsKey $t5Root -Services @($t5Elsewhere)
+    Check 'T5 service binary outside BaseDir gives NO_PG_FOUND' $t5R.Code 'NO_PG_FOUND'
+    Check 'T5 binary mismatch detail names Base Directory' ($t5R.Detail -like '*Base Directory*') 'True'
+
+    $t5Renamed = [pscustomobject]@{ Name = 'postgresql-x64-15b'; State = 'Running'; PathName = $t5SvcPg.PathName }
+    $t5R = Find-PgInstall -InstallationsKey $t5Root -Services @($t5Renamed)
+    Check 'T5 service name different from Service ID gives NO_PG_FOUND' $t5R.Code 'NO_PG_FOUND'
+    Check 'T5 Service ID mismatch detail names both services' ($t5R.Detail -like '*postgresql-x64-15b*' -and $t5R.Detail -like "*'postgresql-x64-15'*") 'True'
+
+    Set-ItemProperty -Path $t5Inst -Name 'Service ID' -Value 'VendorPg'
+    $t5Wrapper = [pscustomobject]@{ Name = 'VendorPg'; State = 'Running'; PathName = '"C:\Vendor\wrapper.exe" run' }
+    $t5R = Find-PgInstall -InstallationsKey $t5Root -Services @($t5SvcVeeam, $t5Wrapper)
+    Check 'T5 service found only through Service ID is checked' $t5R.ServiceName 'VendorPg'
+    Check 'T5 wrapper service binary gives NO_PG_FOUND' $t5R.Code 'NO_PG_FOUND'
+    Set-ItemProperty -Path $t5Inst -Name 'Service ID' -Value 'postgresql-x64-15'
+
+    Rename-Item -LiteralPath (Join-Path $t5Pg 'bin\psql.exe') -NewName 'psql.exe.away'
+    $t5R = Find-PgInstall -InstallationsKey $t5Root -Services @($t5SvcPg)
+    Check 'T5 missing psql.exe gives NO_PG_FOUND' $t5R.Code 'NO_PG_FOUND'
+    Check 'T5 missing psql.exe detail names psql.exe' ($t5R.Detail -like '*psql.exe*') 'True'
+    Rename-Item -LiteralPath (Join-Path $t5Pg 'bin\psql.exe.away') -NewName 'psql.exe'
+
+    Set-ItemProperty -Path $t5Inst -Name 'Version' -Value '17.2-1'
+    Check 'T5 installer-style version gives major 17' (Find-PgInstall -InstallationsKey $t5Root -Services @($t5SvcPg)).Major '17'
+    Set-ItemProperty -Path $t5Inst -Name 'Version' -Value '15.8'
+
+    Remove-ItemProperty -Path $t5Inst -Name 'Data Directory'
+    $t5R = Find-PgInstall -InstallationsKey $t5Root -Services @($t5SvcPg)
+    Check 'T5 missing Data Directory gives NO_PG_FOUND' $t5R.Code 'NO_PG_FOUND'
+    Check 'T5 missing Data Directory detail names the value' ($t5R.Detail -like '*Data Directory*') 'True'
+    New-ItemProperty -Path $t5Inst -Name 'Data Directory' -Value $t5PgData -PropertyType String | Out-Null
+
+    New-Item -Path (Join-Path $t5Root 'postgresql-x64-16') -Force | Out-Null
+    Check 'T5 two registered installs give MULTIPLE_PG' (Find-PgInstall -InstallationsKey $t5Root -Services @($t5SvcPg)).Code 'MULTIPLE_PG'
+} finally {
+    Remove-Item -LiteralPath $t5Root -Recurse -Force -ErrorAction SilentlyContinue
+}
+if (-not (Test-Path -LiteralPath 'HKLM:\SOFTWARE\PostgreSQL\Installations')) {
+    Check 'T5 default key on a machine without PostgreSQL gives NO_PG_FOUND' (Find-PgInstall).Code 'NO_PG_FOUND'
+} else {
+    Skip 'T5 default key on a machine without PostgreSQL gives NO_PG_FOUND' 'PostgreSQL is installed on this machine'
+}
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue
