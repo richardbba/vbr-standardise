@@ -4104,6 +4104,223 @@ function Wait-VbrDbConnected {
 #endregion ConnectCheck
 
 #region PathA
+# A path that reached its safe end (stage PATH_A_DONE or VERIFIED) has fixed the
+# database drift that the audit reported. Remove those issues, so the RMM summary
+# does not list drift that no longer exists, and report the new state.
+# -IncludePassword also removes PG_POSTGRES_PASSWORD_SET: the path either cleared
+# the password, or reports PG_PASSWORD_NOT_CLEARED in its place.
+function Clear-PathFixedIssues {
+    param(
+        [Parameter(Mandatory)][hashtable] $Ctx,
+        [switch] $IncludePassword
+    )
+    $fixedCodes = @('DB_NATIVE_AUTH', 'DB_HOST_NOT_LOCAL', 'DB_WINDOWS_ROLE_NOT_POSTGRES',
+                    'PG_HBA_NOT_STANDARD', 'PG_IDENT_NOT_STANDARD')
+    if ($IncludePassword) { $fixedCodes += 'PG_POSTGRES_PASSWORD_SET' }
+
+    $issuesVar = Get-Variable -Name Issues -Scope Script -ErrorAction SilentlyContinue
+    if ($null -ne $issuesVar -and $issuesVar.Value -is [System.Collections.ArrayList]) {
+        $issueList = $issuesVar.Value
+        foreach ($issue in @($issueList)) {
+            if ($null -ne $issue -and $fixedCodes -contains "$($issue.Code)") { $issueList.Remove($issue) }
+        }
+    }
+
+    $state = $Ctx['State']
+    if ($state -isnot [hashtable]) {
+        $state = @{}
+        $Ctx['State'] = $state
+    }
+    $state['DbAuth'] = 'WINDOWS'
+    $state['PgHba'] = 'STANDARD'
+    $state['PgIdent'] = 'STANDARD'
+    if ([bool]$Ctx['PasswordCleared']) { $state['PgPassword'] = 'NONE' }
+
+    $reportVar = Get-Variable -Name Report -Scope Script -ErrorAction SilentlyContinue
+    if ($null -ne $reportVar -and $reportVar.Value -is [System.Collections.IDictionary]) {
+        $report = $reportVar.Value
+        $report['DbAuth'] = 'WINDOWS'
+        $report['PgHba'] = 'STANDARD'
+        $report['PgIdent'] = 'STANDARD'
+        if ($state.ContainsKey('PgPassword')) { $report['PgPassword'] = "$($state['PgPassword'])" }
+    }
+}
+
+# Spec 7.8 restore for Path A (also used by the trap at stage PATH_A_WRITING).
+# Writes the run-folder backup bytes back with Restore-ConfFile (the same atomic
+# routine as every write, never a move or copy), pg_ident.conf first, then
+# repeats the SSPI test. Returns $true only when both files were restored and
+# SYSTEM can log in again on every listening loopback address. Never throws.
+function Restore-PathAFiles {
+    param([Parameter(Mandatory)][hashtable] $Ctx)
+    $allRestored = $true
+    $files = @(
+        @{ Name = 'pg_ident.conf'; Live = "$($Ctx.Pg.IdentPath)"; Backup = "$($Ctx['IdentBackupPath'])"; Sddl = "$($Ctx.Ident.Sddl)" },
+        @{ Name = 'pg_hba.conf';   Live = "$($Ctx.Pg.HbaPath)";   Backup = "$($Ctx['HbaBackupPath'])";   Sddl = "$($Ctx.Hba.Sddl)" }
+    )
+    foreach ($file in $files) {
+        if ([string]::IsNullOrEmpty($file.Backup)) {
+            Write-Log "No backup of $($file.Name) is recorded, so it cannot be restored." -Level ERROR
+            $allRestored = $false
+            continue
+        }
+        try {
+            $null = Restore-ConfFile -Path $file.Live -BackupPath $file.Backup -ExpectedSddl $file.Sddl
+            Write-Log "Restored $($file.Name) from $($file.Backup)" -Level OK
+        } catch {
+            Write-Log "Restoring $($file.Name) failed: $($_.Exception.Message)" -Level ERROR
+            $allRestored = $false
+        }
+    }
+
+    $loginPassed = $false
+    try {
+        $test = Test-PgSspiLogin -Psql "$($Ctx.Pg.Psql)" -Port ([int]$Ctx.Pg.Port) -Addresses @($Ctx.Addresses) -Database "$($Ctx.Db.DatabaseName)"
+        $loginPassed = [bool]$test.Passed
+        if (-not $loginPassed) {
+            foreach ($result in @($test.Results | Where-Object { $null -ne $_ -and "$($_.Kind)" -ne 'OK' })) {
+                Write-Log "SSPI test after the restore: $($result.Address) $($result.Kind) $($result.StdErr)" -Level ERROR
+            }
+        }
+    } catch {
+        Write-Log "SSPI test after the restore failed to run: $($_.Exception.Message)" -Level ERROR
+        $loginPassed = $false
+    }
+
+    # Spec 7.6 Path A step 3: "test again" means all of section 7.9, so the
+    # config check runs too once the login works.
+    $healthOk = $false
+    if ($loginPassed) {
+        try {
+            $healthAddresses = @($Ctx.Addresses)
+            $health = Test-PgConfigHealth -Psql "$($Ctx.Pg.Psql)" -Port ([int]$Ctx.Pg.Port) -Address "$($healthAddresses[0])" -Database "$($Ctx.Db.DatabaseName)" -Major ([int]$Ctx.Pg.Major) -HbaPath "$($Ctx.Pg.HbaPath)" -IdentPath "$($Ctx.Pg.IdentPath)"
+            $healthOk = [bool]$health.Ok
+            if (-not $healthOk) {
+                Write-Log "Config check after the restore: $($health.Detail)" -Level ERROR
+            }
+        } catch {
+            Write-Log "Config check after the restore failed to run: $($_.Exception.Message)" -Level ERROR
+            $healthOk = $false
+        }
+    }
+    return ($allRestored -and $loginPassed -and $healthOk)
+}
+
+# Spec 7.6 Path A: VBR already uses Windows authentication, so SYSTEM logs in to
+# postgres before and after the change and no service is stopped.
+# Returns { ExitCode; Code; Detail; Action } (Code '' and Action '' mean success and
+# the default RMM action). An unexpected error, for example from Write-ConfFileAtomic,
+# is not caught here: it reaches the trap, which restores both files because the
+# stage is PATH_A_WRITING.
+function Invoke-PathA {
+    param([Parameter(Mandatory)][hashtable] $Ctx)
+    $state = $Ctx['State']
+    $writeIdent = ("$($state['PgIdent'])" -ne 'STANDARD')
+    $writeHba = ("$($state['PgHba'])" -ne 'STANDARD')
+    $psql = "$($Ctx.Pg.Psql)"
+    $port = [int]$Ctx.Pg.Port
+    $addresses = @($Ctx.Addresses)
+    $database = "$($Ctx.Db.DatabaseName)"
+    $notes = New-Object System.Collections.ArrayList
+
+    if ($writeIdent -or $writeHba) {
+        # Render both new texts before the backup and the marker (Task 10): a name that
+        # cannot be written as ASCII then stops the run here, at stage UNTOUCHED, with
+        # nothing changed.
+        $identText = ''
+        $hbaText = ''
+        if ($writeIdent) { $identText = New-PgIdentText -Lines @($Ctx.IdentLines) -RequiredNames @($Ctx.RequiredIdentNames) -LineEnding $Ctx.Ident.LineEnding -Stamp $Ctx.Stamp }
+        if ($writeHba) { $hbaText = New-PgHbaText -Lines @($Ctx.HbaLines) -LineEnding $Ctx.Hba.LineEnding -Stamp $Ctx.Stamp }
+
+        Write-Log 'Path A step 1 - back up pg_hba.conf and pg_ident.conf, then write the marker' -Level STEP
+        $Ctx['RunDir'] = New-RunFolder -WorkRoot $Ctx.WorkRoot -Stamp $Ctx.Stamp
+        $Ctx['HbaBackupPath'] = Backup-ConfFile -Path $Ctx.Pg.HbaPath -RunDir $Ctx.RunDir
+        $Ctx['IdentBackupPath'] = Backup-ConfFile -Path $Ctx.Pg.IdentPath -RunDir $Ctx.RunDir
+        Write-Log "pg_hba.conf SDDL before the change: $($Ctx.Hba.Sddl)"
+        Write-Log "pg_ident.conf SDDL before the change: $($Ctx.Ident.Sddl)"
+        $null = Write-ChangeMarker -WorkRoot $Ctx.WorkRoot -RunDir $Ctx.RunDir -PathName 'A' -Stage 'PATH_A_WRITING'
+        $script:Stage = 'PATH_A_WRITING'
+
+        Write-Log 'Path A step 2 - write the files that are not standard' -Level STEP
+        if ($writeIdent) {
+            $null = Write-ConfFileAtomic -Path $Ctx.Pg.IdentPath -Bytes (ConvertTo-Latin1Bytes -Text $identText) -ExpectedSddl $Ctx.Ident.Sddl
+            Write-Log "Wrote $($Ctx.Pg.IdentPath)" -Level OK
+        }
+        if ($writeHba) {
+            $hbaRules = @($Ctx.HbaRules | Where-Object { $null -ne $_ })
+            if ($hbaRules.Count -gt 0) {
+                foreach ($rule in @(Get-NonLoopbackHbaRules -Rules $hbaRules)) {
+                    $ruleText = "line $([int]$rule.LineIndex + 1): $($rule.Type) $($rule.Database) $($rule.User) $($rule.Address) $($rule.Method)"
+                    Write-Log "pg_hba.conf line for another address is commented out: $ruleText" -Level WARN
+                    [void]$notes.Add("Commented out pg_hba.conf $ruleText.")
+                }
+            }
+            $null = Write-ConfFileAtomic -Path $Ctx.Pg.HbaPath -Bytes (ConvertTo-Latin1Bytes -Text $hbaText) -ExpectedSddl $Ctx.Hba.Sddl
+            Write-Log "Wrote $($Ctx.Pg.HbaPath)" -Level OK
+        }
+
+        Write-Log 'Path A step 3 - SSPI test as SYSTEM and PostgreSQL config check' -Level STEP
+        $failure = ''
+        $sspi = Test-PgSspiLogin -Psql $psql -Port $port -Addresses $addresses -Database $database
+        if (-not $sspi.Passed) {
+            $failed = @($sspi.Results | Where-Object { $null -ne $_ -and "$($_.Kind)" -ne 'OK' } | ForEach-Object { "$($_.Address) $($_.Kind) $($_.StdErr)" })
+            $failure = 'SSPI login as SYSTEM failed after the write: ' + ($failed -join '; ')
+        } else {
+            $health = Test-PgConfigHealth -Psql $psql -Port $port -Address $addresses[0] -Database $database -Major ([int]$Ctx.Pg.Major) -HbaPath "$($Ctx.Pg.HbaPath)" -IdentPath "$($Ctx.Pg.IdentPath)"
+            if (-not $health.Ok) { $failure = "PostgreSQL reports a problem with the new files: $($health.Detail)" }
+        }
+        if ($failure) {
+            Write-Log $failure -Level ERROR
+            if (Restore-PathAFiles -Ctx $Ctx) {
+                $markerNote = ''
+                if (-not (Remove-ChangeMarker -WorkRoot $Ctx.WorkRoot)) {
+                    $markerNote = " The marker could not be removed: delete $(Join-Path $Ctx.WorkRoot 'CHANGES-IN-PROGRESS.marker') after checking the files."
+                }
+                return [pscustomobject]@{
+                    ExitCode = 40
+                    Code     = 'PG_SSPI_TEST_FAILED'
+                    Detail   = "$failure; both files were restored from $($Ctx.RunDir) and SYSTEM can log in again.$markerNote"
+                    Action   = ''
+                }
+            }
+            return [pscustomobject]@{
+                ExitCode = 50
+                Code     = 'ROLLBACK_FAILED'
+                Detail   = "PG_SSPI_TEST_FAILED: $failure; after restoring both files from $($Ctx.RunDir) SYSTEM still cannot log in. The marker stays."
+                Action   = 'PAGE AN OPERATOR NOW. VBR may not be able to open new database connections. Follow the MARKER_PRESENT recovery steps in README.md.'
+            }
+        }
+        [void]$notes.Add("pg_hba.conf and pg_ident.conf are standard now. Backups: $($Ctx.RunDir).")
+    }
+
+    Write-Log 'Path A step 4 - the files are verified; remove the marker' -Level STEP
+    $script:Stage = 'PATH_A_DONE'
+    if ($writeIdent -or $writeHba) {
+        if (-not (Remove-ChangeMarker -WorkRoot $Ctx.WorkRoot)) {
+            $null = Add-RunIssue -Code 'POST_CONVERSION_STEP_FAILED' -ExitCode 5 -Detail "The change worked, but the marker could not be removed: $(Join-Path $Ctx.WorkRoot 'CHANGES-IN-PROGRESS.marker')" -Action 'Delete the marker file named in Detail, then re-run'
+        }
+    }
+    Clear-PathFixedIssues -Ctx $Ctx
+
+    if ("$($state['PgPassword'])" -eq 'SET') {
+        Write-Log 'Path A step 5 - clear the postgres password' -Level STEP
+        $clear = Clear-PostgresPassword -Psql $psql -Port $port -Address $addresses[0] -Database $database
+        if (-not $clear.Ok) {
+            Clear-PathFixedIssues -Ctx $Ctx -IncludePassword
+            return [pscustomobject]@{
+                ExitCode = 5
+                Code     = 'PG_PASSWORD_NOT_CLEARED'
+                Detail   = "VBR works with Windows authentication, but the postgres password could not be cleared: $($clear.Detail) $($notes -join ' ')"
+                Action   = 'Re-run with -Apply to clear the postgres password'
+            }
+        }
+        $Ctx['PasswordCleared'] = $true
+        Clear-PathFixedIssues -Ctx $Ctx -IncludePassword
+        [void]$notes.Add('The postgres password was cleared.')
+        Write-Log 'The postgres password is cleared.' -Level OK
+    }
+    return [pscustomobject]@{ ExitCode = 0; Code = ''; Detail = ($notes -join ' '); Action = '' }
+}
 #endregion PathA
 
 #region PathB

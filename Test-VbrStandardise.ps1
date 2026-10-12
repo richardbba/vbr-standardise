@@ -3812,6 +3812,295 @@ try {
 } catch {
     Check 'Task 15: Wait-VbrDbConnected tests ran to the end' $_.Exception.Message ''
 }
+# --- Task 16: Path A flow ---
+$t16Root = New-TestFolder 't16'
+
+# A fake $Ctx with the contract keys. Nothing in it points at a real file.
+function New-T16Ctx {
+    param([string] $PgHba = 'NOT_STANDARD', [string] $PgIdent = 'EXTRA_ENTRY', [string] $PgPassword = 'SET')
+    $pg = [pscustomobject]@{
+        Ok = $true; Code = ''; Detail = ''; Version = '15.8'; Major = 15
+        BaseDir = 'C:\PG'; DataDir = 'C:\PG\data'; ServiceName = 'postgresql-x64-15'
+        Psql = 'C:\PG\bin\psql.exe'; HbaPath = 'C:\PG\data\pg_hba.conf'; IdentPath = 'C:\PG\data\pg_ident.conf'; Port = 5432
+    }
+    $db = [pscustomobject]@{
+        RootKey = 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication'
+        KeyPath = 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication\DatabaseConfigurations\PostgreSql'
+        ActiveConfiguration = 'PostgreSql'; HostName = '127.0.0.1'; Port = 5432; DatabaseName = 'VeeamBackup'
+        UserName = ''; PasswordSet = $false; WindowsAuthRole = 'postgres'
+        EntraIdHost = ''; EntraIdPort = $null; EntraIdPasswordSet = $false
+    }
+    return @{
+        Config             = Get-DefaultConfig
+        WorkRoot           = $t16Root
+        Stamp              = '20261012-101500'
+        RunDir             = ''
+        Apply              = $true
+        CreateRequested    = $false
+        Vbr                = [pscustomobject]@{ Installed = $true; CorePath = 'C:\VBR'; Version = '12.3.2.3617' }
+        Db                 = $db
+        Em                 = $null
+        LocalNames         = @('VBR01', '10.0.0.5')
+        Pg                 = $pg
+        Addresses          = @('127.0.0.1', '::1')
+        SystemNames        = [pscustomobject]@{ English = 'SYSTEM@NT AUTHORITY'; Translated = 'SYSTEM@NT AUTHORITY'; IsAscii = $true }
+        Account            = [pscustomobject]@{ Status = 'OK'; Info = $null; BlocksDb = $false }
+        ServiceAccounts    = [pscustomobject]@{ MapNames = @(); Unresolved = @() }
+        RequiredIdentNames = @('SYSTEM@NT AUTHORITY', 'svc_veeam@VBR01')
+        Hba                = [pscustomobject]@{ Path = $pg.HbaPath; Bytes = [byte[]]@(35); Text = '#'; LineEnding = "`r`n"; HadBom = $false; Sddl = 'SDDL-HBA' }
+        HbaLines           = @('host all all 127.0.0.1/32 scram-sha-256')
+        HbaRules           = @()
+        Ident              = [pscustomobject]@{ Path = $pg.IdentPath; Bytes = [byte[]]@(35); Text = '#'; LineEnding = "`n"; HadBom = $false; Sddl = 'SDDL-IDENT' }
+        IdentLines         = @('veeam "Administrator@VBR01" postgres')
+        IdentEntries       = @()
+        State              = @{ RegistryAuth = 'WINDOWS'; SspiPassed = $true; DbAuth = 'WINDOWS'; PgHba = $PgHba; PgIdent = $PgIdent; PgPassword = $PgPassword; Backends = @() }
+        HbaBackupPath      = ''
+        IdentBackupPath    = ''
+        Snapshot           = @()
+        StopSet            = @()
+        Stopped            = @()
+        RegSnapshot        = @{}
+        RegBackup          = $null
+        StartUtc           = [DateTime]::MinValue
+        LogOffset          = [long]0
+        PasswordCleared    = $false
+    }
+}
+
+# Mocks for every function Path A calls. Dot-source inside a child scope '& { }'.
+# $calls records the order; Write-ConfFileAtomic and Clear-PostgresPassword also
+# record the stage at the moment they run.
+$t16Mocks = {
+    $calls = New-Object System.Collections.ArrayList
+    $sspiQueue = New-Object System.Collections.Queue
+    $fake = @{ HealthOk = $true; ClearOk = $true; RemoveMarkerOk = $true; WriteThrows = ''; RestoreThrows = '' }
+    function New-RunFolder { param($WorkRoot, $Stamp) [void]$calls.Add('New-RunFolder'); return (Join-Path $WorkRoot "runs\$Stamp") }
+    function Backup-ConfFile { param($Path, $RunDir) [void]$calls.Add("Backup-ConfFile:$(Split-Path -Leaf $Path)"); return (Join-Path $RunDir ((Split-Path -Leaf $Path) + '.before')) }
+    function Write-ChangeMarker { param($WorkRoot, $RunDir, $PathName, $Stage) [void]$calls.Add("Write-ChangeMarker:${PathName}:$Stage") }
+    function Remove-ChangeMarker { param($WorkRoot) [void]$calls.Add('Remove-ChangeMarker'); return [bool]$fake.RemoveMarkerOk }
+    function New-PgIdentText { param($Lines, $RequiredNames, $LineEnding, $Stamp) return "veeam `"SYSTEM@NT AUTHORITY`" postgres$LineEnding" }
+    function New-PgHbaText { param($Lines, $LineEnding, $Stamp) return "host all all 127.0.0.1/32 sspi map=veeam$LineEnding" }
+    function ConvertTo-Latin1Bytes { param($Text) return [System.Text.Encoding]::GetEncoding(28591).GetBytes($Text) }
+    function Get-NonLoopbackHbaRules { param($Rules) return @($Rules | Where-Object { "$($_.Type)" -like 'host*' -and @('127.0.0.1/32', '::1/128') -notcontains "$($_.Address)" }) }
+    function Write-ConfFileAtomic {
+        param($Path, $Bytes, $ExpectedSddl)
+        [void]$calls.Add("Write-ConfFileAtomic:$(Split-Path -Leaf $Path):${ExpectedSddl}:$script:Stage")
+        if ($fake.WriteThrows) { throw $fake.WriteThrows }
+    }
+    function Restore-ConfFile {
+        param($Path, $BackupPath, $ExpectedSddl)
+        [void]$calls.Add("Restore-ConfFile:$(Split-Path -Leaf $Path):$(Split-Path -Leaf $BackupPath):$ExpectedSddl")
+        if ($fake.RestoreThrows -and (Split-Path -Leaf $Path) -eq $fake.RestoreThrows) { throw 'restore failed' }
+    }
+    function Test-PgSspiLogin {
+        param($Psql, $Port, $Addresses, $Database)
+        [void]$calls.Add('Test-PgSspiLogin')
+        $passed = $true
+        if ($sspiQueue.Count -gt 0) { $passed = [bool]$sspiQueue.Dequeue() }
+        $kind = 'OK'
+        if (-not $passed) { $kind = 'AUTH' }
+        return [pscustomobject]@{ Passed = $passed; Results = @([pscustomobject]@{ Address = '127.0.0.1'; ExitCode = 2; Kind = $kind; StdErr = 'no match in usermap' }) }
+    }
+    function Test-PgConfigHealth { param($Psql, $Port, $Address, $Database, $Major, $HbaPath, $IdentPath) [void]$calls.Add('Test-PgConfigHealth'); return [pscustomobject]@{ Ok = [bool]$fake.HealthOk; Detail = 'pg_hba_file_rules has 1 error' } }
+    function Clear-PostgresPassword { param($Psql, $Port, $Address, $Database) [void]$calls.Add("Clear-PostgresPassword:$script:Stage"); return [pscustomobject]@{ Ok = [bool]$fake.ClearOk; Detail = 'ALTER ROLE failed' } }
+}
+
+# Clear-PathFixedIssues: removes only the drift a finished path fixed.
+& {
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'APPLY'
+    foreach ($code in @('SVC_DISABLED', 'DB_NATIVE_AUTH', 'DB_HOST_NOT_LOCAL', 'DB_WINDOWS_ROLE_NOT_POSTGRES', 'PG_HBA_NOT_STANDARD', 'PG_IDENT_NOT_STANDARD', 'PG_POSTGRES_PASSWORD_SET')) {
+        $null = Add-RunIssue -Code $code -ExitCode 5 -Detail 'test'
+    }
+    $ctx = New-T16Ctx -PgPassword 'SET'
+    Clear-PathFixedIssues -Ctx $ctx
+    Check 'T16 fixed drift removed, password issue kept' ((@($script:Issues) | ForEach-Object { $_.Code }) -join ',') 'SVC_DISABLED,PG_POSTGRES_PASSWORD_SET'
+    Check 'T16 state PgHba STANDARD after fix' $ctx.State['PgHba'] 'STANDARD'
+    Check 'T16 report DbAuth WINDOWS after fix' $script:Report['DbAuth'] 'WINDOWS'
+    Check 'T16 report PgPassword unchanged while not cleared' $script:Report['PgPassword'] 'SET'
+    $ctx.PasswordCleared = $true
+    Clear-PathFixedIssues -Ctx $ctx -IncludePassword
+    Check 'T16 -IncludePassword removes PG_POSTGRES_PASSWORD_SET' ((@($script:Issues) | ForEach-Object { $_.Code }) -join ',') 'SVC_DISABLED'
+    Check 'T16 report PgPassword NONE when cleared' $script:Report['PgPassword'] 'NONE'
+}
+
+# Happy path: both files drift and the password is set.
+& {
+    . $t16Mocks
+    $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'APPLY'
+    foreach ($code in @('SVC_DISABLED', 'PG_HBA_NOT_STANDARD', 'PG_IDENT_NOT_STANDARD', 'PG_POSTGRES_PASSWORD_SET')) { $null = Add-RunIssue -Code $code -ExitCode 5 -Detail 'test' }
+    $ctx = New-T16Ctx
+    $result = Invoke-PathA -Ctx $ctx
+    Check 'T16 happy: exit 0' $result.ExitCode 0
+    Check 'T16 happy: no issue code' $result.Code ''
+    Check 'T16 happy: spec order (backup, marker, ident, hba, test, marker off, password)' ($calls -join ' > ') ('New-RunFolder > Backup-ConfFile:pg_hba.conf > Backup-ConfFile:pg_ident.conf > Write-ChangeMarker:A:PATH_A_WRITING > ' +
+        'Write-ConfFileAtomic:pg_ident.conf:SDDL-IDENT:PATH_A_WRITING > Write-ConfFileAtomic:pg_hba.conf:SDDL-HBA:PATH_A_WRITING > ' +
+        'Test-PgSspiLogin > Test-PgConfigHealth > Remove-ChangeMarker > Clear-PostgresPassword:PATH_A_DONE')
+    Check 'T16 happy: stage PATH_A_DONE' $script:Stage 'PATH_A_DONE'
+    Check 'T16 happy: run folder recorded' $ctx.RunDir (Join-Path $t16Root 'runs\20261012-101500')
+    Check 'T16 happy: pg_hba backup recorded' $ctx.HbaBackupPath (Join-Path $t16Root 'runs\20261012-101500\pg_hba.conf.before')
+    Check 'T16 happy: pg_ident backup recorded' $ctx.IdentBackupPath (Join-Path $t16Root 'runs\20261012-101500\pg_ident.conf.before')
+    Check 'T16 happy: PasswordCleared set' $ctx.PasswordCleared 'True'
+    Check 'T16 happy: only the account issue is left' ((@($script:Issues) | ForEach-Object { $_.Code }) -join ',') 'SVC_DISABLED'
+    Check 'T16 happy: report PgHba' $script:Report['PgHba'] 'STANDARD'
+    Check 'T16 happy: report PgIdent' $script:Report['PgIdent'] 'STANDARD'
+    Check 'T16 happy: report PgPassword' $script:Report['PgPassword'] 'NONE'
+    Check 'T16 happy: detail names the run folder' ($result.Detail -like "*$(Join-Path $t16Root 'runs\20261012-101500')*") 'True'
+}
+
+# Files already standard, only the password is set: no backup, no marker, no write.
+& {
+    . $t16Mocks
+    $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'APPLY'
+    $ctx = New-T16Ctx -PgHba 'STANDARD' -PgIdent 'STANDARD' -PgPassword 'SET'
+    $result = Invoke-PathA -Ctx $ctx
+    Check 'T16 password only: exit 0' $result.ExitCode 0
+    Check 'T16 password only: calls' ($calls -join ' > ') 'Clear-PostgresPassword:PATH_A_DONE'
+}
+
+# Only pg_hba.conf drifts; a LAN line is listed in Detail and the log.
+& {
+    . $t16Mocks
+    $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'APPLY'
+    $script:LogLines.Clear()
+    $ctx = New-T16Ctx -PgHba 'NOT_STANDARD' -PgIdent 'STANDARD' -PgPassword 'NONE'
+    $ctx.HbaRules = @(
+        [pscustomobject]@{ LineIndex = 3; Type = 'host'; Database = 'all'; User = 'all'; Address = '127.0.0.1/32'; Method = 'scram-sha-256'; Options = '' },
+        [pscustomobject]@{ LineIndex = 94; Type = 'host'; Database = 'all'; User = 'all'; Address = '10.0.0.0/8'; Method = 'scram-sha-256'; Options = '' }
+    )
+    $result = Invoke-PathA -Ctx $ctx
+    Check 'T16 hba only: exit 0' $result.ExitCode 0
+    Check 'T16 hba only: one write, pg_hba.conf' (@($calls | Where-Object { $_ -like 'Write-ConfFileAtomic:*' }) -join ',') 'Write-ConfFileAtomic:pg_hba.conf:SDDL-HBA:PATH_A_WRITING'
+    Check 'T16 hba only: LAN line in Detail' ($result.Detail -like '*line 95: host all all 10.0.0.0/8 scram-sha-256*') 'True'
+    Check 'T16 hba only: LAN line logged as WARN' (@($script:LogLines | Where-Object { $_ -like '`[WARN`]*10.0.0.0/8*' }).Count) 1
+    Check 'T16 hba only: no password step' (@($calls | Where-Object { $_ -like 'Clear-PostgresPassword*' }).Count) 0
+}
+
+# SSPI test fails after the write; the restore brings SSPI back -> 40, marker removed.
+& {
+    . $t16Mocks
+    $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'APPLY'
+    $null = Add-RunIssue -Code 'PG_HBA_NOT_STANDARD' -ExitCode 5 -Detail 'test'
+    $sspiQueue.Enqueue($false)
+    $sspiQueue.Enqueue($true)
+    $ctx = New-T16Ctx
+    $result = Invoke-PathA -Ctx $ctx
+    Check 'T16 test fails, restore ok: exit 40' $result.ExitCode 40
+    Check 'T16 test fails, restore ok: code' $result.Code 'PG_SSPI_TEST_FAILED'
+    $afterFirstTest = @($calls)[(@($calls).IndexOf('Test-PgSspiLogin') + 1)..(@($calls).Count - 1)] -join ' > '
+    Check 'T16 test fails, restore ok: restore ident, hba, test, marker off' $afterFirstTest ('Restore-ConfFile:pg_ident.conf:pg_ident.conf.before:SDDL-IDENT > ' +
+        'Restore-ConfFile:pg_hba.conf:pg_hba.conf.before:SDDL-HBA > Test-PgSspiLogin > Test-PgConfigHealth > Remove-ChangeMarker')
+    Check 'T16 test fails, restore ok: no password step' (@($calls | Where-Object { $_ -like 'Clear-PostgresPassword*' }).Count) 0
+    Check 'T16 test fails, restore ok: stage stays PATH_A_WRITING' $script:Stage 'PATH_A_WRITING'
+    Check 'T16 test fails, restore ok: drift issue kept' ((@($script:Issues) | ForEach-Object { $_.Code }) -join ',') 'PG_HBA_NOT_STANDARD'
+}
+
+# Config check fails and SSPI still fails after the restore -> 50, marker stays.
+& {
+    . $t16Mocks
+    $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'APPLY'
+    $fake.HealthOk = $false
+    $sspiQueue.Enqueue($true)
+    $sspiQueue.Enqueue($false)
+    $result = Invoke-PathA -Ctx (New-T16Ctx)
+    Check 'T16 restore fails: exit 50' $result.ExitCode 50
+    Check 'T16 restore fails: code' $result.Code 'ROLLBACK_FAILED'
+    Check 'T16 restore fails: detail keeps the first failure' ($result.Detail -like 'PG_SSPI_TEST_FAILED:*pg_hba_file_rules has 1 error*') 'True'
+    Check 'T16 restore fails: marker not removed' (@($calls | Where-Object { $_ -eq 'Remove-ChangeMarker' }).Count) 0
+    Check 'T16 restore fails: action pages' ($result.Action -like 'PAGE AN OPERATOR*') 'True'
+}
+
+# Clearing the password fails after verified files -> 5 PG_PASSWORD_NOT_CLEARED.
+& {
+    . $t16Mocks
+    $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'APPLY'
+    $null = Add-RunIssue -Code 'PG_POSTGRES_PASSWORD_SET' -ExitCode 5 -Detail 'test'
+    $fake.ClearOk = $false
+    $ctx = New-T16Ctx
+    $result = Invoke-PathA -Ctx $ctx
+    Check 'T16 password not cleared: exit 5' $result.ExitCode 5
+    Check 'T16 password not cleared: code' $result.Code 'PG_PASSWORD_NOT_CLEARED'
+    Check 'T16 password not cleared: stage PATH_A_DONE' $script:Stage 'PATH_A_DONE'
+    Check 'T16 password not cleared: PasswordCleared false' $ctx.PasswordCleared 'False'
+    Check 'T16 password not cleared: replaces PG_POSTGRES_PASSWORD_SET' @($script:Issues).Count 0
+}
+
+# The marker cannot be removed after a verified write -> still 0, plus a 5 issue.
+& {
+    . $t16Mocks
+    $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'APPLY'
+    $fake.RemoveMarkerOk = $false
+    $result = Invoke-PathA -Ctx (New-T16Ctx -PgPassword 'NONE')
+    Check 'T16 marker stuck: path result 0' $result.ExitCode 0
+    Check 'T16 marker stuck: POST_CONVERSION_STEP_FAILED added' ((@($script:Issues) | ForEach-Object { "$($_.Code)/$($_.ExitCode)" }) -join ',') 'POST_CONVERSION_STEP_FAILED/5'
+}
+
+# An unexpected write error is left to the trap, with the stage that makes it restore.
+& {
+    . $t16Mocks
+    $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'APPLY'
+    $fake.WriteThrows = 'The process cannot access the file'
+    Throws 'T16 write error reaches the trap' { Invoke-PathA -Ctx (New-T16Ctx) }
+    Check 'T16 write error: stage is PATH_A_WRITING for the trap' $script:Stage 'PATH_A_WRITING'
+    Check 'T16 write error: marker was written before the write' (@($calls).IndexOf('Write-ChangeMarker:A:PATH_A_WRITING') -lt @($calls).IndexOf('Write-ConfFileAtomic:pg_ident.conf:SDDL-IDENT:PATH_A_WRITING')) 'True'
+}
+
+# Both texts are rendered first: a name that cannot be written as ASCII stops Path A
+# before the backup and the marker, so the trap has nothing to restore.
+& {
+    . $t16Mocks
+    $script:Stage = 'UNTOUCHED'
+    function New-PgIdentText { param($Lines, $RequiredNames, $LineEnding, $Stamp) throw 'New-PgIdentText: the name is not printable ASCII' }
+    Throws 'T16 render error reaches the trap' { Invoke-PathA -Ctx (New-T16Ctx) }
+    Check 'T16 render error: no run folder, backup, marker or write' (@($calls | Where-Object { $_ -like 'New-RunFolder*' -or $_ -like 'Backup-ConfFile*' -or $_ -like 'Write-ChangeMarker*' -or $_ -like 'Write-ConfFileAtomic*' }).Count) 0
+    Check 'T16 render error: stage stays UNTOUCHED' $script:Stage 'UNTOUCHED'
+}
+
+# Restore-PathAFiles on its own.
+& {
+    . $t16Mocks
+    $ctx = New-T16Ctx
+    $ctx.HbaBackupPath = 'C:\runs\x\pg_hba.conf.before'
+    $ctx.IdentBackupPath = 'C:\runs\x\pg_ident.conf.before'
+    Check 'T16 restore: both restored and SSPI ok -> True' (Restore-PathAFiles -Ctx $ctx) 'True'
+    Check 'T16 restore: ident first, then hba, then the SSPI test and config check' ($calls -join ' > ') ('Restore-ConfFile:pg_ident.conf:pg_ident.conf.before:SDDL-IDENT > ' +
+        'Restore-ConfFile:pg_hba.conf:pg_hba.conf.before:SDDL-HBA > Test-PgSspiLogin > Test-PgConfigHealth')
+    $calls.Clear()
+    $fake.HealthOk = $false
+    Check 'T16 restore: config check failing after the restore -> False' (Restore-PathAFiles -Ctx $ctx) 'False'
+    $fake.HealthOk = $true
+    $calls.Clear()
+    $fake.RestoreThrows = 'pg_ident.conf'
+    Check 'T16 restore: a failed file -> False' (Restore-PathAFiles -Ctx $ctx) 'False'
+    Check 'T16 restore: the other file is still restored' (@($calls | Where-Object { $_ -like 'Restore-ConfFile:pg_hba.conf*' }).Count) 1
+    $calls.Clear()
+    $fake.RestoreThrows = ''
+    $ctx.IdentBackupPath = ''
+    Check 'T16 restore: missing backup -> False' (Restore-PathAFiles -Ctx $ctx) 'False'
+    Check 'T16 restore: nothing restored without a backup path' (@($calls | Where-Object { $_ -like 'Restore-ConfFile:pg_ident.conf*' }).Count) 0
+    $calls.Clear()
+    $ctx.IdentBackupPath = 'C:\runs\x\pg_ident.conf.before'
+    $sspiQueue.Enqueue($false)
+    Check 'T16 restore: SSPI still failing -> False' (Restore-PathAFiles -Ctx $ctx) 'False'
+}
+$script:Stage = 'UNTOUCHED'
+$script:Issues = New-Object System.Collections.ArrayList
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue
