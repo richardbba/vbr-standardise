@@ -2815,6 +2815,123 @@ function New-PgHbaText {
 #endregion PgHba
 
 #region PgIdent
+# One object per active pg_ident.conf line: { LineIndex; Map; SystemUser; PgUser },
+# quotes removed. A short line gets '' for the missing fields.
+function Get-PgIdentEntries {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]] $Lines)
+    $entries = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $Lines.Length; $i++) {
+        $t = @(Split-ConfTokens -Line $Lines[$i])
+        if ($t.Count -eq 0) { continue }
+        $systemUser = ''
+        $pgUser = ''
+        if ($t.Count -gt 1) { $systemUser = $t[1] }
+        if ($t.Count -gt 2) { $pgUser = $t[2] }
+        [void]$entries.Add([pscustomobject]@{
+            LineIndex  = $i
+            Map        = $t[0]
+            SystemUser = $systemUser
+            PgUser     = $pgUser
+        })
+    }
+    return $entries.ToArray()
+}
+
+# The names the veeam map must hold (spec 7.3): SYSTEM, then svc_veeam, then the
+# accounts of Veeam services that do not run as LocalSystem. Duplicates are removed
+# case-insensitively (PostgreSQL compares SSPI names case-insensitively); the first
+# spelling wins. Empty names are skipped, so a missing svc_veeam gives no empty line.
+function Get-RequiredIdentNames {
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $SvcMapName,
+        [string[]] $ServiceAccountMapNames = @()
+    )
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($name in (@('SYSTEM@NT AUTHORITY', $SvcMapName) + @($ServiceAccountMapNames))) {
+        if ([string]::IsNullOrEmpty($name)) { continue }
+        if ($seen.Add($name)) { $names.Add($name) }
+    }
+    return $names.ToArray()
+}
+
+# STANDARD when the veeam map holds every required name mapped to postgres and nothing
+# else. MISSING_ENTRY when a required name has no veeam entry to postgres; EXTRA_ENTRY
+# when a veeam entry is not required or maps to another role. MISSING wins over EXTRA.
+# System names compare case-insensitively. The map name and the role are
+# case-sensitive, as in PostgreSQL: 'Veeam' is another map, 'Postgres' another role.
+function Get-PgIdentStatus {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Entries,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $RequiredNames
+    )
+    $required = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $RequiredNames) { if (-not [string]::IsNullOrEmpty($name)) { [void]$required.Add($name) } }
+    $mapped = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    $extra = $false
+    foreach ($entry in $Entries) {
+        if ([string](Get-CfgValue -Object $entry -Name 'Map' -Default '') -cne 'veeam') { continue }
+        $systemUser = [string](Get-CfgValue -Object $entry -Name 'SystemUser' -Default '')
+        $pgUser = [string](Get-CfgValue -Object $entry -Name 'PgUser' -Default '')
+        if ($pgUser -ceq 'postgres' -and $required.Contains($systemUser)) {
+            [void]$mapped.Add($systemUser)
+        } else {
+            $extra = $true
+        }
+    }
+    foreach ($name in $required) {
+        if (-not $mapped.Contains($name)) { return 'MISSING_ENTRY' }
+    }
+    if ($extra) { return 'EXTRA_ENTRY' }
+    return 'STANDARD'
+}
+
+# The new pg_ident.conf text (spec 7.8). Lines outside the veeam map stay as they are.
+# A veeam line that is not required, or maps to another role, gets the ASCII prefix
+# '# [VbrStandardise <Stamp>] ' in front of its original characters. Each required name
+# without a veeam line to postgres is appended as: veeam   "<name>"   postgres
+# New lines are ASCII only: a name that is not printable ASCII, or holds a double
+# quote, is refused (throw) rather than written.
+function New-PgIdentText {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]] $Lines,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $RequiredNames,
+        [Parameter(Mandatory = $true)][string] $LineEnding,
+        [Parameter(Mandatory = $true)][string] $Stamp
+    )
+    if (-not (Test-AsciiText -Text $Stamp)) { throw "New-PgIdentText: the stamp '$Stamp' is not printable ASCII." }
+    $required = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $RequiredNames) { if (-not [string]::IsNullOrEmpty($name)) { [void]$required.Add($name) } }
+    $mapped = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    $prefix = "# [VbrStandardise $Stamp] "
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $Lines) {
+        $t = @(Split-ConfTokens -Line $line)
+        if ($t.Count -eq 0 -or $t[0] -cne 'veeam') {
+            $out.Add($line)
+            continue
+        }
+        $systemUser = ''
+        $pgUser = ''
+        if ($t.Count -gt 1) { $systemUser = $t[1] }
+        if ($t.Count -gt 2) { $pgUser = $t[2] }
+        if ($pgUser -ceq 'postgres' -and $required.Contains($systemUser)) {
+            $out.Add($line)
+            [void]$mapped.Add($systemUser)
+        } else {
+            $out.Add($prefix + $line)
+        }
+    }
+    foreach ($name in $RequiredNames) {
+        if ([string]::IsNullOrEmpty($name) -or $mapped.Contains($name)) { continue }
+        if (-not (Test-AsciiText -Text $name) -or $name.Contains('"')) {
+            throw "New-PgIdentText: the name '$name' is not printable ASCII or holds a double quote. It is not written to pg_ident.conf."
+        }
+        $out.Add('veeam   "' + $name + '"   postgres')
+        [void]$mapped.Add($name)
+    }
+    return (Join-ConfLines -Lines $out.ToArray() -LineEnding $LineEnding)
+}
 #endregion PgIdent
 
 #region Psql

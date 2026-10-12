@@ -2464,6 +2464,173 @@ host    replication     all             ::1/128                 sspi map=veeam
         Check 'T9 render checks ran without an error' $_.Exception.Message ''
     }
 }
+# --- Task 10: pg_ident.conf parse, check and render ---
+# Fixtures, shared by the Task 10 groups below.
+# Stock PostgreSQL file from a native-auth install: comments only.
+$T10Empty = @'
+# PostgreSQL User Name Maps
+# =========================
+#
+# Refer to the PostgreSQL documentation, chapter "Client
+# Authentication" for a complete description.
+
+# Put your actual configuration here
+# ----------------------------------
+
+# MAPNAME       SYSTEM-USERNAME         PG-USERNAME
+'@
+# Veeam's default SSPI file (KB4818): SYSTEM plus the account that ran the installer.
+$T10Veeam = @'
+# MAPNAME       SYSTEM-USERNAME         PG-USERNAME
+veeam   "SYSTEM@NT AUTHORITY"   postgres
+veeam   Administrator@DOMAIN   postgres
+'@
+# VBR-PILOT01: SYSTEM, the built-in Administrator and svc_veeam.
+$T10Pilot = @'
+# MAPNAME       SYSTEM-USERNAME         PG-USERNAME
+veeam   "SYSTEM@NT AUTHORITY"   postgres
+veeam   Administrator@VBR-PILOT01   postgres
+veeam   "svc_veeam@VBR-PILOT01"   postgres
+'@
+# A line in another map, which is never touched.
+$T10OtherMap = @'
+veeam   "SYSTEM@NT AUTHORITY"   postgres
+veeam   "svc_veeam@VBR-PILOT01"   postgres
+pgadmins   "jdoe@CORP"   pg_native_admin
+Veeam   "Administrator@VBR-PILOT01"   postgres
+'@
+# A veeam line that maps svc_veeam to another role.
+$T10OtherRole = @'
+veeam   "SYSTEM@NT AUTHORITY"   postgres
+veeam   "svc_veeam@VBR-PILOT01"   pg_native_admin
+'@
+$T10Svc = 'svc_veeam@VBR-PILOT01'
+$T10Stamp = '20261012-101500'
+$T10Prefix = "# [VbrStandardise $T10Stamp] "
+
+# Get-PgIdentEntries and Get-RequiredIdentNames.
+& {
+    try {
+        Check 'T10 a comments-only file has no entries' (@(Get-PgIdentEntries -Lines @(Split-ConfLines -Text $T10Empty)).Count) 0
+        $pilot = @(Get-PgIdentEntries -Lines @(Split-ConfLines -Text $T10Pilot))
+        Check 'T10 pilot file has 3 entries' $pilot.Count 3
+        Check 'T10 entry fields with quotes removed' ('{0}|{1}|{2}|{3}' -f $pilot[0].LineIndex, $pilot[0].Map, $pilot[0].SystemUser, $pilot[0].PgUser) '1|veeam|SYSTEM@NT AUTHORITY|postgres'
+        Check 'T10 an unquoted name is read as is' $pilot[1].SystemUser 'Administrator@VBR-PILOT01'
+        $short = @(Get-PgIdentEntries -Lines @('veeam "a@B" postgres # note', 'veeam'))
+        Check 'T10 a trailing comment is ignored' ('{0}|{1}|{2}' -f $short[0].Map, $short[0].SystemUser, $short[0].PgUser) 'veeam|a@B|postgres'
+        Check 'T10 a short line gets empty fields' ('{0}|{1}|{2}' -f $short[1].Map, $short[1].SystemUser, $short[1].PgUser) 'veeam||'
+
+        Check 'T10 required names: SYSTEM then svc_veeam' (@(Get-RequiredIdentNames -SvcMapName $T10Svc) -join '|') 'SYSTEM@NT AUTHORITY|svc_veeam@VBR-PILOT01'
+        Check 'T10 required names: service accounts last, duplicates removed case-insensitively' (@(Get-RequiredIdentNames -SvcMapName $T10Svc -ServiceAccountMapNames @('veeamsvc@CORP', 'system@nt authority', 'VEEAMSVC@corp', 'SVC_VEEAM@vbr-pilot01')) -join '|') 'SYSTEM@NT AUTHORITY|svc_veeam@VBR-PILOT01|veeamsvc@CORP'
+        Check 'T10 required names skip an empty svc_veeam name' (@(Get-RequiredIdentNames -SvcMapName '' -ServiceAccountMapNames @('veeamsvc@CORP')) -join '|') 'SYSTEM@NT AUTHORITY|veeamsvc@CORP'
+        Check 'T10 required names accept a null svc_veeam name' (@(Get-RequiredIdentNames -SvcMapName $null) -join '|') 'SYSTEM@NT AUTHORITY'
+    } catch {
+        Check 'T10 entry and required-name checks ran without an error' $_.Exception.Message ''
+    }
+}
+
+# Get-PgIdentStatus.
+& {
+    try {
+        $required = @(Get-RequiredIdentNames -SvcMapName $T10Svc)
+        $status = { param([string] $Text, [string[]] $Names) Get-PgIdentStatus -Entries @(Get-PgIdentEntries -Lines @(Split-ConfLines -Text $Text)) -RequiredNames $Names }
+        Check 'T10 empty ident is MISSING_ENTRY' (& $status $T10Empty $required) 'MISSING_ENTRY'
+        Check 'T10 Veeam default ident: svc_veeam missing wins over the extra Administrator' (& $status $T10Veeam $required) 'MISSING_ENTRY'
+        Check 'T10 pilot ident: Administrator is an extra entry' (& $status $T10Pilot $required) 'EXTRA_ENTRY'
+        Check 'T10 a line in another map is ignored' (& $status $T10OtherMap $required) 'STANDARD'
+        Check 'T10 svc_veeam mapped to another role is MISSING_ENTRY' (& $status $T10OtherRole $required) 'MISSING_ENTRY'
+        $extraRole = $T10OtherMap + "`n" + 'veeam   "svc_veeam@VBR-PILOT01"   pg_native_admin'
+        Check 'T10 an extra line to another role is EXTRA_ENTRY' (& $status $extraRole $required) 'EXTRA_ENTRY'
+        $roleCase = 'veeam "SYSTEM@NT AUTHORITY" Postgres' + "`n" + 'veeam "svc_veeam@VBR-PILOT01" postgres'
+        Check 'T10 the role name is case-sensitive' (& $status $roleCase $required) 'MISSING_ENTRY'
+        $nameCase = 'veeam "system@nt authority" postgres' + "`n" + 'veeam SVC_VEEAM@vbr-pilot01 postgres'
+        Check 'T10 system names compare case-insensitively' (& $status $nameCase $required) 'STANDARD'
+        $twice = $T10OtherMap + "`n" + 'veeam "SYSTEM@NT AUTHORITY" postgres'
+        Check 'T10 a required line twice is still STANDARD' (& $status $twice $required) 'STANDARD'
+        $withService = @(Get-RequiredIdentNames -SvcMapName $T10Svc -ServiceAccountMapNames @('veeamsvc@CORP'))
+        Check 'T10 a service account line is required' (& $status $T10OtherMap $withService) 'MISSING_ENTRY'
+        $serviceLine = $T10OtherMap + "`n" + 'veeam "VEEAMSVC@corp" postgres'
+        Check 'T10 a service account line in another case counts' (& $status $serviceLine $withService) 'STANDARD'
+        Check 'T10 that service account line is extra when not required' (& $status $serviceLine $required) 'EXTRA_ENTRY'
+        Check 'T10 a regex system user is an extra entry' (& $status ($T10OtherMap + "`n" + 'veeam /^(.*)@VBR-PILOT01$ postgres') $required) 'EXTRA_ENTRY'
+        $hashEntries = @(@{ Map = 'veeam'; SystemUser = 'SYSTEM@NT AUTHORITY'; PgUser = 'postgres' }, @{ Map = 'veeam'; SystemUser = $T10Svc; PgUser = 'postgres' })
+        Check 'T10 entries given as hashtables are read too' (Get-PgIdentStatus -Entries $hashEntries -RequiredNames $required) 'STANDARD'
+    } catch {
+        Check 'T10 status checks ran without an error' $_.Exception.Message ''
+    }
+}
+
+# New-PgIdentText.
+& {
+    try {
+        $required = @(Get-RequiredIdentNames -SvcMapName $T10Svc)
+        $render = { param([string] $Text, [string[]] $Names, [string] $Eol) New-PgIdentText -Lines @(Split-ConfLines -Text $Text) -RequiredNames $Names -LineEnding $Eol -Stamp $T10Stamp }
+        $statusOf = { param([string] $Text, [string[]] $Names) Get-PgIdentStatus -Entries @(Get-PgIdentEntries -Lines @(Split-ConfLines -Text $Text)) -RequiredNames $Names }
+
+        $expectedPilot = @'
+# MAPNAME       SYSTEM-USERNAME         PG-USERNAME
+veeam   "SYSTEM@NT AUTHORITY"   postgres
+# [VbrStandardise 20261012-101500] veeam   Administrator@VBR-PILOT01   postgres
+veeam   "svc_veeam@VBR-PILOT01"   postgres
+'@
+        $out = & $render $T10Pilot $required "`r`n"
+        Check 'T10 pilot ident renders exactly as expected (CRLF)' ($out -ceq (Join-ConfLines -Lines @(Split-ConfLines -Text $expectedPilot) -LineEnding "`r`n")) $true
+        Check 'T10 rendered pilot ident is STANDARD' (& $statusOf $out $required) 'STANDARD'
+
+        $expectedVeeam = @'
+# MAPNAME       SYSTEM-USERNAME         PG-USERNAME
+veeam   "SYSTEM@NT AUTHORITY"   postgres
+# [VbrStandardise 20261012-101500] veeam   Administrator@DOMAIN   postgres
+veeam   "svc_veeam@VBR-PILOT01"   postgres
+'@
+        $out = & $render $T10Veeam $required "`n"
+        Check 'T10 Veeam default ident renders exactly as expected (LF)' ($out -ceq (Join-ConfLines -Lines @(Split-ConfLines -Text $expectedVeeam) -LineEnding "`n")) $true
+        Check 'T10 rendered Veeam default ident is STANDARD' (& $statusOf $out $required) 'STANDARD'
+
+        $emptyLines = @(Split-ConfLines -Text $T10Empty)
+        $out = @(Split-ConfLines -Text (& $render $T10Empty $required "`r`n"))
+        Check 'T10 empty ident keeps every comment line' (($out[0..($emptyLines.Count - 1)] -join '|') -ceq ($emptyLines -join '|')) $true
+        Check 'T10 empty ident gets SYSTEM and svc_veeam appended' (($out[$emptyLines.Count..($out.Count - 1)]) -join '|') ('veeam   "SYSTEM@NT AUTHORITY"   postgres|veeam   "svc_veeam@VBR-PILOT01"   postgres')
+
+        $out = & $render $T10OtherMap $required "`n"
+        Check 'T10 a line in another map is kept unchanged' (@(Split-ConfLines -Text $out) -ccontains 'pgadmins   "jdoe@CORP"   pg_native_admin') $true
+        Check 'T10 a Veeam (capital V) line is another map and kept unchanged' (@(Split-ConfLines -Text $out) -ccontains 'Veeam   "Administrator@VBR-PILOT01"   postgres') $true
+        Check 'T10 a standard ident renders unchanged' ($out -ceq (Join-ConfLines -Lines @(Split-ConfLines -Text $T10OtherMap) -LineEnding "`n")) $true
+
+        $out = @(Split-ConfLines -Text (& $render $T10OtherRole $required "`n"))
+        Check 'T10 a veeam line to another role is commented out' ($out -ccontains ($T10Prefix + 'veeam   "svc_veeam@VBR-PILOT01"   pg_native_admin')) $true
+        Check 'T10 ...and the svc_veeam line to postgres is appended' $out[$out.Count - 1] 'veeam   "svc_veeam@VBR-PILOT01"   postgres'
+        Check 'T10 rendered other-role ident is STANDARD' (& $statusOf (Join-ConfLines -Lines $out -LineEnding "`n") $required) 'STANDARD'
+
+        $withService = @(Get-RequiredIdentNames -SvcMapName $T10Svc -ServiceAccountMapNames @('veeamsvc@CORP', 'backupsvc@CORP'))
+        $serviceText = $T10Pilot + "`n" + 'veeam   "VEEAMSVC@corp"   postgres'
+        $out = @(Split-ConfLines -Text (& $render $serviceText $withService "`n"))
+        Check 'T10 an existing service account line is kept as written' ($out -ccontains 'veeam   "VEEAMSVC@corp"   postgres') $true
+        Check 'T10 a missing service account line is added once' (@($out | Where-Object { $_ -like '*backupsvc@CORP*' }).Count) 1
+        Check 'T10 veeamsvc is not added a second time' (@($out | Where-Object { $_ -like '*veeamsvc@corp*' }).Count) 1
+        Check 'T10 rendered service ident is STANDARD' (& $statusOf (Join-ConfLines -Lines $out -LineEnding "`n") $withService) 'STANDARD'
+
+        # CP1252 and UTF-8 bytes in a comment and in a removed veeam line survive byte
+        # for byte; CRLF is kept.
+        $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+        $commentBytes = [byte[]]($latin1.GetBytes('# Caf') + [byte[]](0xE9, 0x20, 0x80) + $latin1.GetBytes(' UTF-8 ') + [byte[]](0xC3, 0xA9))
+        $removedBytes = [byte[]]($latin1.GetBytes('veeam   "J') + [byte[]](0xFC) + $latin1.GetBytes('rgen@CORP"   postgres'))
+        $fileBytes = [byte[]]($commentBytes + [byte[]](13, 10) + $latin1.GetBytes('veeam   "SYSTEM@NT AUTHORITY"   postgres') + [byte[]](13, 10) + $removedBytes + [byte[]](13, 10))
+        $read = ConvertFrom-Latin1Bytes -Bytes $fileBytes
+        $outBytes = ConvertTo-Latin1Bytes -Text (New-PgIdentText -Lines @(Split-ConfLines -Text $read) -RequiredNames $required -LineEnding "`r`n" -Stamp $T10Stamp)
+        $hex = { param([byte[]] $B) '-' + [System.BitConverter]::ToString($B) + '-' }
+        Check 'T10 a comment with CP1252 and UTF-8 bytes survives byte for byte' ((& $hex $outBytes).Contains((& $hex ([byte[]]($commentBytes + [byte[]](13, 10)))))) $true
+        Check 'T10 a removed veeam line keeps its bytes after the ASCII prefix' ((& $hex $outBytes).Contains((& $hex ([byte[]]($latin1.GetBytes($T10Prefix) + $removedBytes + [byte[]](13, 10)))))) $true
+        Check 'T10 the appended svc_veeam line ends the file with CRLF' ((& $hex $outBytes).EndsWith((& $hex ($latin1.GetBytes('veeam   "svc_veeam@VBR-PILOT01"   postgres' + "`r`n"))))) $true
+
+        Throws 'T10 a required name that is not ASCII is refused' { New-PgIdentText -Lines @('# empty') -RequiredNames @('SYSTEM@NT AUTHORITY', ('J' + [char]0xFC + 'rgen@CORP')) -LineEnding "`n" -Stamp $T10Stamp }
+        Throws 'T10 a required name with a double quote is refused' { New-PgIdentText -Lines @('# empty') -RequiredNames @('a"b@CORP') -LineEnding "`n" -Stamp $T10Stamp }
+        Throws 'T10 a stamp that is not ASCII is refused' { New-PgIdentText -Lines @('# empty') -RequiredNames $required -LineEnding "`n" -Stamp ('2026' + [char]0xE9) }
+        Check 'T10 a non-ASCII name already mapped to postgres is kept, not refused' ((New-PgIdentText -Lines @(('veeam "J' + [char]0xFC + 'rgen@CORP" postgres'), 'veeam "SYSTEM@NT AUTHORITY" postgres') -RequiredNames @('SYSTEM@NT AUTHORITY', ('J' + [char]0xFC + 'rgen@CORP')) -LineEnding "`n" -Stamp $T10Stamp).Contains([string][char]0xFC)) $true
+    } catch {
+        Check 'T10 render checks ran without an error' $_.Exception.Message ''
+    }
+}
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue
