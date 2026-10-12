@@ -381,6 +381,7 @@ Check 'T2 trap action PATH_A_WRITING' (Get-TrapAction -Stage 'PATH_A_WRITING') '
 Check 'T2 trap action PATH_A_DONE' (Get-TrapAction -Stage 'PATH_A_DONE') 'NO_ROLLBACK'
 Check 'T2 trap action VERIFIED' (Get-TrapAction -Stage 'VERIFIED') 'NO_ROLLBACK'
 Check 'T2 trap action PATH_B_CHANGING' (Get-TrapAction -Stage 'PATH_B_CHANGING') 'ROLLBACK_PATH_B'
+Check 'T2 trap action ROLLED_BACK' (Get-TrapAction -Stage 'ROLLED_BACK') 'EXIT_AFTER_ROLLBACK'
 Check 'T2 trap action unknown stage' (Get-TrapAction -Stage 'SOMETHING_ELSE') 'EXIT_UNHANDLED'
 Check 'T2 trap action empty stage' (Get-TrapAction -Stage '') 'EXIT_UNHANDLED'
 
@@ -4054,7 +4055,7 @@ $t16Mocks = {
     Check 'T16 test fails, restore ok: restore ident, hba, test, marker off' $afterFirstTest ('Restore-ConfFile:pg_ident.conf:pg_ident.conf.before:SDDL-IDENT > ' +
         'Restore-ConfFile:pg_hba.conf:pg_hba.conf.before:SDDL-HBA > Test-PgSspiLogin > Test-PgConfigHealth > Remove-ChangeMarker')
     Check 'T16 test fails, restore ok: no password step' (@($calls | Where-Object { $_ -like 'Clear-PostgresPassword*' }).Count) 0
-    Check 'T16 test fails, restore ok: stage stays PATH_A_WRITING' $script:Stage 'PATH_A_WRITING'
+    Check 'T16 test fails, restore ok: stage ROLLED_BACK, so the trap never restores again' $script:Stage 'ROLLED_BACK'
     Check 'T16 test fails, restore ok: drift issue kept' ((@($script:Issues) | ForEach-Object { $_.Code }) -join ',') 'PG_HBA_NOT_STANDARD'
 }
 
@@ -4073,6 +4074,7 @@ $t16Mocks = {
     Check 'T16 restore fails: detail keeps the first failure' ($result.Detail -like 'PG_SSPI_TEST_FAILED:*pg_hba_file_rules has 1 error*') 'True'
     Check 'T16 restore fails: marker not removed' (@($calls | Where-Object { $_ -eq 'Remove-ChangeMarker' }).Count) 0
     Check 'T16 restore fails: action pages' ($result.Action -like 'PAGE AN OPERATOR*') 'True'
+    Check 'T16 restore fails: stage ROLLED_BACK, so the trap never restores again' $script:Stage 'ROLLED_BACK'
 }
 
 # Clearing the password fails after verified files -> 5 PG_PASSWORD_NOT_CLEARED.
@@ -4478,6 +4480,7 @@ $t17Mocks = {
     Check 'T17 wont stop, wont start: exit 50' $result.ExitCode 50
     Check 'T17 wont stop, wont start: code' $result.Code 'ROLLBACK_FAILED'
     Check 'T17 wont stop, wont start: marker stays' (@($calls | Where-Object { $_ -eq 'Remove-ChangeMarker' }).Count) 0
+    Check 'T17 wont stop, wont start: stage ROLLED_BACK, so the trap adds no rollback' $script:Stage 'ROLLED_BACK'
 }
 
 # Step 5: the StopPending service never leaves StopPending, so it cannot be started
@@ -4524,7 +4527,8 @@ $t17Mocks = {
     Check 'T17 connect fails: registry was switched first' (@($calls | Where-Object { $_ -like 'Set-RegistryTargets*' }).Count) 1
     Check 'T17 connect fails: password never cleared' (@($calls | Where-Object { $_ -like 'Clear-PostgresPassword*' }).Count) 0
     Check 'T17 connect fails: last-failure written' (@($calls | Where-Object { $_ -eq 'Write-LastFailure' }).Count) 1
-    Check 'T17 connect fails: never VERIFIED' $script:Stage 'PATH_B_CHANGING'
+    Check 'T17 connect fails: never VERIFIED, stage ROLLED_BACK after the rollback' $script:Stage 'ROLLED_BACK'
+    Check 'T17 connect fails: the trap would not roll back again' (Get-TrapAction -Stage $script:Stage) 'EXIT_AFTER_ROLLBACK'
 }
 
 # Step 10 fails and the rollback cannot prove VBR works -> 50, marker stays.
@@ -4539,6 +4543,7 @@ $t17Mocks = {
     Check 'T17 rollback fails: detail keeps the cause' ($result.Detail -like 'VBR_DB_CONNECT_FAILED:*') 'True'
     Check 'T17 rollback fails: marker stays' (@($calls | Where-Object { $_ -eq 'Remove-ChangeMarker' }).Count) 0
     Check 'T17 rollback fails: last-failure still written' (@($calls | Where-Object { $_ -eq 'Write-LastFailure' }).Count) 1
+    Check 'T17 rollback fails: stage ROLLED_BACK, so a later error cannot remove the kept marker' $script:Stage 'ROLLED_BACK'
 }
 
 # Step 6: an unexpected write error -> rollback here -> 40 UNHANDLED_ERROR.
@@ -4907,7 +4912,7 @@ $t18TrapMocks = {
     $calls = New-Object System.Collections.ArrayList
     $completed = New-Object System.Collections.ArrayList
     $secondErrors = New-Object System.Collections.ArrayList
-    $fake = @{ Restored = $true; Rollback = $null; CompleteError = '' }
+    $fake = @{ Restored = $true; Rollback = $null; CompleteError = ''; MarkerOk = $true }
     function Complete-Run {
         param([int] $ExitCode = 0, [string] $Code = '', [string] $Detail = '', [string] $Action = '')
         [void]$completed.Add([pscustomobject]@{ ExitCode = $ExitCode; Code = $Code; Detail = $Detail; Action = $Action })
@@ -4926,7 +4931,7 @@ $t18TrapMocks = {
     }
     function Restore-PathAFiles { param($Ctx) [void]$calls.Add('Restore-PathAFiles'); return [bool]$fake.Restored }
     function Invoke-PathBRollback { param($Ctx, $Reason) [void]$calls.Add("Invoke-PathBRollback:$Reason"); return $fake.Rollback }
-    function Remove-ChangeMarker { param($WorkRoot) [void]$calls.Add('Remove-ChangeMarker'); return $true }
+    function Remove-ChangeMarker { param($WorkRoot) [void]$calls.Add('Remove-ChangeMarker'); return [bool]$fake.MarkerOk }
     function Invoke-T18Trap {
         param([string] $Stage)
         $script:Stage = $Stage
@@ -4975,7 +4980,24 @@ $t18TrapMocks = {
         $null = Invoke-T18Trap -Stage $stage
         Check "T18 trap ${stage}: marker removed, nothing rolled back" ($calls -join ' > ') 'Remove-ChangeMarker'
         Check "T18 trap ${stage}: 5 POST_CONVERSION_STEP_FAILED" "$($completed[0].ExitCode) $($completed[0].Code)" '5 POST_CONVERSION_STEP_FAILED'
+        Check "T18 trap ${stage}: no marker note while the marker is removed" ($completed[0].Detail -like '*marker could not be removed*') 'False'
     }
+
+    # The marker cannot be removed after a verified change: Detail says so, because the
+    # next run would otherwise exit 50 MARKER_PRESENT with no hint.
+    $fake.MarkerOk = $false
+    $null = Invoke-T18Trap -Stage 'VERIFIED'
+    Check 'T18 trap VERIFIED, marker stuck: still 5 POST_CONVERSION_STEP_FAILED' "$($completed[0].ExitCode) $($completed[0].Code)" '5 POST_CONVERSION_STEP_FAILED'
+    Check 'T18 trap VERIFIED, marker stuck: Detail names the marker' ($completed[0].Detail -like ('* The marker could not be removed: ' + (Join-Path $script:Ctx.WorkRoot 'CHANGES-IN-PROGRESS.marker') + '; delete it before the next run.')) 'True'
+    $fake.MarkerOk = $true
+
+    # After a restore or rollback has decided the result (stage ROLLED_BACK), an error
+    # neither restores, rolls back nor touches the marker again.
+    $result = Invoke-T18Trap -Stage 'ROLLED_BACK'
+    Check 'T18 trap ROLLED_BACK: ends in Complete-Run' $result 'T18-COMPLETE-RUN/True'
+    Check 'T18 trap ROLLED_BACK: no restore, rollback or marker change' $calls.Count 0
+    Check 'T18 trap ROLLED_BACK: 50 UNHANDLED_ERROR' "$($completed[0].ExitCode) $($completed[0].Code)" '50 UNHANDLED_ERROR'
+    Check 'T18 trap ROLLED_BACK: Detail says nothing was repeated' ($completed[0].Detail -like 'disk is full*nothing was restored or rolled back again and any marker was left as it is.') 'True'
 
     # A normal run through the handler is not a second error.
     $null = Invoke-T18Trap -Stage 'UNTOUCHED'
@@ -5127,7 +5149,13 @@ $t18Second = Invoke-T18InjectedRun -Tag 't18sec1' -Injection ((
 Check 'T18 child second error in Complete-Run: exit 50' $t18Second.ExitCode 50
 Check 'T18 child second error in Complete-Run: one minimal summary block' $t18Second.BlockStarts 1
 Check 'T18 child second error in Complete-Run: Stage, Outcome, ExitCode and IssueCode' (@($t18Second.Summary | Where-Object { $_ -clike 'Computer=*; Stage=UNTOUCHED; Outcome=UNHANDLED_ERROR; ExitCode=50; IssueCode=UNHANDLED_ERROR; ActionRequired=PAGE AN OPERATOR NOW.*' }).Count) 1
-Check 'T18 child second error in Complete-Run: Detail names the first and the second error' (@($t18Second.Summary | Where-Object { $_ -clike '*; Detail=A second unexpected error happened while handling the first. First: T18 first error (line *). Second: T18 second error (line *)' }).Count) 1
+Check 'T18 child second error in Complete-Run: Detail names the first and the second error' (@($t18Second.Summary | Where-Object { $_ -clike '*; Detail=A second unexpected error happened while handling the first. First: T18 first error (line *). Second: T18 second error (line *); LogPath=' }).Count) 1
+# Spec 6.4: the last-resort summary has every report field, in the report's order.
+$t18SecondKeys = ''
+if ($t18Second.Summary.Count -eq 1) { $t18SecondKeys = (@([regex]::Matches($t18Second.Summary[0], '(?:^|; )([A-Za-z]+)=') | ForEach-Object { $_.Groups[1].Value }) -join ',') }
+Check 'T18 child second error in Complete-Run: every report field in order' $t18SecondKeys (@((New-RunReport -Mode 'AUDIT').Keys) -join ',')
+Check 'T18 child second error in Complete-Run: Timestamp, Mode and the status fields' (@($t18Second.Summary | Where-Object { $_ -clike 'Computer=*; Timestamp=????-??-??T??:??:??*; Mode=AUDIT; VbrVersion=; PgMajor=; SvcAccount=UNKNOWN; DbAuth=UNKNOWN; PgHba=UNKNOWN; PgIdent=UNKNOWN; PgPassword=UNKNOWN; Stage=UNTOUCHED; *' }).Count) 1
+Check 'T18 child second error in Complete-Run: RMM ACTION and RMM ISSUE lines' (@($t18Second.Lines | Where-Object { $_ -clike 'RMM ACTION: PAGE AN OPERATOR NOW.*' -or $_ -clike 'RMM ISSUE: UNHANDLED_ERROR | A second unexpected error*' }).Count) 2
 Check 'T18 child second error in Complete-Run: no raw PowerShell error' ($t18Second.Output -match 'CategoryInfo|FullyQualifiedErrorId|NativeCommandError') 'False'
 Check 'T18 child second error in Complete-Run: nothing written' $t18Second.RootExists $false
 

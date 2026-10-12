@@ -242,8 +242,9 @@ If every item is compliant, the script changes nothing and stops no service.
 |---|---|
 | `UNTOUCHED` | No change was made. Exit 20 `UNHANDLED_ERROR`. |
 | `PATH_A_WRITING` | Restore both files (section 7.8), run section 7.9 again. If it passes, remove the marker and exit 40. If it fails, exit 50. |
-| `PATH_A_DONE`, `VERIFIED` | Never roll back. VBR works. Exit 5 `POST_CONVERSION_STEP_FAILED`. Remove the marker. |
+| `PATH_A_DONE`, `VERIFIED` | Never roll back. VBR works. Exit 5 `POST_CONVERSION_STEP_FAILED`. Remove the marker; if that fails, `Detail` names the marker file. |
 | `PATH_B_CHANGING` | Run the Path B rollback. |
+| `ROLLED_BACK` | Set when a Path A restore, the Path B rollback or the restart after `SERVICES_WONT_STOP` has returned its result (40 or 50). Never restore, roll back or touch the marker again. Exit 50 `UNHANDLED_ERROR`. |
 
 **Path A: VBR already uses Windows authentication.** Use this path when `DbAuth` = `WINDOWS`, `SqlHostName` is a loopback name and `PostgresUserForWindowsAuth` is OK. There is no downtime, because the SYSTEM login to `postgres` works before and after the change.
 

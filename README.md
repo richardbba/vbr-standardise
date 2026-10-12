@@ -266,7 +266,7 @@ If a run finds more than one issue, the highest exit code wins. `IssueCode` is t
 | `PG_PASSWORD_NOT_CLEARED` | 5 | VBR works with Windows authentication, but the `postgres` password could not be cleared. | Re-run with `-Apply`. |
 | `POST_CONVERSION_STEP_FAILED` | 5 | The change was verified and VBR works, but a later step failed (for example removing the marker). Nothing was rolled back. Also reported when a Path B run stopped before any change (`VEEAM_BUSY`, `SERVICES_WONT_STOP`) and could not remove its marker: `Detail` names the marker file. | Read the transcript, then re-run with `-Apply`. For a marker named in `Detail`, delete it first. |
 | `ROLLBACK_FAILED` | 50 | A change failed and the restore or rollback also failed. VBR may be down. The marker stays. | Page an operator now. Follow [MARKER_PRESENT: manual recovery](#marker_present-manual-recovery). |
-| `UNHANDLED_ERROR` | 20, 40 | An unexpected error. Exit 20 before any database change. Exit 40 when the script restored the files or rolled back and VBR works. (If that restore fails, the result is 50 `ROLLBACK_FAILED`.) After the change was verified it is reported as `POST_CONVERSION_STEP_FAILED` instead. | Read the transcript. Escalate for 40. |
+| `UNHANDLED_ERROR` | 20, 40, 50 | An unexpected error. Exit 20 before any database change. Exit 40 when the script restored the files or rolled back and VBR works. (If that restore fails, the result is 50 `ROLLBACK_FAILED`.) After the change was verified it is reported as `POST_CONVERSION_STEP_FAILED` instead. Exit 50 means a second error happened inside the error handler, or an error came after a restore or rollback had already ended (`Stage=ROLLED_BACK`): no further restore or rollback was attempted, and any marker is left as it is. | Read the transcript. Escalate for 40. Page an operator now for 50. |
 
 ## RMM output
 
@@ -287,7 +287,7 @@ RMM ISSUE: DB_NATIVE_AUTH | DB_NATIVE_AUTH: VBR logs in to PostgreSQL with a use
 | `PgHba` | `STANDARD`, `NOT_STANDARD` |
 | `PgIdent` | `STANDARD`, `MISSING_ENTRY`, `EXTRA_ENTRY` |
 | `PgPassword` | `NONE`, `SET`, `UNKNOWN` |
-| `Stage` | `UNTOUCHED`, `PATH_A_WRITING`, `PATH_A_DONE`, `PATH_B_CHANGING`, `VERIFIED` |
+| `Stage` | `UNTOUCHED`, `PATH_A_WRITING`, `PATH_A_DONE`, `PATH_B_CHANGING`, `VERIFIED`, `ROLLED_BACK` (a restore or rollback ran and decided the result) |
 
 `Detail` is shortened to 900 characters. The transcript has the full text. On a successful `-Apply`, `Detail` (and the transcript) also lists the `pg_hba.conf` lines that were commented out and the roles that can no longer log in with a password, after any issues; with no issue, `ExitCode=0` and `IssueCode` stays empty.
 

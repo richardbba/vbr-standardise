@@ -436,7 +436,9 @@ function Format-RmmSummary {
     return [string[]]$lines.ToArray()
 }
 
-# What the trap does for an unexpected error, by stage (spec 7.6).
+# What the trap does for an unexpected error, by stage (spec 7.6). ROLLED_BACK means
+# a restore or rollback already ran and decided the result: the trap must not run it
+# again or touch the marker.
 function Get-TrapAction {
     param([string] $Stage = '')
     switch ($Stage) {
@@ -444,6 +446,7 @@ function Get-TrapAction {
         'PATH_A_DONE'     { return 'NO_ROLLBACK' }
         'VERIFIED'        { return 'NO_ROLLBACK' }
         'PATH_B_CHANGING' { return 'ROLLBACK_PATH_B' }
+        'ROLLED_BACK'     { return 'EXIT_AFTER_ROLLBACK' }
         default           { return 'EXIT_UNHANDLED' }
     }
 }
@@ -4289,7 +4292,11 @@ function Invoke-PathA {
         }
         if ($failure) {
             Write-Log $failure -Level ERROR
-            if (Restore-PathAFiles -Ctx $Ctx) {
+            $restored = Restore-PathAFiles -Ctx $Ctx
+            # The restore decided the result (40 or 50). An error after this point must
+            # not make the trap restore again or touch the marker.
+            $script:Stage = 'ROLLED_BACK'
+            if ($restored) {
                 $markerNote = ''
                 if (-not (Remove-ChangeMarker -WorkRoot $Ctx.WorkRoot)) {
                     $markerNote = " The marker could not be removed: delete $(Join-Path $Ctx.WorkRoot 'CHANGES-IN-PROGRESS.marker') after checking the files."
@@ -4627,6 +4634,9 @@ function Invoke-PathB {
             Write-Log "Service(s) did not stop: $notStopped. Starting every service this run asked to stop." -Level ERROR
             $restart = Start-ServicesBounded -Names @(Get-StartOrder -Snapshot $Ctx['Snapshot'] -Names $Ctx['StopSet']) -TimeoutSec $timeoutSec
             if (-not $restart.Ok) {
+                # The restart decided the result (50, marker kept): the trap must not
+                # run the Path B rollback on top of it.
+                $script:Stage = 'ROLLED_BACK'
                 return [pscustomobject]@{
                     ExitCode = 50
                     Code     = 'ROLLBACK_FAILED'
@@ -4704,7 +4714,11 @@ function Invoke-PathB {
     }
     if ($failReason) {
         Write-Log $failReason -Level ERROR
-        return (Invoke-PathBRollback -Ctx $Ctx -Reason $failReason)
+        $rollbackResult = Invoke-PathBRollback -Ctx $Ctx -Reason $failReason
+        # The rollback decided the result (40 or 50). An error after this point must
+        # not make the trap run a second rollback or remove a marker it kept.
+        $script:Stage = 'ROLLED_BACK'
+        return $rollbackResult
     }
 
     Write-Log 'Path B step 11 - VBR works with Windows authentication; from here on there is no rollback' -Level STEP
@@ -4921,9 +4935,11 @@ function Select-ApplyPath {
 # Last resort for an error inside the trap handler itself, for example inside
 # Complete-Run. Windows PowerShell 5.1 does not send an error thrown inside a trap
 # block back to that trap, so Invoke-TrapHandler catches it and calls this. It prints
-# a minimal summary from plain strings only (Format-RmmSummary and Format-ShortText
-# may be what failed), repeats no restore or rollback, leaves any marker where it
-# is, and exits 50.
+# the summary block from plain strings only (Format-RmmSummary and Format-ShortText
+# may be what failed), with every spec 6.4 field in Format-RmmSummary's order: Mode
+# and LogPath from the report when it can be read, the version fields empty and the
+# status fields UNKNOWN. It repeats no restore or rollback, leaves any marker where
+# it is, and exits 50.
 function Exit-TrapSecondError {
     param(
         [string] $Stage = 'UNTOUCHED',
@@ -4942,9 +4958,27 @@ function Exit-TrapSecondError {
     $detail += " Second: $second"
     $detail = ($detail -replace '\s+', ' ').Trim()
     if ($detail.Length -gt 900) { $detail = $detail.Substring(0, 897) + '...' }
+    $stamp = ''
+    try { $stamp = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssK', [System.Globalization.CultureInfo]::InvariantCulture) } catch { $stamp = '' }
+    $mode = ''
+    $logPath = ''
+    try {
+        $report = Get-Variable -Name Report -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        if ($report -is [System.Collections.IDictionary]) {
+            $mode = ("$($report['Mode'])" -replace '\s+', ' ').Trim()
+            $logPath = ("$($report['LogPath'])" -replace '[\r\n]+', ' ').Trim()
+        }
+    } catch {
+        $mode = ''
+        $logPath = ''
+    }
+    $action = 'PAGE AN OPERATOR NOW. Check the transcript and the marker.'
     Write-Host '=== RMM SUMMARY ==='
-    Write-Host ("Computer=$env:COMPUTERNAME; Stage=$Stage; Outcome=UNHANDLED_ERROR; ExitCode=50; IssueCode=UNHANDLED_ERROR; " +
-                "ActionRequired=PAGE AN OPERATOR NOW. Check the transcript and the marker.; Detail=$detail")
+    Write-Host ("Computer=$env:COMPUTERNAME; Timestamp=$stamp; Mode=$mode; VbrVersion=; PgMajor=; SvcAccount=UNKNOWN; DbAuth=UNKNOWN; " +
+                "PgHba=UNKNOWN; PgIdent=UNKNOWN; PgPassword=UNKNOWN; Stage=$Stage; Outcome=UNHANDLED_ERROR; ExitCode=50; IssueCode=UNHANDLED_ERROR; " +
+                "ActionRequired=$action; Detail=$detail; LogPath=$logPath")
+    Write-Host "RMM ACTION: $action"
+    Write-Host "RMM ISSUE: UNHANDLED_ERROR | $detail"
     Write-Host '==================='
     exit 50
 }
@@ -5018,10 +5052,20 @@ function Invoke-TrapAction {
         Complete-Run @finish
     }
     if ($action -eq 'NO_ROLLBACK') {
+        $markerNote = ''
         if ($workRoot) {
-            try { $null = Remove-ChangeMarker -WorkRoot $workRoot } catch { Write-Log "The marker could not be removed: $($_.Exception.Message)" -Level WARN }
+            $markerRemoved = $false
+            try { $markerRemoved = [bool](Remove-ChangeMarker -WorkRoot $workRoot) } catch { Write-Log "The marker could not be removed: $($_.Exception.Message)" -Level WARN }
+            if (-not $markerRemoved) {
+                $markerNote = " The marker could not be removed: $(Join-Path $workRoot 'CHANGES-IN-PROGRESS.marker'); delete it before the next run."
+            }
         }
-        Complete-Run -ExitCode 5 -Code 'POST_CONVERSION_STEP_FAILED' -Detail "$message; the change was verified before this error and VBR works, so nothing was rolled back." -Action 'Check the transcript, then re-run with -Apply to finish the remaining steps'
+        Complete-Run -ExitCode 5 -Code 'POST_CONVERSION_STEP_FAILED' -Detail "$message; the change was verified before this error and VBR works, so nothing was rolled back.$markerNote" -Action 'Check the transcript, then re-run with -Apply to finish the remaining steps'
+    }
+    if ($action -eq 'EXIT_AFTER_ROLLBACK') {
+        # A restore or rollback already ran and decided the result. Running it again
+        # would mean another outage, and could remove a marker the first one kept.
+        Complete-Run -ExitCode 50 -Code 'UNHANDLED_ERROR' -Detail "$message; this error came after the restore or rollback had ended, so nothing was restored or rolled back again and any marker was left as it is." -Action 'PAGE AN OPERATOR NOW. Read the transcript for the result of the restore or rollback. If a marker exists, follow the MARKER_PRESENT recovery steps in README.md.'
     }
     Complete-Run -ExitCode 20 -Code 'UNHANDLED_ERROR' -Detail "$message; no database change was made."
 }
