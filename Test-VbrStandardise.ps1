@@ -4473,6 +4473,478 @@ $t17Mocks = {
 }
 $script:Stage = 'UNTOUCHED'
 $script:Issues = New-Object System.Collections.ArrayList
+# --- Task 18: Main body, audit, trap and policy tests ---
+# Static policy checks on the script text and AST.
+$t18MainMarker = '# ===================== MAIN ====================='
+$t18MainIndex = $ScriptText.IndexOf($t18MainMarker)
+Check 'T18 MAIN line present' ($t18MainIndex -ge 0) 'True'
+$t18MainText = ''
+if ($t18MainIndex -ge 0) { $t18MainText = $ScriptText.Substring($t18MainIndex) }
+
+$t18Params = @($ScriptAst.ParamBlock.Parameters)
+Check 'T18 param block is exactly Apply, CreateServiceAccount, WorkRoot' ((@($t18Params | ForEach-Object { $_.Name.VariablePath.UserPath }) | Sort-Object) -join ',') 'Apply,CreateServiceAccount,WorkRoot'
+Check 'T18 Apply is a switch' (@($t18Params | Where-Object { $_.Name.VariablePath.UserPath -eq 'Apply' -and $_.StaticType -eq [switch] }).Count) 1
+Check 'T18 CreateServiceAccount is a switch' (@($t18Params | Where-Object { $_.Name.VariablePath.UserPath -eq 'CreateServiceAccount' -and $_.StaticType -eq [switch] }).Count) 1
+Check 'T18 WorkRoot default' (@($t18Params | Where-Object { $_.Name.VariablePath.UserPath -eq 'WorkRoot' } | ForEach-Object { "$($_.DefaultValue.Value)" }) -join ',') 'C:\ProgramData\VeeamStandardise'
+
+$t18Commands = @($ScriptAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+function Get-T18CommandUse {
+    param([string[]] $Names)
+    return @($t18Commands | Where-Object { $Names -contains "$($_.GetCommandName())" })
+}
+function Test-T18ParameterUse {
+    param($Command, [string] $FullName, [int] $MinLength)
+    foreach ($element in @($Command.CommandElements)) {
+        if ($element -is [System.Management.Automation.Language.CommandParameterAst] -and
+            $element.ParameterName.Length -ge $MinLength -and
+            $FullName.StartsWith($element.ParameterName, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+Check 'T18 forbidden: Stop-Service -Force' (@(Get-T18CommandUse 'Stop-Service', 'spsv' | Where-Object { Test-T18ParameterUse -Command $_ -FullName 'Force' -MinLength 1 }).Count) 0
+Check 'T18 forbidden: Stop-Process' (@(Get-T18CommandUse 'Stop-Process', 'kill', 'spps').Count) 0
+Check 'T18 forbidden: Get-LocalGroupMember' (@(Get-T18CommandUse 'Get-LocalGroupMember', 'glgm').Count) 0
+Check 'T18 forbidden: Read-Host' (@(Get-T18CommandUse 'Read-Host').Count) 0
+Check 'T18 forbidden: Out-File' (@(Get-T18CommandUse 'Out-File').Count) 0
+Check 'T18 forbidden: Invoke-Expression' (@(Get-T18CommandUse 'Invoke-Expression', 'iex').Count) 0
+$t18Utf8Writes = @(Get-T18CommandUse 'Set-Content', 'sc' | Where-Object {
+    $elements = @($_.CommandElements)
+    $hit = $false
+    for ($i = 1; $i -lt $elements.Count; $i++) {
+        $element = $elements[$i]
+        if ($element -is [System.Management.Automation.Language.CommandParameterAst] -and
+            $element.ParameterName.Length -ge 2 -and 'Encoding'.StartsWith($element.ParameterName, [StringComparison]::OrdinalIgnoreCase)) {
+            $argument = $element.Argument
+            if ($null -eq $argument -and $i + 1 -lt $elements.Count) { $argument = $elements[$i + 1] }
+            if ($null -ne $argument -and "$($argument.Extent.Text)".Trim([char[]]"'`"") -ieq 'UTF8') { $hit = $true }
+        }
+    }
+    $hit
+})
+Check 'T18 forbidden: Set-Content -Encoding UTF8' $t18Utf8Writes.Count 0
+$t18LiteralSecure = @(Get-T18CommandUse 'ConvertTo-SecureString' | Where-Object {
+    $command = $_
+    $literal = @(@($command.CommandElements) | Select-Object -Skip 1 | Where-Object { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] }).Count -gt 0
+    if ($command.Parent -is [System.Management.Automation.Language.PipelineAst]) {
+        $first = $command.Parent.PipelineElements[0]
+        if ($first -ne $command -and $first -is [System.Management.Automation.Language.CommandExpressionAst] -and
+            $first.Expression -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $literal = $true }
+    }
+    $literal
+})
+Check 'T18 forbidden: ConvertTo-SecureString with a literal' $t18LiteralSecure.Count 0
+Check 'T18 password is never read as $env:VEEAM_SVC_PASSWORD' (@($ScriptAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and "$($n.VariablePath.UserPath)" -ieq 'env:VEEAM_SVC_PASSWORD' }, $true)).Count) 0
+
+Check 'T18 every function is above MAIN' (@($ScriptAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | Where-Object { $_.Extent.StartOffset -gt $t18MainIndex }).Count) 0
+$t18Traps = @($ScriptAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.TrapStatementAst] }, $true))
+Check 'T18 exactly one trap, below MAIN' (@($t18Traps | Where-Object { $_.Extent.StartOffset -gt $t18MainIndex }).Count * 10 + $t18Traps.Count) 11
+Check 'T18 trap calls Invoke-TrapHandler' (@($t18Traps | ForEach-Object { $_.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Invoke-TrapHandler' }, $true) }).Count) 1
+Check 'T18 main body never calls exit itself' (@($ScriptAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.ExitStatementAst] }, $true) | Where-Object { $_.Extent.StartOffset -gt $t18MainIndex }).Count) 0
+Check 'T18 mode string is APPLY or AUDIT' ($t18MainText -match '\$runMode = if \(\$Apply\) \{ ''APPLY'' \} else \{ ''AUDIT'' \}') 'True'
+Check 'T18 lock name' ($t18MainText.Contains("Enter-RunLock -Name 'Global\VeeamPgUpdate'")) 'True'
+Check 'T18 transcript file name' ($t18MainText.Contains("'logs\VbrStandardise_{0}_{1}-{2}.log' -f `$env:COMPUTERNAME, `$runStamp, `$PID")) 'True'
+$t18Order = @('Enter-RunLock', 'Get-PreflightContextIssue', 'Initialize-WorkRoot', 'Start-Transcript', 'Find-ChangeMarkers', 'Remove-OldRunData',
+              'Test-IsDomainController', 'Get-VbrInstall', 'Get-VbrDbConfig', 'Test-Vb365Installed', 'Get-DbHostClass', 'Find-PgInstall',
+              'Test-PostmasterLive', 'Test-PgConfOverride', 'Test-PgHbaHasInclude', 'Get-ListeningLoopback', 'Get-SystemMapNames',
+              'Invoke-ServiceAccountStep', 'Get-AuditState', 'Select-ApplyPath', 'Invoke-PathA', 'Invoke-PathB', 'Complete-Run @finish')
+$t18OrderProblem = 'in order'
+$t18Previous = -1
+foreach ($t18Name in $t18Order) {
+    $t18Position = $t18MainText.IndexOf($t18Name)
+    if ($t18Position -le $t18Previous) { $t18OrderProblem = "$t18Name is missing or out of order"; break }
+    $t18Previous = $t18Position
+}
+Check 'T18 main body follows spec 7.1 order, then 7.2 to 7.6' $t18OrderProblem 'in order'
+
+# Get-AuditState with every database function mocked.
+$t18AuditMocks = {
+    $calls = New-Object System.Collections.ArrayList
+    $fake = @{
+        RegistryAuth = 'WINDOWS'; HostClass = 'LOOPBACK'; HbaStandard = $true; IdentStatus = 'STANDARD'
+        SspiPassed = $true; HealthOk = $true; LiveOk = $true; PasswordSet = $false; BackendsOk = $true
+        Backends = @([pscustomobject]@{ Pid = 10; UseName = 'postgres'; DatName = 'VeeamBackup'; ClientAddr = '127.0.0.1'; BackendStartUtc = [DateTime]::UtcNow })
+        FirstMethod = 'sspi'; FirstOptions = 'map=veeam'; Consumers = @(); RemoteClients = @(); LastFailure = $false; NonLoopback = @()
+    }
+    function Get-RegistryAuthMode { param($UserName, $PasswordSet) return $fake.RegistryAuth }
+    function Get-DbHostClass { param($HostName, $LocalNames) return $fake.HostClass }
+    function Test-PgHbaStandard { param($Rules) return [bool]$fake.HbaStandard }
+    function Get-PgIdentStatus { param($Entries, $RequiredNames) return $fake.IdentStatus }
+    function Test-PgSspiLogin {
+        param($Psql, $Port, $Addresses, $Database)
+        [void]$calls.Add('Test-PgSspiLogin')
+        $kind = 'OK'
+        if (-not $fake.SspiPassed) { $kind = 'AUTH' }
+        return [pscustomobject]@{ Passed = [bool]$fake.SspiPassed; Results = @(@($Addresses) | ForEach-Object { [pscustomobject]@{ Address = $_; ExitCode = 0; Kind = $kind; StdErr = '' } }) }
+    }
+    function Test-PgConfigHealth {
+        param($Psql, $Port, $Address, $Database, $Major, $HbaPath, $IdentPath)
+        [void]$calls.Add('Test-PgConfigHealth')
+        return [pscustomobject]@{ Ok = [bool]$fake.HealthOk; Detail = "live hba_file is 'D:/other/pg_hba.conf', not '$HbaPath'" }
+    }
+    function Get-PgLiveState { param($Psql, $Port, $Address, $Database) [void]$calls.Add('Get-PgLiveState'); return [pscustomobject]@{ Ok = [bool]$fake.LiveOk; PasswordSet = [bool]$fake.PasswordSet; Backends = @($fake.Backends) } }
+    function Test-VbrBackendsOk { param($Backends, $Database) return [bool]$fake.BackendsOk }
+    function Get-HbaFirstMatch {
+        param($Rules, $Database, $User, $Address)
+        [void]$calls.Add("Get-HbaFirstMatch:${User}:$Address")
+        return [pscustomobject]@{ LineIndex = 0; Type = 'host'; Database = 'all'; User = 'all'; Address = '127.0.0.1/32'; Method = $fake.FirstMethod; Options = $fake.FirstOptions }
+    }
+    function Get-DbAuthState {
+        param($RegistryAuth, $SspiPassed, $FirstMatchOk, $VbrBackendsOk)
+        if ($RegistryAuth -eq 'NATIVE') { return 'NATIVE' }
+        if ($SspiPassed -and $FirstMatchOk -and $VbrBackendsOk) { return 'WINDOWS' }
+        return 'UNKNOWN'
+    }
+    function Get-EstablishedRemoteClients { param($Port) [void]$calls.Add('Get-EstablishedRemoteClients'); return @($fake.RemoteClients) }
+    function Get-ConsumerIssues {
+        param($DbConfig, $EmConfig, $Backends, $RemoteClients, $LocalNames)
+        [void]$calls.Add("Get-ConsumerIssues:backends=$($null -ne $Backends):remote=$(@($RemoteClients).Count)")
+        return @($fake.Consumers)
+    }
+    function Get-NonLoopbackHbaRules { param($Rules) return @($fake.NonLoopback) }
+    function Test-LastFailure { param($WorkRoot) return [bool]$fake.LastFailure }
+}
+
+# A compliant Windows-auth server: no issues, all report fields set.
+& {
+    . $t18AuditMocks
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'AUDIT'
+    $ctx = New-T16Ctx
+    $ctx.HbaRules = @([pscustomobject]@{ LineIndex = 0; Type = 'host'; Database = 'all'; User = 'all'; Address = '127.0.0.1/32'; Method = 'sspi'; Options = 'map=veeam' })
+    Get-AuditState -Ctx $ctx
+    Check 'T18 audit compliant: DbAuth WINDOWS' $ctx.State['DbAuth'] 'WINDOWS'
+    Check 'T18 audit compliant: PgPassword NONE' $ctx.State['PgPassword'] 'NONE'
+    Check 'T18 audit compliant: SspiPassed' $ctx.State['SspiPassed'] 'True'
+    Check 'T18 audit compliant: no issues' @($script:Issues).Count 0
+    Check 'T18 audit compliant: first match checked per address' (@($calls | Where-Object { $_ -like 'Get-HbaFirstMatch:*' }) -join ',') 'Get-HbaFirstMatch:postgres:127.0.0.1,Get-HbaFirstMatch:postgres:::1'
+    Check 'T18 audit compliant: consumers from pg_stat_activity' (@($calls | Where-Object { $_ -like 'Get-ConsumerIssues*' }) -join ',') 'Get-ConsumerIssues:backends=True:remote=0'
+    Check 'T18 audit compliant: no TCP fallback' (@($calls | Where-Object { $_ -eq 'Get-EstablishedRemoteClients' }).Count) 0
+    Check 'T18 audit compliant: the config check is part of the baseline' (@($calls | Where-Object { $_ -eq 'Test-PgConfigHealth' }).Count) 1
+    Check 'T18 audit compliant: report fields' ("$($script:Report['DbAuth']) $($script:Report['PgHba']) $($script:Report['PgIdent']) $($script:Report['PgPassword']) $($script:Report['SvcAccount'])") 'WINDOWS STANDARD STANDARD NONE OK'
+}
+
+# A native-auth server: SYSTEM cannot log in yet, TCP fallback for consumers.
+& {
+    . $t18AuditMocks
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'AUDIT'
+    $fake.RegistryAuth = 'NATIVE'
+    $fake.SspiPassed = $false
+    $fake.HbaStandard = $false
+    $fake.IdentStatus = 'MISSING_ENTRY'
+    $ctx = New-T16Ctx
+    Get-AuditState -Ctx $ctx
+    Check 'T18 audit native: DbAuth NATIVE' $ctx.State['DbAuth'] 'NATIVE'
+    Check 'T18 audit native: PgPassword UNKNOWN' $ctx.State['PgPassword'] 'UNKNOWN'
+    Check 'T18 audit native: no live query' (@($calls | Where-Object { $_ -eq 'Get-PgLiveState' }).Count) 0
+    Check 'T18 audit native: no config check without an SSPI login' (@($calls | Where-Object { $_ -eq 'Test-PgConfigHealth' }).Count) 0
+    Check 'T18 audit native: consumers from TCP' (@($calls | Where-Object { $_ -like 'Get-ConsumerIssues*' -or $_ -eq 'Get-EstablishedRemoteClients' }) -join ',') 'Get-EstablishedRemoteClients,Get-ConsumerIssues:backends=False:remote=0'
+    Check 'T18 audit native: drift issues' ((@($script:Issues) | ForEach-Object { $_.Code }) -join ',') 'DB_NATIVE_AUTH,PG_HBA_NOT_STANDARD,PG_IDENT_NOT_STANDARD'
+    Check 'T18 audit native: all exit 5' ((@($script:Issues) | ForEach-Object { $_.ExitCode } | Sort-Object -Unique) -join ',') '5'
+}
+
+# Registry says Windows, but the first pg_hba line for postgres is scram -> UNKNOWN.
+& {
+    . $t18AuditMocks
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'AUDIT'
+    $fake.FirstMethod = 'scram-sha-256'
+    $fake.FirstOptions = ''
+    $ctx = New-T16Ctx
+    Get-AuditState -Ctx $ctx
+    Check 'T18 audit unknown: DbAuth UNKNOWN' $ctx.State['DbAuth'] 'UNKNOWN'
+    Check 'T18 audit unknown: DB_AUTH_UNKNOWN reported' ((@($script:Issues) | ForEach-Object { $_.Code }) -join ',') 'DB_AUTH_UNKNOWN'
+    Check 'T18 audit unknown: says why' ($script:Issues[0].Detail -like "*first pg_hba.conf line for postgres from 127.0.0.1*") 'True'
+    $fake.FirstMethod = 'sspi'
+    $fake.FirstOptions = @('map=Veeam')
+    $script:Issues.Clear()
+    Get-AuditState -Ctx $ctx
+    Check 'T18 audit unknown: map name compares case-sensitively' $ctx.State['DbAuth'] 'UNKNOWN'
+}
+
+# The SSPI baseline is the whole spec 7.9 test: a failed config check (here a live
+# hba_file that is not the file in the data folder) makes DbAuth UNKNOWN, even when
+# the login works. The live state is still read.
+& {
+    . $t18AuditMocks
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'AUDIT'
+    $fake.HealthOk = $false
+    $ctx = New-T16Ctx
+    Get-AuditState -Ctx $ctx
+    Check 'T18 audit config check fails: DbAuth UNKNOWN' $ctx.State['DbAuth'] 'UNKNOWN'
+    Check 'T18 audit config check fails: DB_AUTH_UNKNOWN says why' (@($script:Issues | Where-Object { $_.Code -eq 'DB_AUTH_UNKNOWN' -and $_.Detail -like "*the PostgreSQL config check failed (live hba_file is 'D:/other/pg_hba.conf'*" }).Count) 1
+    Check 'T18 audit config check fails: live state still read' $ctx.State['PgPassword'] 'NONE'
+}
+
+# Blockers come before drift; consumer Action is kept; LAN lines are listed.
+& {
+    . $t18AuditMocks
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'APPLY'
+    $fake.PasswordSet = $true
+    $fake.HbaStandard = $false
+    $fake.HostClass = 'LOCAL'
+    $fake.LastFailure = $true
+    $fake.Consumers = @([pscustomobject]@{ Code = 'PG_PASSWORD_CONSUMER'; Detail = 'pg_native_admin from 127.0.0.1'; Action = 'Move the client to Windows authentication, then re-run' })
+    $fake.NonLoopback = @([pscustomobject]@{ LineIndex = 94; Type = 'host'; Database = 'all'; User = 'all'; Address = '10.0.0.0/8'; Method = 'scram-sha-256'; Options = '' })
+    $ctx = New-T16Ctx
+    $ctx.HbaRules = @($fake.NonLoopback)
+    $ctx.Db.HostName = 'VBR01'
+    $ctx.Db.WindowsAuthRole = 'Postgres'
+    $ctx.ServiceAccounts = [pscustomobject]@{ MapNames = @(); Unresolved = @('NT AUTHORITY\NetworkService') }
+    Get-AuditState -Ctx $ctx
+    Check 'T18 audit order: blockers first, then drift' ((@($script:Issues) | ForEach-Object { $_.Code }) -join ',') ('PG_PASSWORD_CONSUMER,SERVICE_ACCOUNT_UNRESOLVED,PATH_B_PREVIOUS_FAILURE,' +
+        'DB_HOST_NOT_LOCAL,DB_WINDOWS_ROLE_NOT_POSTGRES,PG_HBA_NOT_STANDARD,PG_POSTGRES_PASSWORD_SET')
+    Check 'T18 audit order: consumer action kept' $script:Issues[0].Action 'Move the client to Windows authentication, then re-run'
+    Check 'T18 audit order: unresolved StartName in Detail' ($script:Issues[1].Detail -like '*NT AUTHORITY\NetworkService*') 'True'
+    Check 'T18 audit order: LAN line in PG_HBA_NOT_STANDARD' (@($script:Issues | Where-Object { $_.Code -eq 'PG_HBA_NOT_STANDARD' -and $_.Detail -like '*line 95: host all all 10.0.0.0/8 scram-sha-256*' }).Count) 1
+    Check 'T18 audit order: PgPassword SET' $ctx.State['PgPassword'] 'SET'
+}
+
+# An empty PostgresUserForWindowsAuth is not drift.
+& {
+    . $t18AuditMocks
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'AUDIT'
+    $ctx = New-T16Ctx
+    $ctx.Db.WindowsAuthRole = ''
+    Get-AuditState -Ctx $ctx
+    Check 'T18 audit: empty Windows-auth role is not drift' @($script:Issues).Count 0
+}
+
+# Select-ApplyPath decision table (spec 7.6).
+& {
+    function Get-DbHostClass {
+        param($HostName, $LocalNames)
+        if (@('localhost', '127.0.0.1', '::1') -contains $HostName) { return 'LOOPBACK' }
+        if (@($LocalNames) -contains $HostName) { return 'LOCAL' }
+        return 'REMOTE'
+    }
+    function Get-T18Path {
+        param([string] $DbAuth, [string] $Hba = 'STANDARD', [string] $Ident = 'STANDARD', [string] $Password = 'NONE',
+              [string] $HostName = '127.0.0.1', [string] $Role = 'postgres', [bool] $BlocksDb = $false, [string[]] $IssueCodes = @(), [switch] $NoAccount)
+        $script:Issues = New-Object System.Collections.ArrayList
+        foreach ($code in $IssueCodes) { $null = Add-RunIssue -Code $code -ExitCode 5 -Detail 'test' }
+        $ctx = New-T16Ctx -PgHba $Hba -PgIdent $Ident -PgPassword $Password
+        $ctx.State['DbAuth'] = $DbAuth
+        $ctx.Db.HostName = $HostName
+        $ctx.Db.WindowsAuthRole = $Role
+        $ctx.Account = [pscustomobject]@{ Status = 'OK'; Info = $null; BlocksDb = $BlocksDb }
+        if ($NoAccount) { $ctx.Account = $null }
+        return (Select-ApplyPath -Ctx $ctx)
+    }
+    Check 'T18 path: compliant -> NONE' (Get-T18Path -DbAuth 'WINDOWS') 'NONE'
+    Check 'T18 path: Windows, pg_hba drift -> A' (Get-T18Path -DbAuth 'WINDOWS' -Hba 'NOT_STANDARD') 'A'
+    Check 'T18 path: Windows, pg_ident drift -> A' (Get-T18Path -DbAuth 'WINDOWS' -Ident 'EXTRA_ENTRY') 'A'
+    Check 'T18 path: Windows, password set -> A' (Get-T18Path -DbAuth 'WINDOWS' -Password 'SET') 'A'
+    Check 'T18 path: native -> B' (Get-T18Path -DbAuth 'NATIVE' -Hba 'NOT_STANDARD' -Ident 'MISSING_ENTRY' -Password 'UNKNOWN') 'B'
+    Check 'T18 path: Windows, host is the server name -> B' (Get-T18Path -DbAuth 'WINDOWS' -HostName 'VBR01') 'B'
+    Check 'T18 path: Windows, other Windows-auth role -> B' (Get-T18Path -DbAuth 'WINDOWS' -Role 'veeamsql') 'B'
+    Check 'T18 path: role Postgres differs by case -> B' (Get-T18Path -DbAuth 'WINDOWS' -Role 'Postgres') 'B'
+    Check 'T18 path: empty role is fine -> NONE' (Get-T18Path -DbAuth 'WINDOWS' -Role '') 'NONE'
+    Check 'T18 path: UNKNOWN -> BLOCKED' (Get-T18Path -DbAuth 'UNKNOWN' -IssueCodes @('DB_AUTH_UNKNOWN')) 'BLOCKED'
+    Check 'T18 path: UNKNOWN with host drift -> BLOCKED' (Get-T18Path -DbAuth 'UNKNOWN' -HostName 'VBR01') 'BLOCKED'
+    Check 'T18 path: native, account missing -> BLOCKED' (Get-T18Path -DbAuth 'NATIVE' -BlocksDb $true) 'BLOCKED'
+    Check 'T18 path: native, no account object -> BLOCKED' (Get-T18Path -DbAuth 'NATIVE' -NoAccount) 'BLOCKED'
+    Check 'T18 path: compliant DB, account missing -> NONE' (Get-T18Path -DbAuth 'WINDOWS' -BlocksDb $true) 'NONE'
+    Check 'T18 path: password consumer -> BLOCKED' (Get-T18Path -DbAuth 'WINDOWS' -Hba 'NOT_STANDARD' -IssueCodes @('PG_PASSWORD_CONSUMER')) 'BLOCKED'
+    Check 'T18 path: remote consumer -> BLOCKED' (Get-T18Path -DbAuth 'WINDOWS' -Password 'SET' -IssueCodes @('PG_REMOTE_CONSUMER')) 'BLOCKED'
+    Check 'T18 path: unresolved service account -> BLOCKED' (Get-T18Path -DbAuth 'NATIVE' -IssueCodes @('SERVICE_ACCOUNT_UNRESOLVED')) 'BLOCKED'
+    Check 'T18 path: last-failure blocks B' (Get-T18Path -DbAuth 'NATIVE' -IssueCodes @('PATH_B_PREVIOUS_FAILURE')) 'BLOCKED'
+    Check 'T18 path: last-failure does not block A' (Get-T18Path -DbAuth 'WINDOWS' -Hba 'NOT_STANDARD' -IssueCodes @('PATH_B_PREVIOUS_FAILURE')) 'A'
+    Check 'T18 path: a disabled account does not block' (Get-T18Path -DbAuth 'WINDOWS' -Hba 'NOT_STANDARD' -IssueCodes @('SVC_DISABLED', 'SVC_LOCKED_OUT')) 'A'
+}
+
+# Invoke-TrapHandler: the stage decides; Complete-Run always ends it.
+try { throw 'disk is full' } catch { $t18Error = $_ }
+$t18TrapMocks = {
+    $calls = New-Object System.Collections.ArrayList
+    $completed = New-Object System.Collections.ArrayList
+    $fake = @{ Restored = $true; Rollback = $null }
+    function Complete-Run {
+        param([int] $ExitCode = 0, [string] $Code = '', [string] $Detail = '', [string] $Action = '')
+        [void]$completed.Add([pscustomobject]@{ ExitCode = $ExitCode; Code = $Code; Detail = $Detail; Action = $Action })
+        throw 'T18-COMPLETE-RUN'
+    }
+    function Restore-PathAFiles { param($Ctx) [void]$calls.Add('Restore-PathAFiles'); return [bool]$fake.Restored }
+    function Invoke-PathBRollback { param($Ctx, $Reason) [void]$calls.Add("Invoke-PathBRollback:$Reason"); return $fake.Rollback }
+    function Remove-ChangeMarker { param($WorkRoot) [void]$calls.Add('Remove-ChangeMarker'); return $true }
+    function Invoke-T18Trap {
+        param([string] $Stage)
+        $script:Stage = $Stage
+        $script:TrapHandled = $false
+        $script:Issues = New-Object System.Collections.ArrayList
+        $calls.Clear()
+        $completed.Clear()
+        $sentinel = ''
+        try { Invoke-TrapHandler -ErrorRecord $t18Error } catch { $sentinel = "$($_.Exception.Message)" }
+        $handled = [bool]$script:TrapHandled
+        $script:TrapHandled = $false
+        return "$sentinel/$handled"
+    }
+}
+& {
+    . $t18TrapMocks
+    $script:Ctx = New-T16Ctx
+    $script:LogLines.Clear()
+    Check 'T18 trap UNTOUCHED: ends in Complete-Run, guard set' (Invoke-T18Trap -Stage 'UNTOUCHED') 'T18-COMPLETE-RUN/True'
+    Check 'T18 trap UNTOUCHED: 20 UNHANDLED_ERROR' "$($completed[0].ExitCode) $($completed[0].Code)" '20 UNHANDLED_ERROR'
+    Check 'T18 trap UNTOUCHED: message in Detail' ($completed[0].Detail -like 'disk is full*') 'True'
+    Check 'T18 trap UNTOUCHED: no restore or rollback' $calls.Count 0
+    Check 'T18 trap: error logged' (@($script:LogLines | Where-Object { $_ -like '`[ERROR`] UNHANDLED ERROR at stage UNTOUCHED: disk is full*' }).Count) 1
+
+    $null = Invoke-T18Trap -Stage 'PATH_A_WRITING'
+    Check 'T18 trap PATH_A_WRITING restored: restore then marker' ($calls -join ' > ') 'Restore-PathAFiles > Remove-ChangeMarker'
+    Check 'T18 trap PATH_A_WRITING restored: 40 UNHANDLED_ERROR' "$($completed[0].ExitCode) $($completed[0].Code)" '40 UNHANDLED_ERROR'
+
+    $fake.Restored = $false
+    $null = Invoke-T18Trap -Stage 'PATH_A_WRITING'
+    Check 'T18 trap PATH_A_WRITING not restored: marker stays' ($calls -join ' > ') 'Restore-PathAFiles'
+    Check 'T18 trap PATH_A_WRITING not restored: 50 ROLLBACK_FAILED' "$($completed[0].ExitCode) $($completed[0].Code)" '50 ROLLBACK_FAILED'
+    Check 'T18 trap PATH_A_WRITING not restored: the error is kept as an issue' ((@($script:Issues) | ForEach-Object { "$($_.Code)/$($_.ExitCode)" }) -join ',') 'UNHANDLED_ERROR/40'
+
+    $fake.Rollback = [pscustomobject]@{ ExitCode = 40; Code = 'UNHANDLED_ERROR'; Detail = 'rolled back'; Action = 'ESCALATE. test action' }
+    $null = Invoke-T18Trap -Stage 'PATH_B_CHANGING'
+    Check 'T18 trap PATH_B_CHANGING: runs the Path B rollback' ($calls[0] -like 'Invoke-PathBRollback:UNHANDLED_ERROR: disk is full*') 'True'
+    Check 'T18 trap PATH_B_CHANGING: result of the rollback' "$($completed[0].ExitCode) $($completed[0].Code) $($completed[0].Action)" '40 UNHANDLED_ERROR ESCALATE. test action'
+
+    $fake.Rollback = $null
+    $null = Invoke-T18Trap -Stage 'PATH_B_CHANGING'
+    Check 'T18 trap PATH_B_CHANGING: no rollback result -> 50' "$($completed[0].ExitCode) $($completed[0].Code)" '50 ROLLBACK_FAILED'
+
+    foreach ($stage in @('PATH_A_DONE', 'VERIFIED')) {
+        $null = Invoke-T18Trap -Stage $stage
+        Check "T18 trap ${stage}: marker removed, nothing rolled back" ($calls -join ' > ') 'Remove-ChangeMarker'
+        Check "T18 trap ${stage}: 5 POST_CONVERSION_STEP_FAILED" "$($completed[0].ExitCode) $($completed[0].Code)" '5 POST_CONVERSION_STEP_FAILED'
+    }
+    $script:Ctx = $null
+}
+$script:Stage = 'UNTOUCHED'
+$script:Issues = New-Object System.Collections.ArrayList
+
+# Child process runs of the real script. The WorkRoot is a new folder under
+# C:\ProgramData, the parent of the default WorkRoot, because a %TEMP% parent can
+# fail the WorkRoot trust check on some machines. The RESULT section removes it.
+$t18ScriptPath = Join-Path $PSScriptRoot 'Invoke-VbrStandardise.ps1'
+$t18VbrCorePath = Get-RegValue -Path 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication' -Name 'CorePath'
+$t18ChildWorkRoot = Join-Path $env:ProgramData "vbrstd-t18child-$PID"
+$t18PwshWorkRoot = Join-Path $env:ProgramData "vbrstd-t18pwsh-$PID"
+[void]$script:TestFolders.Add($t18ChildWorkRoot)
+[void]$script:TestFolders.Add($t18PwshWorkRoot)
+if (-not (Test-IsAdministrator)) {
+    Skip 'T18 child AUDIT without VBR exits 20 VBR_NOT_FOUND' 'not elevated'
+} elseif ($t18VbrCorePath) {
+    Skip 'T18 child AUDIT without VBR exits 20 VBR_NOT_FOUND' 'this machine has a VBR server'
+} elseif (Test-IsDomainController) {
+    Skip 'T18 child AUDIT without VBR exits 20 VBR_NOT_FOUND' 'this machine is a domain controller'
+} elseif (@(Find-ChangeMarkers -WorkRoot $t18ChildWorkRoot).Count -gt 0) {
+    Skip 'T18 child AUDIT without VBR exits 20 VBR_NOT_FOUND' 'an updater marker exists on this machine'
+} else {
+    $t18PowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { $t18PowerShell = Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe' }
+    $t18Child = & {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $t18PowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $t18ScriptPath -WorkRoot $t18ChildWorkRoot 2>&1 | Out-String)
+        [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
+    }
+    Check 'T18 child AUDIT without VBR: exit 20' $t18Child.ExitCode 20
+    Check 'T18 child AUDIT without VBR: IssueCode VBR_NOT_FOUND' ($t18Child.Output -match 'IssueCode=VBR_NOT_FOUND(;|\s|$)') 'True'
+    Check 'T18 child AUDIT without VBR: summary block' ($t18Child.Output -match '=== RMM SUMMARY ===') 'True'
+    Check 'T18 child AUDIT without VBR: Mode=AUDIT' ($t18Child.Output -match 'Mode=AUDIT') 'True'
+    Check 'T18 child AUDIT without VBR: last-result.json written' (Test-Path -LiteralPath (Join-Path $t18ChildWorkRoot 'logs\last-result.json')) 'True'
+    Check 'T18 child AUDIT without VBR: no run folder' (@(Get-ChildItem -LiteralPath (Join-Path $t18ChildWorkRoot 'runs') -Force -ErrorAction SilentlyContinue).Count) 0
+}
+$t18Pwsh = @(Get-Command -Name 'pwsh.exe' -CommandType Application -ErrorAction SilentlyContinue)
+if ($t18Pwsh.Count -eq 0) {
+    Skip 'T18 child under pwsh exits 20 WRONG_POWERSHELL' 'pwsh.exe not found'
+} else {
+    $t18PwshChild = & {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $t18Pwsh[0].Path -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $t18ScriptPath -WorkRoot $t18PwshWorkRoot 2>&1 | Out-String)
+        [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
+    }
+    Check 'T18 child under pwsh: exit 20' $t18PwshChild.ExitCode 20
+    Check 'T18 child under pwsh: IssueCode WRONG_POWERSHELL' ($t18PwshChild.Output -match 'IssueCode=WRONG_POWERSHELL(;|\s|$)') 'True'
+    Check 'T18 child under pwsh: nothing written' (Test-Path -LiteralPath $t18PwshWorkRoot) 'False'
+}
+
+# Constrained Language Mode (spec 7.1 step 3). A wrapper switches its own session to
+# ConstrainedLanguage and runs the real script, which then runs in that mode too. The
+# script must report CONSTRAINED_LANGUAGE before the lock and before any .NET type
+# that mode blocks. Needs no elevation, VBR or PostgreSQL, so it never skips.
+$t18ClmRoot = Join-Path $env:ProgramData "vbrstd-t18clm-$PID"
+[void]$script:TestFolders.Add($t18ClmRoot)
+$t18ClmWrapper = Join-Path (New-TestFolder 't18clm') 'clm.ps1'
+$t18ClmText = "`$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'`r`n" +
+    "& '" + $t18ScriptPath.Replace("'", "''") + "' -Apply -WorkRoot '" + $t18ClmRoot.Replace("'", "''") + "'`r`n" +
+    "exit `$LASTEXITCODE`r`n"
+[System.IO.File]::WriteAllText($t18ClmWrapper, $t18ClmText, (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+$t18ClmPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { $t18ClmPowerShell = Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe' }
+$t18ClmChild = & {
+    $ErrorActionPreference = 'Continue'
+    $output = (& $t18ClmPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $t18ClmWrapper 2>&1 | Out-String)
+    [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
+}
+$t18ClmLine = @($t18ClmChild.Output -split "`r?`n" | Where-Object { $_ -clike 'Computer=*' })
+$t18ClmKeys = ''
+if ($t18ClmLine.Count -eq 1) { $t18ClmKeys = (@([regex]::Matches($t18ClmLine[0], '(?:^|; )([A-Za-z]+)=') | ForEach-Object { $_.Groups[1].Value }) -join ',') }
+Check 'T18 child in Constrained Language Mode: exit 20' $t18ClmChild.ExitCode 20
+Check 'T18 child in Constrained Language Mode: IssueCode CONSTRAINED_LANGUAGE' ($t18ClmChild.Output -match 'IssueCode=CONSTRAINED_LANGUAGE(;|\s|$)') 'True'
+Check 'T18 child in Constrained Language Mode: one summary line with every report field in order' $t18ClmKeys (@((New-RunReport -Mode 'APPLY').Keys) -join ',')
+Check 'T18 child in Constrained Language Mode: Mode=APPLY, Stage=UNTOUCHED' (@($t18ClmLine | Where-Object { $_ -clike '*; Mode=APPLY; *; Stage=UNTOUCHED; Outcome=CONSTRAINED_LANGUAGE; ExitCode=20; *' }).Count) 1
+Check 'T18 child in Constrained Language Mode: no error record' ($t18ClmChild.Output -match 'Cannot create type|Cannot invoke method|UNHANDLED') 'False'
+Check 'T18 child in Constrained Language Mode: nothing written' (Test-Path -LiteralPath $t18ClmRoot) 'False'
+
+# Complete-Run (Task 2) with -Detail and no -Code adds a note to Detail. The main body
+# passes the notes of a successful path that way (spec 7.5: commented-out pg_hba.conf
+# lines; spec 7.6 Path B step 13: roles that lost their login). Complete-Run exits,
+# so a driver with the real function texts runs in a child powershell.exe.
+$t18Fn = @{}
+foreach ($t18Statement in $ScriptAst.EndBlock.Statements) {
+    if ($t18Statement -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $t18Fn[$t18Statement.Name] = $t18Statement.Extent.Text }
+}
+$t18NoteNeeded = @('Format-ShortText', 'Write-Log', 'Write-AtomicText', 'Write-AtomicJson', 'Get-CfgValue', 'New-RunReport', 'Add-RunIssue', 'Get-RmmActionForExitCode', 'Resolve-RunOutcome', 'Format-RmmSummary', 'Complete-Run')
+$t18NoteHead = @'
+param([string] $Scenario, [string] $Root)
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+function Exit-RunLock { param($Mutex) }
+'@
+$t18NoteBody = @'
+$WorkRoot = $Root
+$script:Report = New-RunReport -Mode 'APPLY'
+$script:WorkRootReady = $true
+if ($Scenario -eq 'issue') { Add-RunIssue -Code 'SVC_DISABLED' -ExitCode 5 -Detail 'svc_veeam is disabled' }
+Complete-Run -ExitCode 0 -Detail 'Commented out pg_hba.conf line 95: host all all 10.0.0.0/8 scram-sha-256.'
+'@
+$t18NoteDriver = Join-Path (New-TestFolder 't18note') 'driver.ps1'
+$t18NoteFunctions = (@($t18NoteNeeded | Where-Object { $t18Fn.ContainsKey($_) } | ForEach-Object { $t18Fn[$_] }) -join "`r`n`r`n")
+[System.IO.File]::WriteAllText($t18NoteDriver, ($t18NoteHead + "`r`n" + $t18NoteFunctions + "`r`n" + $t18NoteBody), (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+$t18NotePowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$t18NoteText = 'Commented out pg_hba.conf line 95: host all all 10.0.0.0/8 scram-sha-256.'
+$t18NoteRoot = New-TestFolder 't18noteok'
+$t18NoteOk = Invoke-Native -FilePath $t18NotePowerShell -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $t18NoteDriver, '-Scenario', 'ok', '-Root', $t18NoteRoot)
+$t18NoteOkLines = @($t18NoteOk.StdOut -split "`r?`n")
+Check 'T18 success note: exit 0' $t18NoteOk.ExitCode 0
+Check 'T18 success note: in Detail, with no issue' (@($t18NoteOkLines | Where-Object { $_ -clike ('*; Outcome=OK; ExitCode=0; IssueCode=; ActionRequired=None; Detail=' + $t18NoteText + '; *') }).Count) 1
+Check 'T18 success note: no RMM ISSUE line' (@($t18NoteOkLines | Where-Object { $_ -clike 'RMM ISSUE:*' }).Count) 0
+$t18NoteJsonPath = Join-Path $t18NoteRoot 'logs\last-result.json'
+$t18NoteJsonDetail = ''
+if (Test-Path -LiteralPath $t18NoteJsonPath) { $t18NoteJsonDetail = "$(([System.IO.File]::ReadAllText($t18NoteJsonPath) | ConvertFrom-Json).Detail)" }
+Check 'T18 success note: in last-result.json' $t18NoteJsonDetail $t18NoteText
+$t18NoteIssue = Invoke-Native -FilePath $t18NotePowerShell -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $t18NoteDriver, '-Scenario', 'issue', '-Root', (New-TestFolder 't18noteissue'))
+Check 'T18 note after an issue: exit 5' $t18NoteIssue.ExitCode 5
+Check 'T18 note after an issue: the issue first, then the note' (@($t18NoteIssue.StdOut -split "`r?`n" | Where-Object { $_ -clike ('*; IssueCode=SVC_DISABLED; *; Detail=SVC_DISABLED: svc_veeam is disabled | ' + $t18NoteText + '; *') }).Count) 1
+Check 'T18 main body passes the path Detail to Complete-Run on success too' ($t18MainText.Contains('if ("$($pathResult.Detail)") { $finish[''Detail''] = "$($pathResult.Detail)" }')) 'True'
+
+# Spec 7.3: the SYSTEM line comes from S-1-5-18. The main body adds the translated
+# name to the required names; Get-RequiredIdentNames keeps Veeam's English line first
+# and drops the translated one when it is the same name.
+$t18RequiredLine = @($t18MainText -split "`r?`n" | Where-Object { $_ -like '*Get-RequiredIdentNames -SvcMapName*' })
+Check 'T18 required names: the main body adds the translated SYSTEM name' (($t18RequiredLine.Count -eq 1) -and $t18RequiredLine[0].Contains('@("$($systemNames.Translated)")')) 'True'
+Check 'T18 required names: English SYSTEM line kept, translated one added' (@(Get-RequiredIdentNames -SvcMapName 'svc_veeam@VBR01' -ServiceAccountMapNames @('SISTEMA@AUTORIDADE NT', 'veeamsvc@CORP')) -join '|') 'SYSTEM@NT AUTHORITY|svc_veeam@VBR01|SISTEMA@AUTORIDADE NT|veeamsvc@CORP'
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue

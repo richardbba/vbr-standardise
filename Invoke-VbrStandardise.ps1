@@ -4702,10 +4702,495 @@ function Invoke-PathB {
 #endregion PathB
 
 #region MainHelpers
+# Spec 7.3-7.5: read the database state, fill $Ctx.State and the report fields,
+# and add the drift and blocker issues (all exit 5). Blockers are added first, so
+# that with equal exit codes the RMM IssueCode names what stops the change.
+# AUDIT and APPLY both run this; it changes nothing.
+function Get-AuditState {
+    param([Parameter(Mandatory)][hashtable] $Ctx)
+    $db = $Ctx.Db
+    $pg = $Ctx.Pg
+    $addresses = @($Ctx.Addresses)
+    $database = "$($db.DatabaseName)"
+    $localNames = @($Ctx.LocalNames | Where-Object { $_ })
+    $hbaRules = @($Ctx.HbaRules | Where-Object { $null -ne $_ })
+    $state = @{
+        RegistryAuth = 'NATIVE'; SspiPassed = $false; DbAuth = 'UNKNOWN'
+        PgHba = 'NOT_STANDARD'; PgIdent = 'MISSING_ENTRY'; PgPassword = 'UNKNOWN'; Backends = $null
+    }
+    $Ctx['State'] = $state
+
+    $state['RegistryAuth'] = Get-RegistryAuthMode -UserName "$($db.UserName)" -PasswordSet ([bool]$db.PasswordSet)
+    $hostClass = Get-DbHostClass -HostName "$($db.HostName)" -LocalNames $localNames
+    $role = "$($db.WindowsAuthRole)"
+    $roleDrift = ($role -ne '' -and $role -cne 'postgres')
+
+    if (Test-PgHbaStandard -Rules $hbaRules) { $state['PgHba'] = 'STANDARD' }
+    $state['PgIdent'] = "$(Get-PgIdentStatus -Entries @($Ctx.IdentEntries | Where-Object { $null -ne $_ }) -RequiredNames @($Ctx.RequiredIdentNames))"
+
+    # Spec 7.4: the SSPI baseline is the whole spec 7.9 test, run before any change:
+    # the login on every listening address, then the config check (the files that
+    # PostgreSQL loads parse without errors, and SHOW hba_file/ident_file name the
+    # files this script edits). WINDOWS needs both parts. The login alone decides
+    # whether the live state can be read.
+    $sspi = Test-PgSspiLogin -Psql "$($pg.Psql)" -Port ([int]$pg.Port) -Addresses $addresses -Database $database
+    $state['SspiPassed'] = [bool]$sspi.Passed
+    $healthOk = $false
+    $firstMatchOk = $false
+    $backendsOk = $false
+    $whyUnknown = New-Object System.Collections.ArrayList
+    if ($state['SspiPassed']) {
+        $health = Test-PgConfigHealth -Psql "$($pg.Psql)" -Port ([int]$pg.Port) -Address $addresses[0] -Database $database -Major ([int]$pg.Major) -HbaPath "$($pg.HbaPath)" -IdentPath "$($pg.IdentPath)"
+        $healthOk = [bool]$health.Ok
+        if (-not $healthOk) { [void]$whyUnknown.Add("the PostgreSQL config check failed ($($health.Detail))") }
+        $live = Get-PgLiveState -Psql "$($pg.Psql)" -Port ([int]$pg.Port) -Address $addresses[0] -Database $database
+        if ($live.Ok) {
+            if ($live.PasswordSet) { $state['PgPassword'] = 'SET' } else { $state['PgPassword'] = 'NONE' }
+            $state['Backends'] = @($live.Backends | Where-Object { $null -ne $_ })
+            $backendsOk = [bool](Test-VbrBackendsOk -Backends $state['Backends'] -Database $database)
+            if (-not $backendsOk) { [void]$whyUnknown.Add('a VBR backend in pg_stat_activity is not postgres from loopback') }
+        } else {
+            [void]$whyUnknown.Add('pg_stat_activity could not be read')
+        }
+        $firstMatchOk = $true
+        foreach ($address in $addresses) {
+            $match = Get-HbaFirstMatch -Rules $hbaRules -Database $database -User 'postgres' -Address $address
+            $options = @()
+            if ($null -ne $match) { $options = @(("$(@($match.Options) -join ' ')") -split '\s+' | Where-Object { $_ }) }
+            if ($null -eq $match -or "$($match.Method)" -ne 'sspi' -or -not ($options -ccontains 'map=veeam')) {
+                $firstMatchOk = $false
+                [void]$whyUnknown.Add("the first pg_hba.conf line for postgres from $address is not 'sspi map=veeam'")
+            }
+        }
+    } else {
+        $failed = @($sspi.Results | Where-Object { $null -ne $_ -and "$($_.Kind)" -ne 'OK' } | ForEach-Object { "$($_.Address) $($_.Kind)" })
+        [void]$whyUnknown.Add('SYSTEM cannot log in over SSPI (' + ($failed -join ', ') + ')')
+    }
+    $state['DbAuth'] = "$(Get-DbAuthState -RegistryAuth $state['RegistryAuth'] -SspiPassed ($state['SspiPassed'] -and $healthOk) -FirstMatchOk $firstMatchOk -VbrBackendsOk $backendsOk)"
+
+    # Spec 7.5 consumers: from pg_stat_activity when SYSTEM can log in, else from TCP.
+    if ($state['SspiPassed'] -and $null -ne $state['Backends']) {
+        $consumers = @(Get-ConsumerIssues -DbConfig $db -EmConfig $Ctx['Em'] -Backends $state['Backends'] -RemoteClients @() -LocalNames $localNames)
+    } else {
+        $remoteClients = @(Get-EstablishedRemoteClients -Port ([int]$pg.Port))
+        $consumers = @(Get-ConsumerIssues -DbConfig $db -EmConfig $Ctx['Em'] -Backends $null -RemoteClients $remoteClients -LocalNames $localNames)
+    }
+
+    # Blockers first.
+    foreach ($consumer in @($consumers | Where-Object { $null -ne $_ })) {
+        $null = Add-RunIssue -Code "$($consumer.Code)" -ExitCode 5 -Detail "$($consumer.Detail)" -Action "$($consumer.Action)"
+    }
+    $unresolved = @($Ctx.ServiceAccounts.Unresolved | Where-Object { $_ })
+    if ($unresolved.Count -gt 0) {
+        $null = Add-RunIssue -Code 'SERVICE_ACCOUNT_UNRESOLVED' -ExitCode 5 -Detail ('Veeam service account(s) that cannot be mapped: ' + ($unresolved -join ', ') + '. No veeam map line is removed and no database change is made.') -Action 'Check the account of each Veeam service named in Detail (NetworkService, LocalService and gMSA accounts are not supported), then re-run'
+    }
+    if ($state['DbAuth'] -eq 'UNKNOWN') {
+        $null = Add-RunIssue -Code 'DB_AUTH_UNKNOWN' -ExitCode 5 -Detail ("The registry says $($state['RegistryAuth']), but " + ($whyUnknown -join '; ') + '.') -Action 'Check by hand how VBR logs in to PostgreSQL on this server; the script makes no database change while this is unknown'
+    }
+    if (Test-LastFailure -WorkRoot $Ctx.WorkRoot) {
+        $null = Add-RunIssue -Code 'PATH_B_PREVIOUS_FAILURE' -ExitCode 5 -Detail "An earlier Path B run failed and was rolled back: $(Join-Path $Ctx.WorkRoot 'last-failure.json')" -Action 'Read the run folder named in last-failure.json, fix the cause, delete last-failure.json, then re-run with -Apply'
+    }
+
+    # Drift.
+    if ($state['DbAuth'] -eq 'NATIVE') {
+        $null = Add-RunIssue -Code 'DB_NATIVE_AUTH' -ExitCode 5 -Detail 'VBR logs in to PostgreSQL with a user name and password (registry SqlUserName or SqlSecuredPassword is set).' -Action 'Re-run with -Apply in a maintenance window'
+    }
+    if ($hostClass -ne 'LOOPBACK') {
+        $null = Add-RunIssue -Code 'DB_HOST_NOT_LOCAL' -ExitCode 5 -Detail "SqlHostName is '$($db.HostName)', not localhost, 127.0.0.1 or ::1." -Action 'Re-run with -Apply in a maintenance window'
+    }
+    if ($roleDrift) {
+        $null = Add-RunIssue -Code 'DB_WINDOWS_ROLE_NOT_POSTGRES' -ExitCode 5 -Detail "PostgresUserForWindowsAuth is '$role', not postgres." -Action 'Re-run with -Apply in a maintenance window'
+    }
+    if ($state['PgHba'] -ne 'STANDARD') {
+        $lanText = ''
+        if ($hbaRules.Count -gt 0) {
+            $lan = @(Get-NonLoopbackHbaRules -Rules $hbaRules | ForEach-Object { "line $([int]$_.LineIndex + 1): $($_.Type) $($_.Database) $($_.User) $($_.Address) $($_.Method)" })
+            if ($lan.Count -gt 0) { $lanText = ' Lines for other addresses that -Apply comments out: ' + ($lan -join '; ') + '.' }
+        }
+        $null = Add-RunIssue -Code 'PG_HBA_NOT_STANDARD' -ExitCode 5 -Detail ("The active pg_hba.conf lines are not Veeam's six SSPI lines.$lanText") -Action 'Re-run with -Apply'
+    }
+    if ($state['PgIdent'] -ne 'STANDARD') {
+        $null = Add-RunIssue -Code 'PG_IDENT_NOT_STANDARD' -ExitCode 5 -Detail ("The veeam map in pg_ident.conf is $($state['PgIdent']). Required: " + (@($Ctx.RequiredIdentNames) -join ', ') + '.') -Action 'Re-run with -Apply'
+    }
+    if ($state['PgPassword'] -eq 'SET') {
+        $null = Add-RunIssue -Code 'PG_POSTGRES_PASSWORD_SET' -ExitCode 5 -Detail 'The postgres role still has a password.' -Action 'Re-run with -Apply'
+    }
+
+    $reportVar = Get-Variable -Name Report -Scope Script -ErrorAction SilentlyContinue
+    if ($null -ne $reportVar -and $reportVar.Value -is [System.Collections.IDictionary]) {
+        $report = $reportVar.Value
+        $report['DbAuth'] = $state['DbAuth']
+        $report['PgHba'] = $state['PgHba']
+        $report['PgIdent'] = $state['PgIdent']
+        $report['PgPassword'] = $state['PgPassword']
+        if ($null -ne $Ctx['Account']) { $report['SvcAccount'] = "$(Get-CfgValue -Object $Ctx['Account'] -Name 'Status' -Default 'UNKNOWN')" }
+    }
+}
+
+# Spec 7.6: which path -Apply takes. NONE = nothing to change; BLOCKED = a change
+# is needed but a prerequisite fails (the reason is already in the issues).
+function Select-ApplyPath {
+    param([Parameter(Mandatory)][hashtable] $Ctx)
+    $state = $Ctx['State']
+    $db = $Ctx.Db
+    $dbAuth = "$($state['DbAuth'])"
+    $hostClass = Get-DbHostClass -HostName "$($db.HostName)" -LocalNames @($Ctx.LocalNames | Where-Object { $_ })
+    $role = "$($db.WindowsAuthRole)"
+    $needsB = ($dbAuth -eq 'NATIVE') -or ($hostClass -ne 'LOOPBACK') -or ($role -ne '' -and $role -cne 'postgres')
+    $needsA = (-not $needsB) -and ($dbAuth -eq 'WINDOWS') -and
+              (("$($state['PgHba'])" -ne 'STANDARD') -or ("$($state['PgIdent'])" -ne 'STANDARD') -or ("$($state['PgPassword'])" -eq 'SET'))
+    if ($dbAuth -eq 'WINDOWS' -and -not $needsA -and -not $needsB) { return 'NONE' }
+
+    $reasons = New-Object System.Collections.ArrayList
+    $account = $Ctx['Account']
+    if ($null -eq $account -or [bool](Get-CfgValue -Object $account -Name 'BlocksDb' -Default $true)) {
+        [void]$reasons.Add('svc_veeam is missing or not in Administrators')
+    }
+    if ($dbAuth -ne 'WINDOWS' -and $dbAuth -ne 'NATIVE') { [void]$reasons.Add("DbAuth is $dbAuth") }
+    $blockCodes = @('PG_PASSWORD_CONSUMER', 'PG_REMOTE_CONSUMER', 'SERVICE_ACCOUNT_UNRESOLVED', 'DB_AUTH_UNKNOWN')
+    if ($needsB) { $blockCodes += 'PATH_B_PREVIOUS_FAILURE' }
+    $issuesVar = Get-Variable -Name Issues -Scope Script -ErrorAction SilentlyContinue
+    if ($null -ne $issuesVar -and $null -ne $issuesVar.Value) {
+        foreach ($issue in @($issuesVar.Value)) {
+            if ($null -ne $issue -and $blockCodes -contains "$($issue.Code)") { [void]$reasons.Add("$($issue.Code)") }
+        }
+    }
+    if ($reasons.Count -gt 0) {
+        Write-Log ('No database change, because: ' + ($reasons -join ', ')) -Level WARN
+        return 'BLOCKED'
+    }
+    if ($needsB) { return 'B' }
+    return 'A'
+}
+
+# Called by the script's trap. Decides by stage (spec 7.6 table, through
+# Get-TrapAction) and always ends in Complete-Run, which exits. A second error
+# while this handler runs (for example inside Complete-Run) prints a minimal
+# summary and exits 50 without repeating any restore or rollback.
+function Invoke-TrapHandler {
+    param([Parameter(Mandatory)][System.Management.Automation.ErrorRecord] $ErrorRecord)
+    $message = "$($ErrorRecord.Exception.Message)"
+    if ($null -ne $ErrorRecord.InvocationInfo -and $ErrorRecord.InvocationInfo.ScriptLineNumber -gt 0) {
+        $message += " (line $($ErrorRecord.InvocationInfo.ScriptLineNumber))"
+    }
+    $stage = "$(Get-Variable -Name Stage -Scope Script -ValueOnly -ErrorAction SilentlyContinue)"
+    if (-not $stage) { $stage = 'UNTOUCHED' }
+
+    if ([bool](Get-Variable -Name TrapHandled -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) {
+        Write-Host '=== RMM SUMMARY ==='
+        Write-Host ("Computer=$env:COMPUTERNAME; Stage=$stage; Outcome=UNHANDLED_ERROR; ExitCode=50; IssueCode=UNHANDLED_ERROR; " +
+                    'ActionRequired=PAGE AN OPERATOR NOW. Check the transcript and the marker.; Detail=' +
+                    (Format-ShortText -Text "A second unexpected error happened while handling the first: $message"))
+        Write-Host '==================='
+        exit 50
+    }
+    $script:TrapHandled = $true
+    Write-Log "UNHANDLED ERROR at stage ${stage}: $message" -Level ERROR
+
+    $ctxVar = Get-Variable -Name Ctx -Scope Script -ErrorAction SilentlyContinue
+    $ctx = $null
+    if ($null -ne $ctxVar -and $ctxVar.Value -is [hashtable]) { $ctx = $ctxVar.Value }
+    $workRoot = ''
+    if ($null -ne $ctx) { $workRoot = "$($ctx['WorkRoot'])" }
+
+    $action = Get-TrapAction -Stage $stage
+    if ($action -eq 'RESTORE_PATH_A') {
+        $restored = $false
+        if ($null -ne $ctx) {
+            try { $restored = [bool](Restore-PathAFiles -Ctx $ctx) } catch { $restored = $false }
+        }
+        if ($restored) {
+            $markerNote = ''
+            try { if (-not (Remove-ChangeMarker -WorkRoot $workRoot)) { $markerNote = ' The marker could not be removed.' } } catch { $markerNote = ' The marker could not be removed.' }
+            Complete-Run -ExitCode 40 -Code 'UNHANDLED_ERROR' -Detail "$message; both config files were restored from the run folder and SYSTEM can log in again.$markerNote"
+        }
+        $null = Add-RunIssue -Code 'UNHANDLED_ERROR' -ExitCode 40 -Detail $message
+        Complete-Run -ExitCode 50 -Code 'ROLLBACK_FAILED' -Detail 'Restoring pg_hba.conf and pg_ident.conf after an unexpected error failed, or SYSTEM still cannot log in. The marker stays.' -Action 'PAGE AN OPERATOR NOW. VBR may not be able to open new database connections. Follow the MARKER_PRESENT recovery steps in README.md.'
+    }
+    if ($action -eq 'ROLLBACK_PATH_B') {
+        $rollback = $null
+        if ($null -ne $ctx) {
+            try { $rollback = Invoke-PathBRollback -Ctx $ctx -Reason "UNHANDLED_ERROR: $message" } catch { $rollback = $null }
+        }
+        if ($null -eq $rollback) {
+            $rollback = [pscustomobject]@{
+                ExitCode = 50; Code = 'ROLLBACK_FAILED'
+                Detail   = "UNHANDLED_ERROR: $message; the Path B rollback could not run. The marker stays."
+                Action   = 'PAGE AN OPERATOR NOW. VBR may be down. Follow the MARKER_PRESENT recovery steps in README.md.'
+            }
+        }
+        $finish = @{ ExitCode = [int]$rollback.ExitCode; Code = "$($rollback.Code)"; Detail = "$($rollback.Detail)" }
+        $rollbackAction = "$(Get-CfgValue -Object $rollback -Name 'Action' -Default '')"
+        if ($rollbackAction) { $finish['Action'] = $rollbackAction }
+        Complete-Run @finish
+    }
+    if ($action -eq 'NO_ROLLBACK') {
+        if ($workRoot) {
+            try { $null = Remove-ChangeMarker -WorkRoot $workRoot } catch { Write-Log "The marker could not be removed: $($_.Exception.Message)" -Level WARN }
+        }
+        Complete-Run -ExitCode 5 -Code 'POST_CONVERSION_STEP_FAILED' -Detail "$message; the change was verified before this error and VBR works, so nothing was rolled back." -Action 'Check the transcript, then re-run with -Apply to finish the remaining steps'
+    }
+    Complete-Run -ExitCode 20 -Code 'UNHANDLED_ERROR' -Detail "$message; no database change was made."
+}
+
+# Spec 7.1 step 3 for Constrained Language Mode, which cannot wait for its turn: that
+# mode blocks New-Object for the run lock (step 1), the issue list and Complete-Run,
+# so the run would end in an error with no RMM summary. The main body calls this
+# first. It uses only strings, Get-Date and Write-Host, which that mode allows, prints
+# the RMM summary block with every report field in Format-RmmSummary's layout, and
+# exits 20. In FullLanguage it does nothing. Nothing is locked, checked or written.
+function Exit-IfConstrainedLanguage {
+    param(
+        [string] $LanguageMode,
+        [string] $Mode = 'AUDIT'
+    )
+    if ($LanguageMode -eq 'FullLanguage') { return }
+    $stamp = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssK', [System.Globalization.CultureInfo]::InvariantCulture)
+    $action = 'Allow this script in the application control policy (WDAC or AppLocker) so it runs in FullLanguage mode'
+    $detail = "CONSTRAINED_LANGUAGE: PowerShell language mode is '$LanguageMode'. This script needs FullLanguage. Nothing was checked or changed."
+    Write-Host ''
+    Write-Host '=== RMM SUMMARY ==='
+    Write-Host ("Computer=$env:COMPUTERNAME; Timestamp=$stamp; Mode=$Mode; VbrVersion=; PgMajor=; SvcAccount=UNKNOWN; DbAuth=UNKNOWN; " +
+                'PgHba=UNKNOWN; PgIdent=UNKNOWN; PgPassword=UNKNOWN; Stage=UNTOUCHED; Outcome=CONSTRAINED_LANGUAGE; ExitCode=20; ' +
+                "IssueCode=CONSTRAINED_LANGUAGE; ActionRequired=$action; Detail=$detail; LogPath=")
+    Write-Host "RMM ACTION: $action"
+    Write-Host "RMM ISSUE: CONSTRAINED_LANGUAGE | $detail"
+    Write-Host '==================='
+    exit 20
+}
 #endregion MainHelpers
 
 # ===================== MAIN =====================
-# Temporary main body so the file runs end to end. Task 18 replaces everything
-# below the MAIN line with the real main body.
-$EXIT = Get-ExitCodeTable
-exit $EXIT.PREFLIGHT
+# Everything above this line is a function. The test file loads those functions and
+# never runs this part. The order below is spec section 7.1, then 7.2 to 7.6.
+
+trap {
+    Invoke-TrapHandler -ErrorRecord $_
+}
+
+$runMode = if ($Apply) { 'APPLY' } else { 'AUDIT' }
+# 7.1 step 3, Constrained Language Mode only, comes before everything else: that mode
+# blocks the .NET types that the lock (step 1), the issue list and Complete-Run need.
+Exit-IfConstrainedLanguage -LanguageMode "$($ExecutionContext.SessionState.LanguageMode)" -Mode $runMode
+
+$script:Stage = 'UNTOUCHED'
+$script:Issues = New-Object System.Collections.ArrayList
+$script:WorkRootReady = $false
+$script:TranscriptStarted = $false
+$script:RunLock = $null
+$script:TrapHandled = $false
+$Ctx = $null
+$script:Report = New-RunReport -Mode $runMode
+$config = Get-DefaultConfig
+$exitCodes = Get-ExitCodeTable
+
+# 7.1 step 1: the lock shared with Update-VeeamPostgres.ps1. If it is held, check nothing else.
+$script:RunLock = Enter-RunLock -Name 'Global\VeeamPgUpdate'
+if ($null -eq $script:RunLock) {
+    Complete-Run -ExitCode $exitCodes.RETRY -Code 'CONCURRENT_RUN' -Detail 'Another process holds the Global\VeeamPgUpdate lock (this script or Update-VeeamPostgres.ps1). Nothing was checked.'
+}
+
+# 7.1 steps 2 and 3: Windows PowerShell 5.1 Desktop, elevated, 64-bit, FullLanguage.
+$contextIssue = Get-PreflightContextIssue -PSEdition "$($PSVersionTable.PSEdition)" -IsAdmin (Test-IsAdministrator) -Is64BitOS ([Environment]::Is64BitOperatingSystem) -Is64BitProcess ([Environment]::Is64BitProcess) -LanguageMode "$($ExecutionContext.SessionState.LanguageMode)"
+if ($null -ne $contextIssue) {
+    Complete-Run -ExitCode ([int]$contextIssue.ExitCode) -Code "$($contextIssue.Code)" -Detail "$($contextIssue.Detail)" -Action "$($contextIssue.Action)"
+}
+
+# 7.1 step 4: the work folder. Nothing is written there before it passes.
+$workRootError = ''
+if ([string]::IsNullOrWhiteSpace($WorkRoot) -or $WorkRoot -notmatch '^[A-Za-z]:[\\/]') {
+    $workRootError = "WorkRoot '$WorkRoot' must be an absolute path on a local drive."
+} else {
+    try { $WorkRoot = [IO.Path]::GetFullPath($WorkRoot).TrimEnd('\') } catch { $workRootError = "WorkRoot '$WorkRoot' is not a valid path: $($_.Exception.Message)" }
+}
+if (-not $workRootError) {
+    $workRootResult = Initialize-WorkRoot -Path $WorkRoot
+    if (-not $workRootResult.Ok) { $workRootError = "$($workRootResult.Detail)" }
+}
+if ($workRootError) {
+    Complete-Run -ExitCode $exitCodes.PREFLIGHT -Code 'WORKROOT_UNSAFE' -Detail $workRootError -Action 'Use a WorkRoot that only SYSTEM and Administrators control (default C:\ProgramData\VeeamStandardise)'
+}
+$script:WorkRootReady = $true
+$runStamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+$transcriptPath = Join-Path $WorkRoot ('logs\VbrStandardise_{0}_{1}-{2}.log' -f $env:COMPUTERNAME, $runStamp, $PID)
+try {
+    $null = Start-Transcript -Path $transcriptPath -IncludeInvocationHeader
+    $script:TranscriptStarted = $true
+    $script:Report['LogPath'] = $transcriptPath
+} catch {
+    Write-Log "The transcript could not start: $($_.Exception.Message)" -Level WARN
+}
+Write-Log "Invoke-VbrStandardise.ps1 - mode $runMode" -Level STEP
+Write-Log "PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)); WorkRoot $WorkRoot; CreateServiceAccount $([bool]$CreateServiceAccount)"
+
+# 7.1 step 5: a marker from an unfinished run of this script or of the updater.
+$markers = @(Find-ChangeMarkers -WorkRoot $WorkRoot)
+if ($markers.Count -gt 0) {
+    Complete-Run -ExitCode $exitCodes.ESCALATE_NOW -Code 'MARKER_PRESENT' -Detail ('A run stopped in the middle of a change. Marker: ' + ($markers -join ', ')) -Action 'PAGE AN OPERATOR NOW. Hold Update-VeeamPostgres.ps1 jobs on this server. Follow the MARKER_PRESENT recovery steps in README.md, then delete the marker.'
+}
+if (Test-LastFailure -WorkRoot $WorkRoot) {
+    Write-Log 'last-failure.json exists, so old run folders are kept.' -Level WARN
+} else {
+    try { $null = Remove-OldRunData -WorkRoot $WorkRoot -RetentionDays ([int]$config.RetentionDays) } catch { Write-Log "Housekeeping failed: $($_.Exception.Message)" -Level WARN }
+}
+
+# 7.1 step 6
+if (Test-IsDomainController) {
+    Complete-Run -ExitCode $exitCodes.UNSUPPORTED -Code 'DOMAIN_CONTROLLER' -Detail 'This server is a domain controller, where a local account would be a domain account.'
+}
+
+# 7.1 step 7
+$vbr = Get-VbrInstall
+if (-not $vbr.Installed) {
+    Complete-Run -ExitCode $exitCodes.PREFLIGHT -Code 'VBR_NOT_FOUND' -Detail 'No Veeam Backup & Replication server is installed (no CorePath under HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication).'
+}
+$script:Report['VbrVersion'] = "$($vbr.Version)"
+$db = Get-VbrDbConfig
+if ("$($db.ActiveConfiguration)" -ne 'PostgreSql') {
+    Complete-Run -ExitCode $exitCodes.UNSUPPORTED -Code 'VBR_DB_NOT_POSTGRES' -Detail "SqlActiveConfiguration is '$($db.ActiveConfiguration)', not PostgreSql."
+}
+
+# 7.1 step 8
+if (Test-Vb365Installed) {
+    Complete-Run -ExitCode $exitCodes.UNSUPPORTED -Code 'STACKED_VBR_VB365' -Detail 'Veeam Backup for Microsoft 365 is installed on this server and shares the PostgreSQL instance.'
+}
+
+# 7.1 step 9 (DB_HOST_NOT_LOCAL and step 10's DB_WINDOWS_ROLE_NOT_POSTGRES are drift, reported by the audit)
+$localNames = @(Get-LocalHostNames)
+$hostClass = Get-DbHostClass -HostName "$($db.HostName)" -LocalNames $localNames
+if ($hostClass -eq 'REMOTE') {
+    Complete-Run -ExitCode $exitCodes.UNSUPPORTED -Code 'REMOTE_DB' -Detail "SqlHostName '$($db.HostName)' is not this server."
+}
+
+# 7.1 step 11
+$pg = Find-PgInstall
+if (-not $pg.Ok) {
+    $pgCode = "$($pg.Code)"
+    if (-not $pgCode) { $pgCode = 'NO_PG_FOUND' }
+    $pgExit = $exitCodes.PREFLIGHT
+    if ($pgCode -eq 'MULTIPLE_PG') { $pgExit = $exitCodes.UNSUPPORTED }
+    Complete-Run -ExitCode $pgExit -Code $pgCode -Detail "$($pg.Detail)"
+}
+$script:Report['PgMajor'] = "$($pg.Major)"
+if ($null -eq $db.Port) {
+    Complete-Run -ExitCode $exitCodes.UNSUPPORTED -Code 'PG_INSTANCE_MISMATCH' -Detail 'SqlHostPort is missing from the VBR registry.'
+}
+$pg | Add-Member -NotePropertyName 'Port' -NotePropertyValue ([int]$db.Port) -Force
+
+# 7.1 step 12
+$postmaster = Test-PostmasterLive -DataDir "$($pg.DataDir)" -ExpectedPort ([int]$pg.Port)
+if (-not $postmaster.Ok) {
+    Complete-Run -ExitCode $exitCodes.UNSUPPORTED -Code 'PG_INSTANCE_MISMATCH' -Detail "$($postmaster.Detail)"
+}
+
+# 7.1 step 13
+$overrides = @(Test-PgConfOverride -DataDir "$($pg.DataDir)")
+if ($overrides.Count -gt 0) {
+    Complete-Run -ExitCode $exitCodes.UNSUPPORTED -Code 'PG_CONF_OVERRIDE' -Detail ('postgresql.conf or postgresql.auto.conf sets ' + ($overrides -join ', ') + '.')
+}
+$hba = Read-ConfFile -Path "$($pg.HbaPath)"
+$hbaLines = @(Split-ConfLines -Text $hba.Text)
+if (Test-PgHbaHasInclude -Lines $hbaLines) {
+    Complete-Run -ExitCode $exitCodes.UNSUPPORTED -Code 'PG_HBA_INCLUDE' -Detail "$($pg.HbaPath) uses include, include_if_exists, include_dir or an @file."
+}
+
+# 7.1 step 14
+$addresses = @(Get-ListeningLoopback -Port ([int]$pg.Port))
+if ($addresses.Count -eq 0) {
+    Complete-Run -ExitCode $exitCodes.PREFLIGHT -Code 'PG_NOT_LISTENING' -Detail "Neither 127.0.0.1 nor ::1 listens on port $($pg.Port)."
+}
+
+# 7.1 step 15
+$systemNames = Get-SystemMapNames
+if (-not $systemNames.IsAscii) {
+    Complete-Run -ExitCode $exitCodes.UNSUPPORTED -Code 'PG_IDENT_LOCALISED' -Detail "The SYSTEM account name '$($systemNames.Translated)' has non-ASCII characters."
+}
+
+# 7.2: the svc_veeam account (adds its own issues).
+Write-Log 'Service account check' -Level STEP
+$account = Invoke-ServiceAccountStep -Config $config -Apply ([bool]$Apply) -CreateRequested ([bool]$CreateServiceAccount)
+$script:Report['SvcAccount'] = "$($account.Status)"
+
+# 7.3: the names the veeam map must hold.
+$serviceAccounts = Get-VeeamServiceAccountNames -ComputerName $env:COMPUTERNAME
+$svcMapName = ''
+if ($null -ne $account.Info -and [bool](Get-CfgValue -Object $account.Info -Name 'IsUser' -Default $false)) {
+    $svcMapName = "$(Get-CfgValue -Object $account.Info -Name 'MapName' -Default '')"
+}
+if (-not $svcMapName) { $svcMapName = ConvertTo-SspiMapName -Domain $env:COMPUTERNAME -Name "$($config.ServiceAccountName)" }
+# Spec 7.3 builds every name from a SID, SYSTEM from S-1-5-18. PostgreSQL sees the
+# translated name, so on Windows whose SYSTEM name is translated but ASCII (for
+# example SISTEMA@AUTORIDADE NT) that line is required next to Veeam's English one.
+# On English Windows the two are the same name and the duplicate is dropped.
+$requiredNames = @(Get-RequiredIdentNames -SvcMapName $svcMapName -ServiceAccountMapNames (@("$($systemNames.Translated)") + @($serviceAccounts.MapNames | Where-Object { $_ })))
+$ident = Read-ConfFile -Path "$($pg.IdentPath)"
+$identLines = @(Split-ConfLines -Text $ident.Text)
+
+$Ctx = @{
+    Config             = $config
+    WorkRoot           = $WorkRoot
+    Stamp              = $runStamp
+    RunDir             = ''
+    Apply              = [bool]$Apply
+    CreateRequested    = [bool]$CreateServiceAccount
+    Vbr                = $vbr
+    Db                 = $db
+    Em                 = (Get-EnterpriseManagerDbConfig)
+    LocalNames         = $localNames
+    Pg                 = $pg
+    Addresses          = $addresses
+    SystemNames        = $systemNames
+    Account            = $account
+    ServiceAccounts    = $serviceAccounts
+    RequiredIdentNames = $requiredNames
+    Hba                = $hba
+    HbaLines           = $hbaLines
+    HbaRules           = @(Get-PgHbaRules -Lines $hbaLines)
+    Ident              = $ident
+    IdentLines         = $identLines
+    IdentEntries       = @(Get-PgIdentEntries -Lines $identLines)
+    State              = @{}
+    HbaBackupPath      = ''
+    IdentBackupPath    = ''
+    Snapshot           = @()
+    StopSet            = @()
+    Stopped            = @()
+    RegSnapshot        = @{}
+    RegBackup          = $null
+    StartUtc           = [DateTime]::MinValue
+    LogOffset          = [long]0
+    PasswordCleared    = $false
+}
+
+# 7.4 and 7.5: live state, drift and blockers (both modes).
+Write-Log 'Database state' -Level STEP
+Get-AuditState -Ctx $Ctx
+Write-Log ('DbAuth={0}; PgHba={1}; PgIdent={2}; PgPassword={3}; SvcAccount={4}' -f $Ctx.State['DbAuth'], $Ctx.State['PgHba'], $Ctx.State['PgIdent'], $Ctx.State['PgPassword'], $account.Status)
+if (-not $Apply) {
+    Write-Log 'AUDIT mode: no database change was made.'
+    Complete-Run
+}
+
+# 7.6
+$applyPath = Select-ApplyPath -Ctx $Ctx
+Write-Log "Apply path: $applyPath" -Level STEP
+if ($applyPath -eq 'NONE' -or $applyPath -eq 'BLOCKED') {
+    Complete-Run
+}
+if ($applyPath -eq 'A') {
+    $pathResult = Invoke-PathA -Ctx $Ctx
+} else {
+    $pathResult = Invoke-PathB -Ctx $Ctx
+}
+# The path's Detail goes to Complete-Run in every case. With a Code it is that issue's
+# Detail; on success it is a note at the end of Detail (spec 7.5: the pg_hba.conf
+# lines that were commented out; spec 7.6 Path B step 13: the roles that lost login).
+if ("$($pathResult.Detail)") { Write-Log "Result: $($pathResult.Detail)" }
+$finish = @{ ExitCode = [int]$pathResult.ExitCode }
+if ("$($pathResult.Detail)") { $finish['Detail'] = "$($pathResult.Detail)" }
+if ("$($pathResult.Code)") {
+    $finish['Code'] = "$($pathResult.Code)"
+    $pathAction = "$(Get-CfgValue -Object $pathResult -Name 'Action' -Default '')"
+    if ($pathAction) { $finish['Action'] = $pathAction }
+}
+Complete-Run @finish
