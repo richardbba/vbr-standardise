@@ -715,19 +715,40 @@ Check 'Remove-OldRunData: marker kept' (Test-Path -LiteralPath (Join-Path $t3Ret
 Remove-OldRunData -WorkRoot $t3Ret -RetentionDays 0
 Check 'Remove-OldRunData: RetentionDays 0 deletes nothing' (Test-Path -LiteralPath $t3Dir) 'True'
 
-# Test-SafeWorkRootParent on real folders (read only), and an unsafe parent
+# Test-SafeWorkRootParent on a real folder (read only)
 Check 'Test-SafeWorkRootParent: C:\ProgramData (parent of the default WorkRoot) is safe' (Test-SafeWorkRootParent -Path 'C:\ProgramData') 'True'
-$t3Unsafe = New-TestFolder 'unsafe'
-$t3Acl = Get-Acl -LiteralPath $t3Unsafe
-$t3Acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
-Set-Acl -LiteralPath $t3Unsafe -AclObject $t3Acl
-Check 'Test-SafeWorkRootParent: folder anyone can delete from is unsafe' (Test-SafeWorkRootParent -Path $t3Unsafe) 'False'
-$t3R = Initialize-WorkRoot -Path (Join-Path $t3Unsafe 'root')
-Check 'Initialize-WorkRoot: unsafe parent is refused' $t3R.Ok 'False'
-Check 'Initialize-WorkRoot: nothing is created under an unsafe parent' (Test-Path -LiteralPath (Join-Path $t3Unsafe 'root')) 'False'
+
+# Test-SafeWorkRootParent and Initialize-WorkRoot with an unsafe parent (elevation needed).
+# The fixture must be safe before the Everyone rule is added, or the False result could
+# come from something else. A plain folder in the %TEMP% chain is not safe on hosts where
+# other accounts have Modify on TEMP, so the fixture lives under C:\ProgramData, whose
+# chain is checked safe above. Each refusal below is a True-to-False flip on one folder.
+if ($t3IsAdmin) {
+    $t3Unsafe = Join-Path 'C:\ProgramData' "vbrstd-unsafe-$PID"
+    [void]$script:TestFolders.Add($t3Unsafe)
+    try {
+        if (Test-Path -LiteralPath $t3Unsafe) { Remove-Item -LiteralPath $t3Unsafe -Recurse -Force }
+        [void](New-Item -ItemType Directory -Path $t3Unsafe -Force)
+        Check 'Test-SafeWorkRootParent: fresh folder under C:\ProgramData is safe before the rule' (Test-SafeWorkRootParent -Path $t3Unsafe) 'True'
+        $t3R = Initialize-WorkRoot -Path (Join-Path $t3Unsafe 'okroot')
+        Check 'Initialize-WorkRoot: safe parent under C:\ProgramData is accepted' $t3R.Ok 'True'
+        $t3Acl = Get-Acl -LiteralPath $t3Unsafe
+        $t3Acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        Set-Acl -LiteralPath $t3Unsafe -AclObject $t3Acl
+        Check 'Test-SafeWorkRootParent: folder anyone can delete from is unsafe' (Test-SafeWorkRootParent -Path $t3Unsafe) 'False'
+        $t3R = Initialize-WorkRoot -Path (Join-Path $t3Unsafe 'root')
+        Check 'Initialize-WorkRoot: unsafe parent is refused' $t3R.Ok 'False'
+        Check 'Initialize-WorkRoot: unsafe parent refusal names the parent check' ($t3R.Detail -match 'parent folder can be replaced') 'True'
+        Check 'Initialize-WorkRoot: nothing is created under an unsafe parent' (Test-Path -LiteralPath (Join-Path $t3Unsafe 'root')) 'False'
+    } finally {
+        Remove-Item -LiteralPath $t3Unsafe -Recurse -Force -ErrorAction SilentlyContinue
+    }
+} else {
+    Skip 'Test-SafeWorkRootParent and Initialize-WorkRoot unsafe parent tests' 'not elevated'
+}
 
 # Initialize-WorkRoot ACL work and the trusted legacy marker (elevation needed).
-# The parent check is mocked here: it is tested above on C:\ProgramData, and on
+# The parent check is mocked here: it is tested above under C:\ProgramData, and on
 # some machines other accounts have rights on the TEMP folder chain.
 if ($t3IsAdmin) {
     & {
