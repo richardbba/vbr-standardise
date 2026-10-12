@@ -2840,6 +2840,19 @@ function Get-PgIdentEntries {
     return $entries.ToArray()
 }
 
+# True when an active pg_ident.conf line includes other files: include,
+# include_if_exists or include_dir (PostgreSQL 16 and later). Get-PgIdentEntries would
+# read such a line as a map named 'include', so veeam lines in the included file would
+# stay invisible. Preflight refuses it like an include in pg_hba.conf (spec 7.1 step 13).
+function Test-PgIdentHasInclude {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]] $Lines)
+    foreach ($entry in @(Get-ConfLogicalLines -Lines $Lines)) {
+        $t = @(Split-ConfTokens -Line $entry.Text)
+        if ($t.Count -gt 0 -and @('include', 'include_if_exists', 'include_dir') -contains $t[0]) { return $true }
+    }
+    return $false
+}
+
 # A set of names that compares case-insensitively, as PostgreSQL compares SSPI names.
 # Empty and $null names are skipped. Every name lookup in this region goes through this
 # one set, so the de-duplication, the check and the render cannot disagree on case. The
@@ -4261,6 +4274,9 @@ function Restore-PathAFiles {
 # stage is PATH_A_WRITING.
 function Invoke-PathA {
     param([Parameter(Mandatory)][hashtable] $Ctx)
+    # Spec 6.1: AUDIT changes nothing. The main body already stops AUDIT before this
+    # call; this guard throws at stage UNTOUCHED (trap: exit 20, nothing changed).
+    if (-not [bool]$Ctx['Apply']) { throw 'Invoke-PathA was called without -Apply (AUDIT mode); nothing was changed.' }
     $state = $Ctx['State']
     $writeIdent = ("$($state['PgIdent'])" -ne 'STANDARD')
     $writeHba = ("$($state['PgHba'])" -ne 'STANDARD')
@@ -4352,6 +4368,21 @@ function Invoke-PathA {
         }
     }
     Clear-PathFixedIssues -Ctx $Ctx
+
+    if ($writeHba) {
+        # Spec 7.14: the new pg_hba.conf has no password line, so Detail names the other
+        # roles with LOGIN and a password (for example pg_native_admin). Information
+        # only: the change is verified, so a failure here is a warning.
+        try {
+            $otherRoles = @(Get-OtherPasswordRoles -Psql $psql -Port $port -Address $addresses[0] -Database $database | Where-Object { $_ })
+            if ($otherRoles.Count -gt 0) {
+                Write-Log ('Roles with LOGIN and a password, which can no longer log in: ' + ($otherRoles -join ', ')) -Level WARN
+                [void]$notes.Add('Roles with LOGIN and a password that can no longer log in: ' + ($otherRoles -join ', ') + '.')
+            }
+        } catch {
+            Write-Log "Could not list the other roles with a password: $($_.Exception.Message)" -Level WARN
+        }
+    }
 
     if ("$($state['PgPassword'])" -eq 'SET') {
         Write-Log 'Path A step 5 - clear the postgres password' -Level STEP
@@ -4527,6 +4558,9 @@ function Invoke-PathBRollback {
 # trap, which runs the same rollback because the stage is PATH_B_CHANGING.
 function Invoke-PathB {
     param([Parameter(Mandatory)][hashtable] $Ctx)
+    # Spec 6.1: AUDIT changes nothing. The main body already stops AUDIT before this
+    # call; this guard throws at stage UNTOUCHED (trap: exit 20, nothing changed).
+    if (-not [bool]$Ctx['Apply']) { throw 'Invoke-PathB was called without -Apply (AUDIT mode); nothing was changed.' }
     $cfg = $Ctx.Config
     $state = $Ctx['State']
     $timeoutSec = [int]$cfg.ServiceStopTimeoutSec
@@ -5200,7 +5234,8 @@ $script:WorkRootReady = $true
 $runStamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
 $transcriptPath = Join-Path $WorkRoot ('logs\VbrStandardise_{0}_{1}-{2}.log' -f $env:COMPUTERNAME, $runStamp, $PID)
 try {
-    $null = Start-Transcript -Path $transcriptPath -IncludeInvocationHeader
+    # -LiteralPath: -Path is a wildcard, so a WorkRoot with [ or ] would lose the transcript.
+    $null = Start-Transcript -LiteralPath $transcriptPath -IncludeInvocationHeader
     $script:TranscriptStarted = $true
     $script:Report['LogPath'] = $transcriptPath
 } catch {
@@ -5279,6 +5314,13 @@ $hbaLines = @(Split-ConfLines -Text $hba.Text)
 if (Test-PgHbaHasInclude -Lines $hbaLines) {
     Complete-Run -ExitCode $exitCodes.UNSUPPORTED -Code 'PG_HBA_INCLUDE' -Detail "$($pg.HbaPath) uses include, include_if_exists, include_dir or an @file."
 }
+# PostgreSQL 16 and later also accept includes in pg_ident.conf; veeam lines in an
+# included file would be invisible to the check and the render.
+$ident = Read-ConfFile -Path "$($pg.IdentPath)"
+$identLines = @(Split-ConfLines -Text $ident.Text)
+if (Test-PgIdentHasInclude -Lines $identLines) {
+    Complete-Run -ExitCode $exitCodes.UNSUPPORTED -Code 'PG_HBA_INCLUDE' -Detail "$($pg.IdentPath) (pg_ident.conf) uses include, include_if_exists or include_dir."
+}
 
 # 7.1 step 14
 $addresses = @(Get-ListeningLoopback -Port ([int]$pg.Port))
@@ -5309,8 +5351,6 @@ if (-not $svcMapName) { $svcMapName = ConvertTo-SspiMapName -Domain $env:COMPUTE
 # example SISTEMA@AUTORIDADE NT) that line is required next to Veeam's English one.
 # On English Windows the two are the same name and the duplicate is dropped.
 $requiredNames = @(Get-RequiredIdentNames -SvcMapName $svcMapName -ServiceAccountMapNames (@("$($systemNames.Translated)") + @($serviceAccounts.MapNames | Where-Object { $_ })))
-$ident = Read-ConfFile -Path "$($pg.IdentPath)"
-$identLines = @(Split-ConfLines -Text $ident.Text)
 
 $Ctx = @{
     Config             = $config

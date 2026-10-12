@@ -26,7 +26,7 @@ The script supports a Windows VBR server whose configuration database is Postgre
 - VBR and Veeam Backup for Microsoft 365 on the same server (`STACKED_VBR_VB365`). VB365 shares the PostgreSQL instance and needs remote SSPI lines for its proxies.
 - Domain controllers (`DOMAIN_CONTROLLER`).
 - Non-English Windows where the SYSTEM account name has non-ASCII characters, for example `NT-AUTORITÄT` (`PG_IDENT_LOCALISED`).
-- PostgreSQL setups the script cannot edit safely: more than one install (`MULTIPLE_PG`), a running instance that is not the one in the registry (`PG_INSTANCE_MISMATCH`), `hba_file` or `ident_file` set in `postgresql.conf` (`PG_CONF_OVERRIDE`), or `include` lines in `pg_hba.conf` (`PG_HBA_INCLUDE`).
+- PostgreSQL setups the script cannot edit safely: more than one install (`MULTIPLE_PG`), a running instance that is not the one in the registry (`PG_INSTANCE_MISMATCH`), `hba_file` or `ident_file` set in `postgresql.conf` (`PG_CONF_OVERRIDE`), or `include` lines in `pg_hba.conf` or `pg_ident.conf` (`PG_HBA_INCLUDE`).
 - VBR on Linux and the Veeam Software Appliance.
 
 The script never changes the account the Veeam services run as, never upgrades PostgreSQL (`Update-VeeamPostgres.ps1` does that), and has no recovery mode: if a run stops in the middle of a change, a person recovers the server with the steps in [MARKER_PRESENT: manual recovery](#marker_present-manual-recovery).
@@ -104,7 +104,7 @@ In this order. The first failure ends the run. One exception: Constrained Langua
 10. `PostgresUserForWindowsAuth` is missing, empty or `postgres`. Any other value is drift `DB_WINDOWS_ROLE_NOT_POSTGRES`.
 11. Exactly one PostgreSQL install, and its service runs.
 12. `postmaster.pid` names a live `postgres.exe` on the VBR port.
-13. No `hba_file`/`ident_file` override and no `include` in `pg_hba.conf`.
+13. No `hba_file`/`ident_file` override, and no `include` in `pg_hba.conf` or `pg_ident.conf`.
 14. `127.0.0.1` or `::1` (or both) listen on the port. Only listening addresses are tested later.
 15. The SYSTEM account name is ASCII.
 
@@ -139,7 +139,7 @@ Used when `DbAuth=WINDOWS`, `SqlHostName` is a loopback name and `PostgresUserFo
 1. Create the run folder, back up `pg_hba.conf` and `pg_ident.conf`, record their ACLs (SDDL), write the marker. Stage `PATH_A_WRITING`.
 2. Write `pg_ident.conf`, then `pg_hba.conf`, only where they are not standard. Lines that are removed are commented out with `# [VbrStandardise <stamp>]`; nothing is deleted.
 3. Test: the SSPI login on every listening address, `pg_hba_file_rules` (and `pg_ident_file_mappings` on PostgreSQL 15 and later) without errors, and `SHOW hba_file`/`ident_file` naming the edited files. If the test fails, both files are restored from the run folder and tested again: exit 40 `PG_SSPI_TEST_FAILED` if SYSTEM can log in again (marker removed), else exit 50 `ROLLBACK_FAILED` (marker stays).
-4. Remove the marker. Stage `PATH_A_DONE`.
+4. Remove the marker. Stage `PATH_A_DONE`. If `pg_hba.conf` was rewritten, list the other roles that have LOGIN and a password in `Detail`. They cannot log in any more.
 5. Clear the `postgres` password if it is set (`PG_PASSWORD_NOT_CLEARED`, exit 5, if that fails; VBR still works).
 
 Every file write and restore uses one routine: a temp file in the data folder, swapped in with `[IO.File]::Replace`, then a check that the file exists, its SHA-256 matches and its ACL is unchanged. A run-folder file is never moved or copied into the data folder, because it would bring the run folder's ACL and PostgreSQL could no longer read it.
@@ -213,7 +213,7 @@ If a run finds more than one issue, the highest exit code wins. `IssueCode` is t
 | `PG_INSTANCE_MISMATCH` | 11 | `postmaster.pid` does not name a live `postgres.exe` on the VBR port, or `SqlHostPort` is missing. | Check by hand which instance VBR uses. |
 | `PG_NOT_LISTENING` | 20 | Neither `127.0.0.1` nor `::1` listens on the port. | Check `listen_addresses` and the service. |
 | `PG_CONF_OVERRIDE` | 11 | `postgresql.conf` or `postgresql.auto.conf` sets `hba_file` or `ident_file`. | Standardise by hand. |
-| `PG_HBA_INCLUDE` | 11 | `pg_hba.conf` uses `include`, `include_if_exists`, `include_dir` or `@file`. | Standardise by hand. |
+| `PG_HBA_INCLUDE` | 11 | `pg_hba.conf` uses `include`, `include_if_exists`, `include_dir` or `@file`, or `pg_ident.conf` uses `include`, `include_if_exists` or `include_dir` (PostgreSQL 16 and later). `Detail` names the file. | Standardise by hand. |
 | `PG_IDENT_LOCALISED` | 11 | The SYSTEM account name has non-ASCII characters. | Standardise by hand. |
 
 ### Account
@@ -377,7 +377,7 @@ A pass ends with `RESULT: <n> passed, 0 failed` and exit code 0. `SKIP` lines ar
 - The test file parses `Invoke-VbrStandardise.ps1`, loads its functions and never runs the main body. It does not use Pester.
 - Every function that would change the system is replaced by a mock in a child scope. The tests create only temp folders (`%TEMP%\vbrstd-*`) and throwaway `HKCU:` keys, and remove them at the end. They never create a local user, never change a service and never write to `HKLM:`.
 - Static checks enforce the rules: no `Stop-Service -Force`, no `Stop-Process`, no `Get-LocalGroupMember`, no `Read-Host`, no `Out-File`, no `Set-Content -Encoding UTF8`, no `ConvertTo-SecureString` with a literal, no `Invoke-Expression`; the parameter list; the order of the main body.
-- Three child-process runs use the real script: an AUDIT under `powershell.exe` on a machine without VBR must exit 20 `VBR_NOT_FOUND` with a valid summary, a run under `pwsh.exe` must exit 20 `WRONG_POWERSHELL`, and a run from a session switched to Constrained Language Mode must exit 20 `CONSTRAINED_LANGUAGE` and write nothing. The first two are skipped when the machine has a VBR server, is a domain controller, is not elevated, or has no `pwsh.exe`; the third always runs.
+- Three child-process runs use the real script: an AUDIT under `powershell.exe` on a machine without VBR must exit 20 `VBR_NOT_FOUND` with a valid summary, a run under `pwsh.exe` must exit 20 `WRONG_POWERSHELL`, and an `-Apply` run from a session switched to Constrained Language Mode must exit 20 `CONSTRAINED_LANGUAGE` and write nothing. The AUDIT run is skipped when the machine has a VBR server, is a domain controller, is not elevated, or has an updater marker. The `pwsh.exe` run is skipped when `pwsh.exe` is missing. The Constrained Language Mode run is skipped on a machine with a VBR server, because an AppLocker or WDAC rule that trusts the project folder would run the script in FullLanguage and make that `-Apply` real.
 
 ## Pilot order
 

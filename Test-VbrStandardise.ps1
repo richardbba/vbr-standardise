@@ -3982,7 +3982,13 @@ function New-T16Ctx {
 $t16Mocks = {
     $calls = New-Object System.Collections.ArrayList
     $sspiQueue = New-Object System.Collections.Queue
-    $fake = @{ HealthOk = $true; ClearOk = $true; RemoveMarkerOk = $true; WriteThrows = ''; RestoreThrows = '' }
+    $fake = @{ HealthOk = $true; ClearOk = $true; RemoveMarkerOk = $true; WriteThrows = ''; RestoreThrows = ''; OtherRoles = @('pg_native_admin'); RolesThrow = '' }
+    function Get-OtherPasswordRoles {
+        param($Psql, $Port, $Address, $Database)
+        [void]$calls.Add("Get-OtherPasswordRoles:$script:Stage")
+        if ($fake.RolesThrow) { throw $fake.RolesThrow }
+        return @($fake.OtherRoles)
+    }
     function New-RunFolder { param($WorkRoot, $Stamp) [void]$calls.Add('New-RunFolder'); return (Join-Path $WorkRoot "runs\$Stamp") }
     function Backup-ConfFile { param($Path, $RunDir) [void]$calls.Add("Backup-ConfFile:$(Split-Path -Leaf $Path)"); return (Join-Path $RunDir ((Split-Path -Leaf $Path) + '.before')) }
     function Write-ChangeMarker { param($WorkRoot, $RunDir, $PathName, $Stage) [void]$calls.Add("Write-ChangeMarker:${PathName}:$Stage") }
@@ -4044,9 +4050,10 @@ $t16Mocks = {
     $result = Invoke-PathA -Ctx $ctx
     Check 'T16 happy: exit 0' $result.ExitCode 0
     Check 'T16 happy: no issue code' $result.Code ''
-    Check 'T16 happy: spec order (backup, marker, ident, hba, test, marker off, password)' ($calls -join ' > ') ('New-RunFolder > Backup-ConfFile:pg_hba.conf > Backup-ConfFile:pg_ident.conf > Write-ChangeMarker:A:PATH_A_WRITING > ' +
+    Check 'T16 happy: spec order (backup, marker, ident, hba, test, marker off, roles, password)' ($calls -join ' > ') ('New-RunFolder > Backup-ConfFile:pg_hba.conf > Backup-ConfFile:pg_ident.conf > Write-ChangeMarker:A:PATH_A_WRITING > ' +
         'Write-ConfFileAtomic:pg_ident.conf:SDDL-IDENT:PATH_A_WRITING > Write-ConfFileAtomic:pg_hba.conf:SDDL-HBA:PATH_A_WRITING > ' +
-        'Test-PgSspiLogin > Test-PgConfigHealth > Remove-ChangeMarker > Clear-PostgresPassword:PATH_A_DONE')
+        'Test-PgSspiLogin > Test-PgConfigHealth > Remove-ChangeMarker > Get-OtherPasswordRoles:PATH_A_DONE > Clear-PostgresPassword:PATH_A_DONE')
+    Check 'T16 happy: Detail names the roles that can no longer log in (spec 7.14)' ($result.Detail -like '*Roles with LOGIN and a password that can no longer log in: pg_native_admin.*') 'True'
     Check 'T16 happy: stage PATH_A_DONE' $script:Stage 'PATH_A_DONE'
     Check 'T16 happy: run folder recorded' $ctx.RunDir (Join-Path $t16Root 'runs\20261012-101500')
     Check 'T16 happy: pg_hba backup recorded' $ctx.HbaBackupPath (Join-Path $t16Root 'runs\20261012-101500\pg_hba.conf.before')
@@ -4089,6 +4096,37 @@ $t16Mocks = {
     Check 'T16 hba only: LAN line in Detail' ($result.Detail -like '*line 95: host all all 10.0.0.0/8 scram-sha-256*') 'True'
     Check 'T16 hba only: LAN line logged as WARN' (@($script:LogLines | Where-Object { $_ -like '`[WARN`]*10.0.0.0/8*' }).Count) 1
     Check 'T16 hba only: no password step' (@($calls | Where-Object { $_ -like 'Clear-PostgresPassword*' }).Count) 0
+    Check 'T16 hba only: other password roles listed after the marker is gone' (@($calls | Where-Object { $_ -eq 'Get-OtherPasswordRoles:PATH_A_DONE' }).Count) 1
+}
+
+# Only pg_ident.conf drifts: pg_hba.conf keeps its lines, so no role loses its login
+# and none is listed. A failed role query is only a warning: the change is verified.
+& {
+    . $t16Mocks
+    $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'APPLY'
+    $result = Invoke-PathA -Ctx (New-T16Ctx -PgHba 'STANDARD' -PgIdent 'EXTRA_ENTRY' -PgPassword 'NONE')
+    Check 'T16 ident only: exit 0' $result.ExitCode 0
+    Check 'T16 ident only: no role list' (@($calls | Where-Object { $_ -like 'Get-OtherPasswordRoles*' }).Count) 0
+    $calls.Clear()
+    $script:LogLines.Clear()
+    $fake.RolesThrow = 'psql could not start'
+    $result = Invoke-PathA -Ctx (New-T16Ctx -PgHba 'NOT_STANDARD' -PgIdent 'STANDARD' -PgPassword 'NONE')
+    Check 'T16 role list fails: still exit 0' "$($result.ExitCode) $($result.Code)" '0 '
+    Check 'T16 role list fails: logged as WARN' (@($script:LogLines | Where-Object { $_ -like '`[WARN`] Could not list the other roles with a password: psql could not start*' }).Count) 1
+}
+
+# Spec 6.1: AUDIT changes nothing. Invoke-PathA refuses a context without Apply
+# before it reads or writes anything, at stage UNTOUCHED.
+& {
+    . $t16Mocks
+    $script:Stage = 'UNTOUCHED'
+    $ctx = New-T16Ctx
+    $ctx.Apply = $false
+    Throws 'T16 AUDIT context: Invoke-PathA throws' { Invoke-PathA -Ctx $ctx }
+    Check 'T16 AUDIT context: nothing called' $calls.Count 0
+    Check 'T16 AUDIT context: stage stays UNTOUCHED' $script:Stage 'UNTOUCHED'
 }
 
 # SSPI test fails after the write; the restore brings SSPI back -> 40, marker removed.
@@ -4398,6 +4436,18 @@ $t17Mocks = {
     Check 'T17 log missing, rollback: still 40' "$($result.ExitCode) $($result.Code)" '40 VBR_DB_CONNECT_FAILED'
     Check 'T17 log missing, rollback: no claim of no new authentication error' ($result.Detail.Contains('no new authentication error')) 'False'
     Check 'T17 log missing, rollback: Detail says the check did not run' ($result.Detail.Contains($note)) 'True'
+}
+
+# Spec 6.1: AUDIT changes nothing. Invoke-PathB refuses a context without Apply
+# before it reads or writes anything, at stage UNTOUCHED.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $ctx = New-T17Ctx
+    $ctx.Apply = $false
+    Throws 'T17 AUDIT context: Invoke-PathB throws' { Invoke-PathB -Ctx $ctx }
+    Check 'T17 AUDIT context: nothing called' $calls.Count 0
+    Check 'T17 AUDIT context: stage stays UNTOUCHED' $script:Stage 'UNTOUCHED'
 }
 
 # Step 1: last-failure.json blocks Path B before anything else.
@@ -4777,7 +4827,7 @@ Check 'T18 lock name' ($t18MainText.Contains("Enter-RunLock -Name 'Global\VeeamP
 Check 'T18 transcript file name' ($t18MainText.Contains("'logs\VbrStandardise_{0}_{1}-{2}.log' -f `$env:COMPUTERNAME, `$runStamp, `$PID")) 'True'
 $t18Order = @('Enter-RunLock', 'Get-PreflightContextIssue', 'Initialize-WorkRoot', 'Start-Transcript', 'Find-ChangeMarkers', 'Remove-OldRunData',
               'Test-IsDomainController', 'Get-VbrInstall', 'Get-VbrDbConfig', 'Test-Vb365Installed', 'Get-DbHostClass', 'Find-PgInstall',
-              'Test-PostmasterLive', 'Test-PgConfOverride', 'Test-PgHbaHasInclude', 'Get-ListeningLoopback', 'Get-SystemMapNames',
+              'Test-PostmasterLive', 'Test-PgConfOverride', 'Test-PgHbaHasInclude', 'Test-PgIdentHasInclude', 'Get-ListeningLoopback', 'Get-SystemMapNames',
               'Invoke-ServiceAccountStep', 'Get-AuditState', 'Select-ApplyPath', 'Invoke-PathA', 'Invoke-PathB', 'Complete-Run @finish')
 $t18OrderProblem = 'in order'
 $t18Previous = -1
@@ -4787,6 +4837,48 @@ foreach ($t18Name in $t18Order) {
     $t18Previous = $t18Position
 }
 Check 'T18 main body follows spec 7.1 order, then 7.2 to 7.6' $t18OrderProblem 'in order'
+
+# Spec 6.1: AUDIT changes nothing. The one main-body gate, if (-not $Apply) with a
+# Complete-Run in its block, must sit after Get-AuditState and before Select-ApplyPath.
+$t18MainStatements = @($ScriptAst.EndBlock.Statements | Where-Object { $_.Extent.StartOffset -gt $t18MainIndex })
+$t18FindMainCall = {
+    param([string] $Name)
+    return @($t18MainStatements | ForEach-Object { $_.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq $Name }, $true) })
+}
+$t18AuditCalls = @(& $t18FindMainCall 'Get-AuditState')
+$t18SelectCalls = @(& $t18FindMainCall 'Select-ApplyPath')
+$t18Gates = @($t18MainStatements | Where-Object {
+    $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses.Count -eq 1 -and $_.Clauses[0].Item1.Extent.Text -ceq '-not $Apply' -and
+    @($_.Clauses[0].Item2.Statements | Where-Object { $_ -is [System.Management.Automation.Language.PipelineAst] -and @($_.PipelineElements).Count -eq 1 -and
+        $_.PipelineElements[0] -is [System.Management.Automation.Language.CommandAst] -and $_.PipelineElements[0].GetCommandName() -eq 'Complete-Run' }).Count -eq 1
+})
+Check 'T18 AUDIT gate: one if (-not $Apply) { ... Complete-Run } in the main body' $t18Gates.Count 1
+Check 'T18 AUDIT gate: Get-AuditState and Select-ApplyPath are each called once' "$($t18AuditCalls.Count)/$($t18SelectCalls.Count)" '1/1'
+$t18GateInPlace = $false
+if ($t18Gates.Count -eq 1 -and $t18AuditCalls.Count -eq 1 -and $t18SelectCalls.Count -eq 1) {
+    $t18GateInPlace = ($t18Gates[0].Extent.StartOffset -gt $t18AuditCalls[0].Extent.StartOffset) -and ($t18Gates[0].Extent.StartOffset -lt $t18SelectCalls[0].Extent.StartOffset)
+}
+Check 'T18 AUDIT gate: after Get-AuditState and before Select-ApplyPath' $t18GateInPlace 'True'
+
+# -Path of Start-Transcript is a wildcard: a WorkRoot with [ or ] would lose the transcript.
+$t18Transcripts = @(& $t18FindMainCall 'Start-Transcript')
+Check 'T18 transcript: one Start-Transcript, with -LiteralPath and no -Path' (@($t18Transcripts | ForEach-Object { "$(Test-T18ParameterUse -Command $_ -FullName 'LiteralPath' -MinLength 1)/$(Test-T18ParameterUse -Command $_ -FullName 'Path' -MinLength 1)" }) -join ',') 'True/False'
+
+# Spec 7.1 step 13: pg_ident.conf includes (PostgreSQL 16 and later) are refused in
+# preflight, before the account step, with the PG_HBA_INCLUDE code.
+Check 'T18 ident include: include line' (Test-PgIdentHasInclude -Lines @('# comment', 'include other_ident.conf')) 'True'
+Check 'T18 ident include: include_if_exists line' (Test-PgIdentHasInclude -Lines @('  include_if_exists "maps.conf"')) 'True'
+Check 'T18 ident include: include_dir line' (Test-PgIdentHasInclude -Lines @('include_dir conf.d')) 'True'
+Check 'T18 ident include: continued include line' (Test-PgIdentHasInclude -Lines @('include_dir \', 'conf.d')) 'True'
+Check 'T18 ident include: a commented include is fine' (Test-PgIdentHasInclude -Lines @('# include other_ident.conf', 'veeam "SYSTEM@NT AUTHORITY" postgres')) 'False'
+Check 'T18 ident include: a map line is fine' (Test-PgIdentHasInclude -Lines @('veeam "include@HOST" postgres', 'other_map include postgres')) 'False'
+Check 'T18 ident include: an empty file is fine' (Test-PgIdentHasInclude -Lines @()) 'False'
+$t18IdentGate = @($t18MainStatements | Where-Object {
+    $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -like '*Test-PgIdentHasInclude -Lines $identLines*' -and
+    $_.Clauses[0].Item2.Extent.Text -like "*Complete-Run -ExitCode `$exitCodes.UNSUPPORTED -Code 'PG_HBA_INCLUDE'*pg_ident.conf*"
+})
+$t18AccountCalls = @(& $t18FindMainCall 'Invoke-ServiceAccountStep')
+Check 'T18 ident include: the main body refuses it with exit 11 PG_HBA_INCLUDE before the account step' ($t18IdentGate.Count -eq 1 -and $t18AccountCalls.Count -eq 1 -and $t18IdentGate[0].Extent.StartOffset -lt $t18AccountCalls[0].Extent.StartOffset) 'True'
 
 # Get-AuditState with every database function mocked.
 $t18AuditMocks = {
@@ -5165,32 +5257,47 @@ if ($t18Pwsh.Count -eq 0) {
 }
 
 # Constrained Language Mode (spec 7.1 step 3). A wrapper switches its own session to
-# ConstrainedLanguage and runs the real script, which then runs in that mode too. The
-# script must report CONSTRAINED_LANGUAGE before the lock and before any .NET type
-# that mode blocks. Needs no elevation, VBR or PostgreSQL, so it never skips.
-$t18ClmRoot = Join-Path $env:ProgramData "vbrstd-t18clm-$PID"
-[void]$script:TestFolders.Add($t18ClmRoot)
-$t18ClmWrapper = Join-Path (New-TestFolder 't18clm') 'clm.ps1'
-$t18ClmText = "`$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'`r`n" +
-    "& '" + $t18ScriptPath.Replace("'", "''") + "' -Apply -WorkRoot '" + $t18ClmRoot.Replace("'", "''") + "'`r`n" +
-    "exit `$LASTEXITCODE`r`n"
-[System.IO.File]::WriteAllText($t18ClmWrapper, $t18ClmText, (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+# ConstrainedLanguage and runs the real script with -Apply, which then runs in that
+# mode too. The script must report CONSTRAINED_LANGUAGE before the lock and before any
+# .NET type that mode blocks. Needs no elevation, VBR or PostgreSQL. It is skipped on
+# a VBR server: where AppLocker or WDAC trusts the project folder, Windows PowerShell
+# runs the trusted script in FullLanguage even from a constrained session, and the
+# -Apply would then be real. The wrapper stops if it cannot switch the mode.
 $t18ClmPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { $t18ClmPowerShell = Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe' }
-$t18ClmChild = & {
-    $ErrorActionPreference = 'Continue'
-    $output = (& $t18ClmPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $t18ClmWrapper 2>&1 | Out-String)
-    [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
+if ($t18VbrCorePath) {
+    Skip 'T18 child in Constrained Language Mode exits 20 CONSTRAINED_LANGUAGE' 'this machine has a VBR server'
+} else {
+    $t18ClmRoot = Join-Path $env:ProgramData "vbrstd-t18clm-$PID"
+    [void]$script:TestFolders.Add($t18ClmRoot)
+    $t18ClmWrapper = Join-Path (New-TestFolder 't18clm') 'clm.ps1'
+    $t18ClmText = "`$ErrorActionPreference = 'Stop'`r`n" +
+        "`$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'`r`n" +
+        "& '" + $t18ScriptPath.Replace("'", "''") + "' -Apply -WorkRoot '" + $t18ClmRoot.Replace("'", "''") + "'`r`n" +
+        "exit `$LASTEXITCODE`r`n"
+    [System.IO.File]::WriteAllText($t18ClmWrapper, $t18ClmText, (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+    $t18ClmChild = & {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $t18ClmPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $t18ClmWrapper 2>&1 | Out-String)
+        [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
+    }
+    $t18ClmLine = @($t18ClmChild.Output -split "`r?`n" | Where-Object { $_ -clike 'Computer=*' })
+    $t18ClmKeys = ''
+    if ($t18ClmLine.Count -eq 1) { $t18ClmKeys = (@([regex]::Matches($t18ClmLine[0], '(?:^|; )([A-Za-z]+)=') | ForEach-Object { $_.Groups[1].Value }) -join ',') }
+    Check 'T18 child in Constrained Language Mode: exit 20' $t18ClmChild.ExitCode 20
+    Check 'T18 child in Constrained Language Mode: IssueCode CONSTRAINED_LANGUAGE' ($t18ClmChild.Output -match 'IssueCode=CONSTRAINED_LANGUAGE(;|\s|$)') 'True'
+    Check 'T18 child in Constrained Language Mode: one summary line with every report field in order' $t18ClmKeys (@((New-RunReport -Mode 'APPLY').Keys) -join ',')
+    Check 'T18 child in Constrained Language Mode: Mode=APPLY, Stage=UNTOUCHED' (@($t18ClmLine | Where-Object { $_ -clike '*; Mode=APPLY; *; Stage=UNTOUCHED; Outcome=CONSTRAINED_LANGUAGE; ExitCode=20; *' }).Count) 1
+    Check 'T18 child in Constrained Language Mode: no error record' ($t18ClmChild.Output -match 'Cannot create type|Cannot invoke method|UNHANDLED') 'False'
+    Check 'T18 child in Constrained Language Mode: nothing written' (Test-Path -LiteralPath $t18ClmRoot) 'False'
 }
-$t18ClmLine = @($t18ClmChild.Output -split "`r?`n" | Where-Object { $_ -clike 'Computer=*' })
-$t18ClmKeys = ''
-if ($t18ClmLine.Count -eq 1) { $t18ClmKeys = (@([regex]::Matches($t18ClmLine[0], '(?:^|; )([A-Za-z]+)=') | ForEach-Object { $_.Groups[1].Value }) -join ',') }
-Check 'T18 child in Constrained Language Mode: exit 20' $t18ClmChild.ExitCode 20
-Check 'T18 child in Constrained Language Mode: IssueCode CONSTRAINED_LANGUAGE' ($t18ClmChild.Output -match 'IssueCode=CONSTRAINED_LANGUAGE(;|\s|$)') 'True'
-Check 'T18 child in Constrained Language Mode: one summary line with every report field in order' $t18ClmKeys (@((New-RunReport -Mode 'APPLY').Keys) -join ',')
-Check 'T18 child in Constrained Language Mode: Mode=APPLY, Stage=UNTOUCHED' (@($t18ClmLine | Where-Object { $_ -clike '*; Mode=APPLY; *; Stage=UNTOUCHED; Outcome=CONSTRAINED_LANGUAGE; ExitCode=20; *' }).Count) 1
-Check 'T18 child in Constrained Language Mode: no error record' ($t18ClmChild.Output -match 'Cannot create type|Cannot invoke method|UNHANDLED') 'False'
-Check 'T18 child in Constrained Language Mode: nothing written' (Test-Path -LiteralPath $t18ClmRoot) 'False'
+# The child above must never reach a real -Apply on a VBR server.
+$t18TestTokens = $null
+$t18TestErrors = $null
+$t18TestAst = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$t18TestTokens, [ref]$t18TestErrors)
+$t18ClmGuard = @($t18TestAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -ceq '$t18VbrCorePath' -and
+    $n.Clauses[0].Item2.Extent.Text -like "*Skip 'T18 child in Constrained Language Mode*" -and $null -ne $n.ElseClause -and $n.ElseClause.Extent.Text -like '*-Apply -WorkRoot*' }, $true))
+Check 'T18 child in Constrained Language Mode: the -Apply child is skipped on a VBR server' $t18ClmGuard.Count 1
 
 # An error inside the trap handler (spec 7.6). Windows PowerShell 5.1 does not send an
 # error thrown inside a trap block back to that trap, so Invoke-TrapHandler catches it

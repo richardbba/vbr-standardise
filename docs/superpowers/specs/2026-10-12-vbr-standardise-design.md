@@ -138,7 +138,7 @@ Run in this order. The first failure ends the run, except where it says "drift".
 10. `DatabaseConfigurations\PostgreSql\PostgresUserForWindowsAuth` is missing, empty or `postgres`. Any other value is drift `DB_WINDOWS_ROLE_NOT_POSTGRES`.
 11. Exactly one PostgreSQL install in `HKLM:\SOFTWARE\PostgreSQL\Installations`. Its service exists and runs, and the service binary is under its `Base Directory`. Copy the updater's discovery code. Otherwise exit 20 `NO_PG_FOUND` or `PG_NOT_RUNNING`, or exit 11 `MULTIPLE_PG`.
 12. `postmaster.pid` in the registry `Data Directory` names a live `postgres.exe` process, and its port equals `SqlHostPort`. Otherwise exit 11 `PG_INSTANCE_MISMATCH`. This proves the data directory is the live one without SQL.
-13. `postgresql.conf` and `postgresql.auto.conf` do not set `hba_file` or `ident_file`. Otherwise exit 11 `PG_CONF_OVERRIDE`. `pg_hba.conf` has no `include`, `include_if_exists`, `include_dir` or `@file`. Otherwise exit 11 `PG_HBA_INCLUDE`.
+13. `postgresql.conf` and `postgresql.auto.conf` do not set `hba_file` or `ident_file`. Otherwise exit 11 `PG_CONF_OVERRIDE`. `pg_hba.conf` has no `include`, `include_if_exists`, `include_dir` or `@file`. Otherwise exit 11 `PG_HBA_INCLUDE`. `pg_ident.conf` has no `include`, `include_if_exists` or `include_dir` line (PostgreSQL 16 and later), because `veeam` map lines in an included file would be invisible to the check and the render. Otherwise exit 11 `PG_HBA_INCLUDE`, with `pg_ident.conf` named in `Detail`.
 14. Find which of `127.0.0.1` and `::1` listen on the port (`Get-NetTCPConnection -State Listen -LocalPort <port>`; a listener on `0.0.0.0` or `::` counts for that family). Record the list. If neither listens: exit 20 `PG_NOT_LISTENING`. Section 7.9 tests only these addresses.
 15. Translate `S-1-5-18`. If the name has non-ASCII characters: exit 11 `PG_IDENT_LOCALISED`.
 
@@ -229,6 +229,8 @@ Each blocker gives exit 5, and the script makes no database change.
 
 ### 7.6 Apply flow
 
+The paths run only with `-Apply`: the main body ends an AUDIT run right after the audit, and `Invoke-PathA` and `Invoke-PathB` also refuse a context without `-Apply` (an error at stage `UNTOUCHED`, exit 20, nothing changed).
+
 Both paths need all of these. Otherwise the script makes no database change (exit 5):
 - `svc_veeam` exists and is in Administrators. A disabled, locked or expired account does not block. It is reported only.
 - No blocker from section 7.5.
@@ -251,7 +253,7 @@ If every item is compliant, the script changes nothing and stops no service.
 1. Create the run folder. Back up `pg_hba.conf` and `pg_ident.conf`. Record the SDDL of both files. Write the marker. Stage = `PATH_A_WRITING`.
 2. Write the files that are not standard (section 7.8).
 3. Test (section 7.9). If the test fails: restore both files, test again, remove the marker if the second test passes, and exit 40. If the second test fails, exit 50.
-4. Remove the marker. Stage = `PATH_A_DONE`.
+4. Remove the marker. Stage = `PATH_A_DONE`. If `pg_hba.conf` was rewritten, list the other roles that have LOGIN and a password in `Detail` (as in Path B step 13); a failure of this list is only a warning.
 5. If `PgPassword` = `SET`, clear it (section 7.10).
 
 **Path B: full conversion.** Use this path when `DbAuth` = `NATIVE`, or `DB_HOST_NOT_LOCAL`, or `DB_WINDOWS_ROLE_NOT_POSTGRES`.
