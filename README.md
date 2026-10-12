@@ -235,9 +235,9 @@ If a run finds more than one issue, the highest exit code wins. `IssueCode` is t
 | Code | Exit | Meaning | Action |
 |---|---|---|---|
 | `DB_NATIVE_AUTH` | 5 | VBR logs in to PostgreSQL with a user name and password. | Re-run with `-Apply` in a maintenance window (Path B). |
-| `DB_AUTH_UNKNOWN` | 5 | The script cannot prove how VBR logs in. `Detail` says why. No database change. | Check by hand: the registry values, `pg_hba.conf` and `pg_stat_activity`. |
-| `DB_HOST_NOT_LOCAL` | 5 | `SqlHostName` is this server's name or address, not a loopback name. | Re-run with `-Apply` in a maintenance window (Path B). |
-| `DB_WINDOWS_ROLE_NOT_POSTGRES` | 5 | `PostgresUserForWindowsAuth` is a role other than `postgres`. | Re-run with `-Apply` in a maintenance window (Path B). |
+| `DB_AUTH_UNKNOWN` | 5 | The script cannot prove how VBR logs in. `Detail` says why. No database change. Also reported for the two cases in [Known limits](#known-limits). | Check by hand: the registry values, `pg_hba.conf` and `pg_stat_activity`. If it comes with `DB_HOST_NOT_LOCAL` on a server that already uses Windows authentication, set `SqlHostName` to `127.0.0.1` with the Veeam DB settings tool (DBConfig) or in the registry, then re-run. If it comes with `DB_WINDOWS_ROLE_NOT_POSTGRES`, set `PostgresUserForWindowsAuth` to `postgres` with DBConfig in a maintenance window, then re-run. |
+| `DB_HOST_NOT_LOCAL` | 5 | `SqlHostName` is this server's name or address, not a loopback name. | Re-run with `-Apply` in a maintenance window (Path B). On a server that already uses Windows authentication this comes with `DB_AUTH_UNKNOWN` and is not changed: see [Known limits](#known-limits). |
+| `DB_WINDOWS_ROLE_NOT_POSTGRES` | 5 | `PostgresUserForWindowsAuth` is a role other than `postgres`. | Re-run with `-Apply` in a maintenance window (Path B). While VBR is connected on a server that already uses Windows authentication, this comes with `DB_AUTH_UNKNOWN` and `PG_PASSWORD_CONSUMER` and is not changed: set `PostgresUserForWindowsAuth` to `postgres` with DBConfig in a maintenance window, then re-run (see [Known limits](#known-limits)). |
 | `PG_HBA_NOT_STANDARD` | 5 | `pg_hba.conf` is not Veeam's six SSPI lines. `Detail` lists the lines for other addresses that `-Apply` comments out. | Check that nothing still needs those lines, then re-run with `-Apply`. |
 | `PG_IDENT_NOT_STANDARD` | 5 | The `veeam` map misses a required name or holds an extra one. | Re-run with `-Apply`. |
 | `PG_POSTGRES_PASSWORD_SET` | 5 | The `postgres` role still has a password. | Re-run with `-Apply`. |
@@ -362,6 +362,13 @@ To clear it:
 Before any database change, the script looks for clients that would lose access: client sessions in `pg_stat_activity` that use another role or come from another computer (when SYSTEM can log in), or established TCP connections to the PostgreSQL port from another address (when it cannot). It also checks the Enterprise Manager and Entra ID repository settings in the registry.
 
 This is a check at one moment. A client that connects only now and then, for example a nightly report, a monitoring tool or a remote Enterprise Manager, can be missed. `-Apply` then comments out the `pg_hba.conf` lines for other addresses and removes the `postgres` password, and that client fails at its next connection. Before `-Apply`, read the lines that `PG_HBA_NOT_STANDARD` lists in `Detail` and find out who uses them. Path A on a server that has `pg_native_admin` removes that role's login too.
+
+## Known limits
+
+Both cases fail safe: the script reports them and changes nothing, and a person fixes them by hand.
+
+- **Windows authentication with a non-loopback `SqlHostName`.** If the registry says Windows authentication but `SqlHostName` is this server's own name, FQDN or IP address, VBR's sessions come from that address and not from loopback, so `DbAuth` cannot be proved and is `UNKNOWN`. The run reports `DB_AUTH_UNKNOWN` (exit 5) next to `DB_HOST_NOT_LOCAL`, and Path B does not run. Fix: in a maintenance window, set `SqlHostName` to `127.0.0.1` with the Veeam DB settings tool (DBConfig) or in the registry (`HKLM\SOFTWARE\Veeam\Veeam Backup and Replication\DatabaseConfigurations\PostgreSql`; after a registry edit, restart the Veeam services), then re-run.
+- **Windows authentication with another `PostgresUserForWindowsAuth` role.** While VBR is connected, its own sessions use that role, so the run reports `DB_AUTH_UNKNOWN` and `PG_PASSWORD_CONSUMER` (exit 5) next to `DB_WINDOWS_ROLE_NOT_POSTGRES`, and nothing is changed. Fix: in a maintenance window, set `PostgresUserForWindowsAuth` to `postgres` with DBConfig, then re-run.
 
 ## Testing
 

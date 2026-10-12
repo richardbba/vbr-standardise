@@ -354,6 +354,8 @@ All three must be true before `VbrConnectTimeoutSec` ends:
 - On success, `Detail` also lists the `pg_hba.conf` lines that were commented out and the roles that still have a password.
 - Path B: if a service this run asked to stop (including one still `StopPending` at the deadline) does not start again after `SERVICES_WONT_STOP`, the result is 50 and the marker stays. A service that does not start in step 9 counts as `VBR_DB_CONNECT_FAILED` and runs the rollback.
 - Path A sets `PATH_A_DONE` just before it removes the marker, so an error during the removal never restores verified files.
+- A server whose registry says Windows authentication but whose `SqlHostName` is a local non-loopback name (the computer name, its FQDN or one of its own IP addresses) gets `DbAuth` = `UNKNOWN`: VBR's sessions arrive from the server's own IP address, and section 7.4 needs loopback. The run reports `DB_AUTH_UNKNOWN` (exit 5) next to `DB_HOST_NOT_LOCAL` and changes nothing; Path B does not fix it. This fails safe. Fix by hand: set `SqlHostName` to `127.0.0.1` with the Veeam DB settings tool (DBConfig) or in the registry, in a maintenance window, then re-run.
+- While VBR is connected, a server whose registry says Windows authentication and whose `PostgresUserForWindowsAuth` is a role other than `postgres` reports `DB_AUTH_UNKNOWN` and `PG_PASSWORD_CONSUMER` (VBR's own sessions use that role, so section 7.4 and 7.5 do not accept them) next to `DB_WINDOWS_ROLE_NOT_POSTGRES`, and is not changed, although section 7.6 names this drift as a Path B case. This fails safe. Fix by hand: in a maintenance window, set `PostgresUserForWindowsAuth` to `postgres` with DBConfig, then re-run.
 
 ## 8. Security
 
