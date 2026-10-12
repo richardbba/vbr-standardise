@@ -492,6 +492,318 @@ $t2CJsonPath = Join-Path $t2RootC 'logs\last-result.json'
 Check 'T2 clean: last-result.json written' (Test-Path -LiteralPath $t2CJsonPath) 'True'
 $t2CJson = [System.IO.File]::ReadAllText($t2CJsonPath) | ConvertFrom-Json
 Check 'T2 clean: last-result.json Outcome' ('{0} {1}' -f $t2CJson.Outcome, $t2CJson.ExitCode) 'OK 0'
+# --- Task 3: Host preflight, work root, lock and markers ---
+$t3IsAdmin = (New-Object System.Security.Principal.WindowsPrincipal([System.Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+$t3PsExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$t3FnAst = @{}
+foreach ($t3Node in $ScriptAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) { $t3FnAst[$t3Node.Name] = $t3Node }
+$t3ChildDir = New-TestFolder 'child'
+$t3ChildCount = 0
+# Runs code in a separate powershell.exe and returns its output as one string.
+$t3RunChild = {
+    param([string] $Code)
+    $script:t3ChildCount++
+    $file = Join-Path $t3ChildDir "child-$($script:t3ChildCount).ps1"
+    [IO.File]::WriteAllText($file, "`$ProgressPreference = 'SilentlyContinue'`r`n" + $Code, (New-Object System.Text.UTF8Encoding($true)))
+    $output = & $t3PsExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $file
+    return ((@($output) -join "`n").Trim())
+}
+$t3ParamDefault = {
+    param([string] $Function, [string] $Parameter)
+    $p = @($t3FnAst[$Function].Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq $Parameter })
+    if ($p.Count -ne 1 -or $null -eq $p[0].DefaultValue) { return '' }
+    return $p[0].DefaultValue.Extent.Text
+}
+# Makes a test file look like one the script wrote as SYSTEM: owner Administrators.
+$t3SetOwnerAdmins = {
+    param([string] $Path)
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+$t3AllowEveryoneWrite = {
+    param([string] $Path)
+    $acl = Get-Acl -LiteralPath $Path
+    $everyone = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($everyone, 'Write', 'Allow')))
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+# Test-IsAdministrator
+Check 'Test-IsAdministrator: returns a bool' ((Test-IsAdministrator) -is [bool]) 'True'
+Check 'Test-IsAdministrator: matches the process token' (Test-IsAdministrator) "$t3IsAdmin"
+
+# Get-PreflightContextIssue: order WRONG_POWERSHELL, NOT_ELEVATED, HOST_32BIT, CONSTRAINED_LANGUAGE
+$t3I = Get-PreflightContextIssue -PSEdition 'Desktop' -IsAdmin $true -Is64BitOS $true -Is64BitProcess $true -LanguageMode 'FullLanguage'
+Check 'preflight context: all good gives no issue' ($null -eq $t3I) 'True'
+$t3I = Get-PreflightContextIssue -PSEdition 'Core' -IsAdmin $true -Is64BitOS $true -Is64BitProcess $true -LanguageMode 'FullLanguage'
+Check 'preflight context: Core edition is WRONG_POWERSHELL' $t3I.Code 'WRONG_POWERSHELL'
+Check 'preflight context: WRONG_POWERSHELL exits 20' $t3I.ExitCode 20
+Check 'preflight context: WRONG_POWERSHELL action names powershell.exe' $t3I.Action 'Run %SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe'
+Check 'preflight context: issue shape' (@($t3I.PSObject.Properties | ForEach-Object { $_.Name }) -join ',') 'Code,ExitCode,Detail,Action'
+$t3I = Get-PreflightContextIssue -PSEdition 'Desktop' -IsAdmin $false -Is64BitOS $true -Is64BitProcess $true -LanguageMode 'FullLanguage'
+Check 'preflight context: not elevated is NOT_ELEVATED' $t3I.Code 'NOT_ELEVATED'
+Check 'preflight context: NOT_ELEVATED exits 20' $t3I.ExitCode 20
+$t3I = Get-PreflightContextIssue -PSEdition 'Desktop' -IsAdmin $true -Is64BitOS $true -Is64BitProcess $false -LanguageMode 'FullLanguage'
+Check 'preflight context: 32-bit process on 64-bit OS is HOST_32BIT' $t3I.Code 'HOST_32BIT'
+Check 'preflight context: HOST_32BIT exits 20' $t3I.ExitCode 20
+$t3I = Get-PreflightContextIssue -PSEdition 'Desktop' -IsAdmin $true -Is64BitOS $false -Is64BitProcess $false -LanguageMode 'FullLanguage'
+Check 'preflight context: 32-bit process on 32-bit OS is not HOST_32BIT' ($null -eq $t3I) 'True'
+$t3I = Get-PreflightContextIssue -PSEdition 'Desktop' -IsAdmin $true -Is64BitOS $true -Is64BitProcess $true -LanguageMode 'ConstrainedLanguage'
+Check 'preflight context: ConstrainedLanguage is CONSTRAINED_LANGUAGE' $t3I.Code 'CONSTRAINED_LANGUAGE'
+Check 'preflight context: CONSTRAINED_LANGUAGE exits 20' $t3I.ExitCode 20
+$t3I = Get-PreflightContextIssue -PSEdition 'Desktop' -IsAdmin $true -Is64BitOS $true -Is64BitProcess $true -LanguageMode 'RestrictedLanguage'
+Check 'preflight context: RestrictedLanguage is CONSTRAINED_LANGUAGE' $t3I.Code 'CONSTRAINED_LANGUAGE'
+$t3I = Get-PreflightContextIssue -PSEdition 'Core' -IsAdmin $false -Is64BitOS $true -Is64BitProcess $false -LanguageMode 'ConstrainedLanguage'
+Check 'preflight context: edition is checked first' $t3I.Code 'WRONG_POWERSHELL'
+$t3I = Get-PreflightContextIssue -PSEdition 'Desktop' -IsAdmin $false -Is64BitOS $true -Is64BitProcess $false -LanguageMode 'ConstrainedLanguage'
+Check 'preflight context: elevation is checked before bitness' $t3I.Code 'NOT_ELEVATED'
+$t3I = Get-PreflightContextIssue -PSEdition 'Desktop' -IsAdmin $true -Is64BitOS $true -Is64BitProcess $false -LanguageMode 'ConstrainedLanguage'
+Check 'preflight context: bitness is checked before language mode' $t3I.Code 'HOST_32BIT'
+
+# Enter-RunLock / Exit-RunLock (a Local\ test name, so no elevation is needed)
+Check 'Enter-RunLock: default name is the updater mutex' (& $t3ParamDefault 'Enter-RunLock' 'Name') "'Global\VeeamPgUpdate'"
+$t3LockName = "Local\VbrStdTest-$PID"
+$t3ChildLock = @(
+    'function Write-Log { param([string] $Message, [string] $Level = ''INFO'') }',
+    $t3FnAst['Enter-RunLock'].Extent.Text,
+    $t3FnAst['Exit-RunLock'].Extent.Text,
+    "`$m = Enter-RunLock -Name '$t3LockName'",
+    "if (`$null -eq `$m) { 'NOT_ACQUIRED' } else { 'ACQUIRED'; Exit-RunLock -Mutex `$m }"
+) -join "`n"
+$t3Lock = Enter-RunLock -Name $t3LockName
+try {
+    Check 'Enter-RunLock: free lock is acquired' ($t3Lock -is [System.Threading.Mutex]) 'True'
+    Check 'Enter-RunLock: second process does not get a held lock' (& $t3RunChild $t3ChildLock) 'NOT_ACQUIRED'
+} finally {
+    Exit-RunLock -Mutex $t3Lock
+}
+Check 'Exit-RunLock: released lock can be taken by another process' (& $t3RunChild $t3ChildLock) 'ACQUIRED'
+$t3Threw = $false
+try { Exit-RunLock -Mutex $t3Lock; Exit-RunLock -Mutex $null } catch { $t3Threw = $true }
+Check 'Exit-RunLock: disposed or null mutex never throws' $t3Threw 'False'
+$t3AbandonName = "Local\VbrStdTest-abandoned-$PID"
+$t3Holder = New-Object System.Threading.Mutex($false, $t3AbandonName)
+try {
+    $t3Took = & $t3RunChild "`$m = New-Object System.Threading.Mutex(`$false, '$t3AbandonName'); if (`$m.WaitOne(0)) { 'TOOK' }"
+    Check 'Enter-RunLock fixture: child took the lock and exited without release' $t3Took 'TOOK'
+    $t3LogStart = $script:LogLines.Count
+    $t3Abandoned = Enter-RunLock -Name $t3AbandonName
+    Check 'Enter-RunLock: abandoned lock counts as acquired' ($t3Abandoned -is [System.Threading.Mutex]) 'True'
+    Check 'Enter-RunLock: abandoned lock is logged' (@($script:LogLines | Select-Object -Skip $t3LogStart | Where-Object { $_ -like '*abandoned*' }).Count) 1
+    Exit-RunLock -Mutex $t3Abandoned
+} finally {
+    $t3Holder.Dispose()
+}
+
+# Test-IsDomainController (Win32_OperatingSystem mocked)
+Check 'Test-IsDomainController: ProductType 2 is a DC' (& {
+    function Get-CimInstance { [CmdletBinding()] param([string] $ClassName) [pscustomobject]@{ ProductType = [uint32]2 } }
+    Test-IsDomainController }) 'True'
+Check 'Test-IsDomainController: ProductType 3 is a member server' (& {
+    function Get-CimInstance { [CmdletBinding()] param([string] $ClassName) [pscustomobject]@{ ProductType = [uint32]3 } }
+    Test-IsDomainController }) 'False'
+Check 'Test-IsDomainController: ProductType 1 is a workstation' (& {
+    function Get-CimInstance { [CmdletBinding()] param([string] $ClassName) [pscustomobject]@{ ProductType = [uint32]1 } }
+    Test-IsDomainController }) 'False'
+Check 'Test-IsDomainController: asks for Win32_OperatingSystem' (& {
+    function Get-CimInstance { [CmdletBinding()] param([string] $ClassName) [pscustomobject]@{ ProductType = $(if ($ClassName -eq 'Win32_OperatingSystem') { 2 } else { 0 }) } }
+    Test-IsDomainController }) 'True'
+
+# Initialize-WorkRoot: refusals that need no elevation
+$t3R = Initialize-WorkRoot -Path 'C:\'
+Check 'Initialize-WorkRoot: drive root is refused' $t3R.Ok 'False'
+Check 'Initialize-WorkRoot: drive root says why' ($t3R.Detail -match 'root of a drive') 'True'
+Check 'Initialize-WorkRoot: result shape' (@($t3R.PSObject.Properties | ForEach-Object { $_.Name }) -join ',') 'Ok,Detail'
+$t3Missing = Join-Path (New-TestFolder 'wrmiss') 'no-such-parent'
+$t3R = Initialize-WorkRoot -Path (Join-Path $t3Missing 'root')
+Check 'Initialize-WorkRoot: missing parent is refused' $t3R.Ok 'False'
+Check 'Initialize-WorkRoot: missing parent is not created' (Test-Path -LiteralPath $t3Missing) 'False'
+
+# Find-ChangeMarkers, New-RunFolder, markers and last failure (no elevation needed)
+$t3FindDefault = & $t3ParamDefault 'Find-ChangeMarkers' 'UpdaterPaths'
+$t3UpdIndex = $t3FindDefault.IndexOf('C:\ProgramData\VeeamPgUpdate\CHANGES-IN-PROGRESS.marker')
+$t3LegIndex = $t3FindDefault.IndexOf('C:\temp\VeeamPgUpdate\CHANGES-IN-PROGRESS.marker')
+Check 'Find-ChangeMarkers: default checks the updater marker first' ($t3UpdIndex -ge 0 -and $t3LegIndex -gt $t3UpdIndex) 'True'
+$t3Wr = New-TestFolder 'mk'
+$t3Upd = New-TestFolder 'mkupd'
+$t3UpdCurrent = Join-Path $t3Upd 'current\CHANGES-IN-PROGRESS.marker'
+$t3UpdLegacy = Join-Path $t3Upd 'legacy\CHANGES-IN-PROGRESS.marker'
+$t3Own = Join-Path $t3Wr 'CHANGES-IN-PROGRESS.marker'
+Check 'Find-ChangeMarkers: none present' (@(Find-ChangeMarkers -WorkRoot $t3Wr -UpdaterPaths @($t3UpdCurrent, $t3UpdLegacy)).Count) 0
+
+$t3Run = New-RunFolder -WorkRoot $t3Wr -Stamp '20261012-101500'
+Check 'New-RunFolder: path is <WorkRoot>\runs\<Stamp>' $t3Run (Join-Path $t3Wr 'runs\20261012-101500')
+Check 'New-RunFolder: folder exists' (Test-Path -LiteralPath $t3Run -PathType Container) 'True'
+Throws 'New-RunFolder: an existing run folder is refused' { New-RunFolder -WorkRoot $t3Wr -Stamp '20261012-101500' }
+Throws 'New-RunFolder: a stamp with a path separator is refused' { New-RunFolder -WorkRoot $t3Wr -Stamp '..\escape' }
+
+Write-ChangeMarker -WorkRoot $t3Wr -RunDir $t3Run -PathName 'B' -Stage 'PATH_B_CHANGING'
+Check 'Write-ChangeMarker: marker exists' (Test-Path -LiteralPath $t3Own -PathType Leaf) 'True'
+$t3Bytes = [IO.File]::ReadAllBytes($t3Own)
+Check 'Write-ChangeMarker: no BOM' ($t3Bytes.Length -gt 0 -and $t3Bytes[0] -ne 0xEF) 'True'
+$t3Json = [IO.File]::ReadAllText($t3Own) | ConvertFrom-Json
+Check 'Write-ChangeMarker: RunDir' (Get-CfgValue -Object $t3Json -Name 'RunDir') $t3Run
+Check 'Write-ChangeMarker: Path' (Get-CfgValue -Object $t3Json -Name 'Path') 'B'
+Check 'Write-ChangeMarker: Stage' (Get-CfgValue -Object $t3Json -Name 'Stage') 'PATH_B_CHANGING'
+Check 'Write-ChangeMarker: Time' ([IO.File]::ReadAllText($t3Own) -match '"Time"\s*:\s*"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}') 'True'
+
+$t3Found = @(Find-ChangeMarkers -WorkRoot $t3Wr -UpdaterPaths @($t3UpdCurrent, $t3UpdLegacy))
+Check 'Find-ChangeMarkers: own marker found' ($t3Found -join '|') $t3Own
+$t3Found = @(Find-ChangeMarkers -WorkRoot $t3Wr -UpdaterPaths @($t3Own, $t3UpdLegacy))
+Check 'Find-ChangeMarkers: a path is listed once' $t3Found.Count 1
+Check 'Remove-ChangeMarker: returns true' (Remove-ChangeMarker -WorkRoot $t3Wr) 'True'
+Check 'Remove-ChangeMarker: marker is gone' (Test-Path -LiteralPath $t3Own) 'False'
+Check 'Remove-ChangeMarker: absent marker is true' (Remove-ChangeMarker -WorkRoot $t3Wr) 'True'
+
+[void][IO.Directory]::CreateDirectory((Split-Path -Parent $t3UpdCurrent))
+[IO.File]::WriteAllText($t3UpdCurrent, '{}')
+Check 'Find-ChangeMarkers: updater marker found' ((@(Find-ChangeMarkers -WorkRoot $t3Wr -UpdaterPaths @($t3UpdCurrent, $t3UpdLegacy))) -join '|') $t3UpdCurrent
+Remove-Item -LiteralPath $t3UpdCurrent -Force
+[void][IO.Directory]::CreateDirectory((Split-Path -Parent $t3UpdLegacy))
+[IO.File]::WriteAllText($t3UpdLegacy, '{}')
+& $t3AllowEveryoneWrite $t3UpdLegacy
+Check 'Test-TrustedLegacyMarker: file anyone can write is not trusted' (Test-TrustedLegacyMarker -Path $t3UpdLegacy) 'False'
+Check 'Find-ChangeMarkers: untrusted legacy marker is ignored' (@(Find-ChangeMarkers -WorkRoot $t3Wr -UpdaterPaths @($t3UpdCurrent, $t3UpdLegacy)).Count) 0
+Check 'Test-TrustedLegacyMarker: missing file is not trusted' (Test-TrustedLegacyMarker -Path (Join-Path $t3Upd 'none.marker')) 'False'
+
+Check 'Test-LastFailure: false when absent' (Test-LastFailure -WorkRoot $t3Wr) 'False'
+Write-LastFailure -WorkRoot $t3Wr -RunDir $t3Run -Reason 'VBR did not connect'
+Check 'Test-LastFailure: true after Write-LastFailure' (Test-LastFailure -WorkRoot $t3Wr) 'True'
+$t3Json = [IO.File]::ReadAllText((Join-Path $t3Wr 'last-failure.json')) | ConvertFrom-Json
+Check 'Write-LastFailure: RunDir' (Get-CfgValue -Object $t3Json -Name 'RunDir') $t3Run
+Check 'Write-LastFailure: Reason' (Get-CfgValue -Object $t3Json -Name 'Reason') 'VBR did not connect'
+
+# Remove-OldRunData
+$t3Old = (Get-Date).AddDays(-40)
+$t3Ret = New-TestFolder 'ret'
+$t3RetLogs = Join-Path $t3Ret 'logs'
+$t3RetRuns = Join-Path $t3Ret 'runs'
+[void][IO.Directory]::CreateDirectory($t3RetLogs)
+foreach ($t3Name in @('VbrStandardise_SRV_20260801-000000-11.log', 'VbrStandardise_SRV_20261012-000000-12.log', 'other.log')) {
+    [IO.File]::WriteAllText((Join-Path $t3RetLogs $t3Name), 'x')
+}
+[IO.File]::SetLastWriteTime((Join-Path $t3RetLogs 'VbrStandardise_SRV_20260801-000000-11.log'), $t3Old)
+[IO.File]::SetLastWriteTime((Join-Path $t3RetLogs 'other.log'), $t3Old)
+foreach ($t3Name in @('20260801-000000', '20260802-000000', '20261012-000000')) {
+    $t3Dir = Join-Path $t3RetRuns $t3Name
+    [void][IO.Directory]::CreateDirectory($t3Dir)
+    [IO.File]::WriteAllText((Join-Path $t3Dir 'pg_hba.conf.before'), 'x')
+    [IO.File]::SetLastWriteTime((Join-Path $t3Dir 'pg_hba.conf.before'), $t3Old)
+}
+Write-LastFailure -WorkRoot $t3Ret -RunDir (Join-Path $t3RetRuns '20260802-000000') -Reason 'test'
+[IO.File]::SetLastWriteTime((Join-Path $t3Ret 'last-failure.json'), $t3Old)
+[IO.Directory]::SetLastWriteTime((Join-Path $t3RetRuns '20260801-000000'), $t3Old)
+[IO.Directory]::SetLastWriteTime((Join-Path $t3RetRuns '20260802-000000'), $t3Old)
+Remove-OldRunData -WorkRoot $t3Ret -RetentionDays 30
+Check 'Remove-OldRunData: old transcript removed' (Test-Path -LiteralPath (Join-Path $t3RetLogs 'VbrStandardise_SRV_20260801-000000-11.log')) 'False'
+Check 'Remove-OldRunData: new transcript kept' (Test-Path -LiteralPath (Join-Path $t3RetLogs 'VbrStandardise_SRV_20261012-000000-12.log')) 'True'
+Check 'Remove-OldRunData: other files in logs kept' (Test-Path -LiteralPath (Join-Path $t3RetLogs 'other.log')) 'True'
+Check 'Remove-OldRunData: old run folder removed' (Test-Path -LiteralPath (Join-Path $t3RetRuns '20260801-000000')) 'False'
+Check 'Remove-OldRunData: new run folder kept' (Test-Path -LiteralPath (Join-Path $t3RetRuns '20261012-000000')) 'True'
+Check 'Remove-OldRunData: run folder named in last-failure.json kept' (Test-Path -LiteralPath (Join-Path $t3RetRuns '20260802-000000')) 'True'
+Check 'Remove-OldRunData: last-failure.json kept' (Test-Path -LiteralPath (Join-Path $t3Ret 'last-failure.json')) 'True'
+$t3Dir = Join-Path $t3RetRuns '20260803-000000'
+[void][IO.Directory]::CreateDirectory($t3Dir)
+[IO.Directory]::SetLastWriteTime($t3Dir, $t3Old)
+Write-ChangeMarker -WorkRoot $t3Ret -RunDir $t3Dir -PathName 'A' -Stage 'PATH_A_WRITING'
+[IO.File]::SetLastWriteTime((Join-Path $t3Ret 'CHANGES-IN-PROGRESS.marker'), $t3Old)
+Remove-OldRunData -WorkRoot $t3Ret -RetentionDays 30
+Check 'Remove-OldRunData: every run folder kept while a marker exists' (Test-Path -LiteralPath $t3Dir) 'True'
+Check 'Remove-OldRunData: marker kept' (Test-Path -LiteralPath (Join-Path $t3Ret 'CHANGES-IN-PROGRESS.marker')) 'True'
+[void](Remove-ChangeMarker -WorkRoot $t3Ret)
+Remove-OldRunData -WorkRoot $t3Ret -RetentionDays 0
+Check 'Remove-OldRunData: RetentionDays 0 deletes nothing' (Test-Path -LiteralPath $t3Dir) 'True'
+
+# Test-SafeWorkRootParent on real folders (read only), and an unsafe parent
+Check 'Test-SafeWorkRootParent: C:\ProgramData (parent of the default WorkRoot) is safe' (Test-SafeWorkRootParent -Path 'C:\ProgramData') 'True'
+$t3Unsafe = New-TestFolder 'unsafe'
+$t3Acl = Get-Acl -LiteralPath $t3Unsafe
+$t3Acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+Set-Acl -LiteralPath $t3Unsafe -AclObject $t3Acl
+Check 'Test-SafeWorkRootParent: folder anyone can delete from is unsafe' (Test-SafeWorkRootParent -Path $t3Unsafe) 'False'
+$t3R = Initialize-WorkRoot -Path (Join-Path $t3Unsafe 'root')
+Check 'Initialize-WorkRoot: unsafe parent is refused' $t3R.Ok 'False'
+Check 'Initialize-WorkRoot: nothing is created under an unsafe parent' (Test-Path -LiteralPath (Join-Path $t3Unsafe 'root')) 'False'
+
+# Initialize-WorkRoot ACL work and the trusted legacy marker (elevation needed).
+# The parent check is mocked here: it is tested above on C:\ProgramData, and on
+# some machines other accounts have rights on the TEMP folder chain.
+if ($t3IsAdmin) {
+    & {
+        function Test-SafeWorkRootParent { param([string] $Path) return $true }
+        $t3Base = New-TestFolder 'wr'
+        $t3Root = Join-Path $t3Base 'root'
+        $t3R = Initialize-WorkRoot -Path $t3Root
+        Check 'Initialize-WorkRoot: new folder is Ok' $t3R.Ok 'True'
+        Check 'Initialize-WorkRoot: creates logs' (Test-Path -LiteralPath (Join-Path $t3Root 'logs') -PathType Container) 'True'
+        Check 'Initialize-WorkRoot: creates runs' (Test-Path -LiteralPath (Join-Path $t3Root 'runs') -PathType Container) 'True'
+        Check 'Initialize-WorkRoot: writes a trusted sentinel' (Test-RegularTrustedFile -Path (Join-Path $t3Root '.vbr-standardise')) 'True'
+        $t3Acl = Get-Acl -LiteralPath $t3Root
+        $t3Sids = @($t3Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+        Check 'Initialize-WorkRoot: ACL is SYSTEM + Administrators only' ($t3Sids -join ',') 'S-1-5-18,S-1-5-32-544'
+        Check 'Initialize-WorkRoot: inheritance is off' $t3Acl.AreAccessRulesProtected 'True'
+        Check 'Initialize-WorkRoot: owner is Administrators' $t3Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value 'S-1-5-32-544'
+        [IO.File]::WriteAllText((Join-Path $t3Root 'logs\VbrStandardise_x.log'), 'x')
+        Check 'Initialize-WorkRoot: rerun on its own folder is Ok' (Initialize-WorkRoot -Path $t3Root).Ok 'True'
+
+        $t3Foreign = Join-Path $t3Base 'foreign'
+        [void][IO.Directory]::CreateDirectory($t3Foreign)
+        [IO.File]::WriteAllText((Join-Path $t3Foreign 'their-data.txt'), 'do not touch')
+        $t3Sddl = (Get-Acl -LiteralPath $t3Foreign).Sddl
+        $t3R = Initialize-WorkRoot -Path $t3Foreign
+        Check 'Initialize-WorkRoot: foreign folder is refused' $t3R.Ok 'False'
+        Check 'Initialize-WorkRoot: foreign folder ACL untouched' ((Get-Acl -LiteralPath $t3Foreign).Sddl -eq $t3Sddl) 'True'
+        Check 'Initialize-WorkRoot: foreign folder gets no logs folder' (Test-Path -LiteralPath (Join-Path $t3Foreign 'logs')) 'False'
+
+        $t3Forged = Join-Path $t3Base 'forged'
+        Check 'New-ProtectedDirectory: fixture created' (New-ProtectedDirectory -Path $t3Forged) 'True'
+        [IO.File]::WriteAllText((Join-Path $t3Forged '.vbr-standardise'), 'forged')
+        & $t3SetOwnerAdmins (Join-Path $t3Forged '.vbr-standardise')
+        Check 'Initialize-WorkRoot: wrong sentinel text is refused' (Initialize-WorkRoot -Path $t3Forged).Ok 'False'
+
+        $t3Empty = Join-Path $t3Base 'empty'
+        [void](New-ProtectedDirectory -Path $t3Empty)
+        Check 'Initialize-WorkRoot: empty protected folder is Ok' (Initialize-WorkRoot -Path $t3Empty).Ok 'True'
+
+        $t3Target = New-TestFolder 'wrtarget'
+        $t3Junction = Join-Path $t3Root 'runs\linked'
+        $t3JunctionMade = $false
+        try {
+            [void](New-Item -ItemType Junction -Path $t3Junction -Target $t3Target -ErrorAction Stop)
+            $t3JunctionMade = $true
+            $t3R = Initialize-WorkRoot -Path $t3Root
+            Check 'Initialize-WorkRoot: junction inside is refused' $t3R.Ok 'False'
+            Check 'Initialize-WorkRoot: junction refusal says why' ($t3R.Detail -match 'reparse point') 'True'
+        } catch {
+            Skip 'Initialize-WorkRoot: junction inside is refused' "could not create a junction: $($_.Exception.Message)"
+        } finally {
+            if ($t3JunctionMade) { [IO.Directory]::Delete($t3Junction) }
+        }
+
+        $t3Marker = Join-Path $t3Root 'CHANGES-IN-PROGRESS.marker'
+        [IO.File]::WriteAllText($t3Marker, '{}')
+        & $t3SetOwnerAdmins $t3Marker
+        Check 'Test-TrustedLegacyMarker: protected marker is trusted' (Test-TrustedLegacyMarker -Path $t3Marker) 'True'
+        Check 'Find-ChangeMarkers: trusted legacy marker found' ((@(Find-ChangeMarkers -WorkRoot $t3Wr -UpdaterPaths @($t3UpdCurrent, $t3Marker))) -join '|') $t3Marker
+        $t3Link = Join-Path $t3Base 'link'
+        $t3LinkMade = $false
+        try {
+            [void](New-Item -ItemType Junction -Path $t3Link -Target $t3Root -ErrorAction Stop)
+            $t3LinkMade = $true
+            Check 'Test-TrustedLegacyMarker: marker reached through a junction is not trusted' (Test-TrustedLegacyMarker -Path (Join-Path $t3Link 'CHANGES-IN-PROGRESS.marker')) 'False'
+        } catch {
+            Skip 'Test-TrustedLegacyMarker: marker reached through a junction is not trusted' "could not create a junction: $($_.Exception.Message)"
+        } finally {
+            if ($t3LinkMade) { [IO.Directory]::Delete($t3Link) }
+        }
+        & $t3AllowEveryoneWrite $t3Marker
+        Check 'Test-TrustedLegacyMarker: protected marker made writable is not trusted' (Test-TrustedLegacyMarker -Path $t3Marker) 'False'
+        Remove-Item -LiteralPath $t3Marker -Force
+    }
+} else {
+    Skip 'Initialize-WorkRoot ACL and trusted legacy marker tests' 'not elevated'
+}
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue

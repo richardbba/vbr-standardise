@@ -549,6 +549,528 @@ function Complete-Run {
 #endregion Outcome
 
 #region Preflight
+# --- Host context (spec 7.1 steps 1-3 and 6) ---
+
+function Test-IsAdministrator {
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
+    return [bool]$principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# Pure decision for spec 7.1 steps 2-3. The first failing check wins. All exit 20.
+# $PSEdition is a read-only automatic variable, so the parameter variable is
+# $Edition and callers pass it as -PSEdition through the alias.
+function Get-PreflightContextIssue {
+    param(
+        [Alias('PSEdition')][string] $Edition,
+        [bool] $IsAdmin,
+        [bool] $Is64BitOS,
+        [bool] $Is64BitProcess,
+        [string] $LanguageMode
+    )
+    if ($Edition -ne 'Desktop') {
+        return [pscustomobject]@{
+            Code     = 'WRONG_POWERSHELL'
+            ExitCode = 20
+            Detail   = "PowerShell edition is '$Edition'. This script needs Windows PowerShell 5.1 (Desktop edition)."
+            Action   = 'Run %SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe'
+        }
+    }
+    if (-not $IsAdmin) {
+        return [pscustomobject]@{
+            Code     = 'NOT_ELEVATED'
+            ExitCode = 20
+            Detail   = 'The process is not elevated.'
+            Action   = 'Run the script from RMM as SYSTEM, or from an elevated prompt'
+        }
+    }
+    if ($Is64BitOS -and -not $Is64BitProcess) {
+        return [pscustomobject]@{
+            Code     = 'HOST_32BIT'
+            ExitCode = 20
+            Detail   = 'Windows is 64-bit but this PowerShell process is 32-bit.'
+            Action   = 'Run 64-bit PowerShell: from a 32-bit RMM agent use %SystemRoot%\SysNative\WindowsPowerShell\v1.0\powershell.exe'
+        }
+    }
+    if ($LanguageMode -ne 'FullLanguage') {
+        return [pscustomobject]@{
+            Code     = 'CONSTRAINED_LANGUAGE'
+            ExitCode = 20
+            Detail   = "PowerShell language mode is '$LanguageMode'. This script needs FullLanguage."
+            Action   = 'Allow this script in the application control policy (WDAC or AppLocker) so it runs in FullLanguage mode'
+        }
+    }
+    return $null
+}
+
+# Single instance (spec 7.1 step 1). The updater uses the same name, so the two
+# scripts never run at the same time. An abandoned mutex (a run that was killed)
+# still grants ownership and counts as acquired.
+function Enter-RunLock {
+    param([string] $Name = 'Global\VeeamPgUpdate')
+    try {
+        $mutex = New-Object System.Threading.Mutex($false, $Name)
+    } catch {
+        # The name exists but this process cannot open it, so another process has it.
+        Write-Log -Message "Could not open the run lock '$Name': $($_.Exception.Message)" -Level 'WARN'
+        return $null
+    }
+    $acquired = $false
+    try {
+        $acquired = $mutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+        $acquired = $true
+        Write-Log -Message 'Took over an abandoned run lock from a run that was killed.' -Level 'WARN'
+    }
+    if ($acquired) { return $mutex }
+    $mutex.Dispose()
+    return $null
+}
+
+function Exit-RunLock {
+    param([System.Threading.Mutex] $Mutex)
+    if ($null -eq $Mutex) { return }
+    try { $Mutex.ReleaseMutex() } catch { }
+    try { $Mutex.Dispose() } catch { }
+}
+
+function Test-IsDomainController {
+    $os = Get-CimInstance -ClassName 'Win32_OperatingSystem' -ErrorAction Stop
+    return ([int]$os.ProductType -eq 2)
+}
+# --- WorkRoot trust boundary (adapted from Update-VeeamPostgres.ps1) ---
+# The WorkRoot holds file backups and a registry export with the encrypted VBR
+# database password. A folder name alone is not proof that the folder is ours:
+# an ordinary user can create folders under C:\ProgramData and plant junctions.
+# These helpers fail closed on reparse points and check the exact ACL the script
+# sets. Well-known SIDs keep the checks language-neutral.
+
+function Test-PathTreeHasReparsePoint {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [switch] $IncludeDescendants
+    )
+    try {
+        $full = [IO.Path]::GetFullPath($Path)
+        $pathRoot = [IO.Path]::GetPathRoot($full)
+        $current = $pathRoot
+        $relative = $full.Substring($pathRoot.Length)
+        foreach ($part in @($relative -split '[\\/]' | Where-Object { $_ })) {
+            $current = Join-Path $current $part
+            try { $attributes = [IO.File]::GetAttributes($current) }
+            catch [IO.FileNotFoundException] { break }
+            catch [IO.DirectoryNotFoundException] { break }
+            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+        }
+        if ($IncludeDescendants -and (Test-Path -LiteralPath $full -PathType Container)) {
+            $pending = New-Object 'System.Collections.Generic.Queue[string]'
+            $pending.Enqueue($full)
+            while ($pending.Count -gt 0) {
+                $directory = $pending.Dequeue()
+                foreach ($child in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
+                    if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+                    if ($child.PSIsContainer) { $pending.Enqueue($child.FullName) }
+                }
+            }
+        }
+        return $false
+    } catch {
+        # A path that cannot be inspected is not a safe place for privileged data.
+        return $true
+    }
+}
+
+# A regular file owned by SYSTEM or Administrators that no other principal can change.
+function Test-RegularTrustedFile {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { return $false }
+        $trustedSids = @('S-1-5-18', 'S-1-5-32-544')
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if ($trustedSids -notcontains $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value) { return $false }
+        $dangerous = [int64]([System.Security.AccessControl.FileSystemRights]::Write -bor
+                             [System.Security.AccessControl.FileSystemRights]::Delete -bor
+                             [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+                             [System.Security.AccessControl.FileSystemRights]::TakeOwnership) -bor
+                     [int64]0x10000000 -bor [int64]0x40000000
+        foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+            if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                $trustedSids -notcontains $rule.IdentityReference.Value -and
+                ([int64]$rule.FileSystemRights -band $dangerous) -ne 0) {
+                return $false
+            }
+        }
+        return $true
+    } catch { return $false }
+}
+
+# Exactly: inheritance off, owner Administrators, two Allow FullControl rules
+# (SYSTEM and Administrators) that apply to this folder, subfolders and files.
+function Test-ProtectedFolderAcl {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if (-not $item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { return $false }
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if (-not $acl.AreAccessRulesProtected) { return $false }
+        if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne 'S-1-5-32-544') { return $false }
+        $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+        if ($rules.Count -ne 2) { return $false }
+        $requiredInheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+                               [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+        foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+            $matching = @($rules | Where-Object { $_.IdentityReference.Value -eq $sid })
+            if ($matching.Count -ne 1) { return $false }
+            $rule = $matching[0]
+            if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+                $rule.IsInherited -or
+                [int]$rule.FileSystemRights -ne [int][System.Security.AccessControl.FileSystemRights]::FullControl -or
+                [int]$rule.InheritanceFlags -ne [int]$requiredInheritance -or
+                $rule.PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None) {
+                return $false
+            }
+        }
+        return $true
+    } catch { return $false }
+}
+
+# No folder from the drive root down to Path may let an untrusted principal
+# delete or replace children, or rewrite the ACL. Create-folder rights alone are
+# allowed: a new WorkRoot is created under a random staging name and renamed.
+function Test-SafeWorkRootParent {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    try {
+        if (Test-PathTreeHasReparsePoint -Path $Path) { return $false }
+        $trustedSids = @(
+            'S-1-5-18',
+            'S-1-5-32-544',
+            'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+        )
+        $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $currentPrincipal = New-Object System.Security.Principal.WindowsPrincipal($currentIdentity)
+        if ($currentPrincipal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            $trustedSids += $currentIdentity.User.Value
+        }
+        $dangerous = [int64]([System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+                             [System.Security.AccessControl.FileSystemRights]::Delete -bor
+                             [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+                             [System.Security.AccessControl.FileSystemRights]::TakeOwnership) -bor
+                     [int64]0x10000000 -bor
+                     [int64]0x40000000
+        $resolvedPath = [IO.Path]::GetFullPath($Path)
+        $pathRoot = [IO.Path]::GetPathRoot($resolvedPath)
+        if ($resolvedPath.TrimEnd('\') -ieq $pathRoot.TrimEnd('\')) { $full = $pathRoot } else { $full = $resolvedPath.TrimEnd('\') }
+        $components = @($pathRoot)
+        $current = $pathRoot
+        $relative = $full.Substring($pathRoot.Length)
+        foreach ($part in @($relative -split '[\\/]' | Where-Object { $_ })) {
+            $current = Join-Path $current $part
+            $components += $current
+        }
+        foreach ($component in $components) {
+            $item = Get-Item -LiteralPath $component -Force -ErrorAction Stop
+            if (-not $item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { return $false }
+            $acl = Get-Acl -LiteralPath $component -ErrorAction Stop
+            if ($trustedSids -notcontains $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value) { return $false }
+            foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+                if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+                if ($trustedSids -contains $rule.IdentityReference.Value) { continue }
+                if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+                if (([int64]$rule.FileSystemRights -band $dangerous) -ne 0) { return $false }
+            }
+        }
+        return $true
+    } catch { return $false }
+}
+
+# Creates Path with the protected ACL in one native call under a random staging
+# name, checks it, then renames it into place. Returns $true only when the final
+# folder has exactly the protected ACL and no reparse point.
+function New-ProtectedDirectory {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    $stage = $null
+    try {
+        $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+        $parent = [IO.Directory]::GetParent($full).FullName
+        if (-not (Test-SafeWorkRootParent -Path $parent) -or (Test-Path -LiteralPath $full)) { return $false }
+        $stage = Join-Path $parent ('.vbr-standardise-stage-' + [guid]::NewGuid().ToString('N'))
+        $system = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+        $admins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        $stageAcl = New-Object System.Security.AccessControl.DirectorySecurity
+        $stageAcl.SetAccessRuleProtection($true, $false)
+        foreach ($sid in @($system, $admins)) {
+            $stageAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        }
+        $stageAcl.SetOwner($admins)
+        # Create with the final DACL in the same native call. Creating first and
+        # calling Set-Acl later leaves a writable folder open to a junction swap.
+        $stageInfo = New-Object System.IO.DirectoryInfo($stage)
+        if ($PSVersionTable.PSEdition -eq 'Core') {
+            [System.IO.FileSystemAclExtensions]::Create($stageInfo, $stageAcl)
+        } else {
+            $stageInfo.Create($stageAcl)
+        }
+        if (-not (Test-ProtectedFolderAcl -Path $stage)) { return $false }
+        if (Test-PathTreeHasReparsePoint -Path $stage -IncludeDescendants) { return $false }
+        if (@(Get-ChildItem -LiteralPath $stage -Force -ErrorAction Stop).Count -ne 0) { return $false }
+        [IO.Directory]::Move($stage, $full)
+        $stage = $null
+        return ((Test-ProtectedFolderAcl -Path $full) -and -not (Test-PathTreeHasReparsePoint -Path $full -IncludeDescendants))
+    } catch {
+        return $false
+    } finally {
+        if ($stage -and (Test-Path -LiteralPath $stage) -and
+            (Test-ProtectedFolderAcl -Path $stage) -and
+            -not (Test-PathTreeHasReparsePoint -Path $stage -IncludeDescendants)) {
+            try { [IO.Directory]::Delete($stage, $true) } catch { }
+        }
+    }
+}
+
+# The updater's legacy marker test (Get-TrustedLegacyRecoveryMarker): a marker
+# under a folder that ordinary users can write (C:\temp) counts only when no part
+# of its path is a reparse point and the file is owned by and writable only by
+# SYSTEM or Administrators.
+function Test-TrustedLegacyMarker {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    try {
+        if (Test-PathTreeHasReparsePoint -Path $Path) { return $false }
+        return (Test-RegularTrustedFile -Path $Path)
+    } catch { return $false }
+}
+
+# Takes charge only of a folder this script created: a new folder, an empty
+# folder that already has the protected ACL, or a folder with the protected ACL
+# and this script's sentinel file. Never changes the ACL of an existing folder.
+function Initialize-WorkRoot {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    $sentinelText = 'Created by Invoke-VbrStandardise.ps1. Marks this folder as safe for the script to lock down and clean up.'
+    try {
+        $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+        $root = [IO.Path]::GetPathRoot($full).TrimEnd('\')
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Detail = "invalid WorkRoot path '$Path': $($_.Exception.Message)" }
+    }
+    if ($full -ieq $root) {
+        return [pscustomobject]@{ Ok = $false; Detail = "$Path is the root of a drive or share" }
+    }
+    if (Test-PathTreeHasReparsePoint -Path $full) {
+        return [pscustomobject]@{ Ok = $false; Detail = "$full or one of its parent folders is a reparse point" }
+    }
+    $parent = [IO.Directory]::GetParent($full).FullName
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        # Never create a missing parent: the default parent C:\ProgramData always exists.
+        return [pscustomobject]@{ Ok = $false; Detail = "parent folder does not exist: $parent" }
+    }
+    if (-not (Test-SafeWorkRootParent -Path $parent)) {
+        return [pscustomobject]@{ Ok = $false; Detail = "parent folder can be replaced by a non-administrator or has an untrusted owner: $parent" }
+    }
+    if (-not (Test-Path -LiteralPath $full)) {
+        if (-not (New-ProtectedDirectory -Path $full)) {
+            return [pscustomobject]@{ Ok = $false; Detail = "could not create a protected WorkRoot at $full" }
+        }
+    }
+    if (-not (Test-Path -LiteralPath $full -PathType Container)) {
+        return [pscustomobject]@{ Ok = $false; Detail = "$full is not a folder" }
+    }
+    if (Test-PathTreeHasReparsePoint -Path $full -IncludeDescendants) {
+        return [pscustomobject]@{ Ok = $false; Detail = "$full contains a reparse point" }
+    }
+    if (-not (Test-ProtectedFolderAcl -Path $full)) {
+        return [pscustomobject]@{ Ok = $false; Detail = "$full does not have the SYSTEM + Administrators only ACL with owner Administrators; remove the folder or fix its ACL" }
+    }
+    $sentinel = Join-Path $full '.vbr-standardise'
+    try {
+        $children = @(Get-ChildItem -LiteralPath $full -Force -ErrorAction Stop)
+        if ($children.Count -eq 0) {
+            [IO.File]::WriteAllText($sentinel, $sentinelText, (New-Object System.Text.UTF8Encoding($false)))
+            $sentinelAcl = Get-Acl -LiteralPath $sentinel -ErrorAction Stop
+            $owner = $sentinelAcl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+            if ($owner -ne 'S-1-5-18' -and $owner -ne 'S-1-5-32-544') {
+                $sentinelAcl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+                Set-Acl -LiteralPath $sentinel -AclObject $sentinelAcl -ErrorAction Stop
+            }
+        }
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Detail = "could not write the WorkRoot sentinel in ${full}: $($_.Exception.Message)" }
+    }
+    $sentinelOk = $false
+    if (Test-RegularTrustedFile -Path $sentinel) {
+        try { $sentinelOk = ([IO.File]::ReadAllText($sentinel).TrimEnd([char[]]"`r`n") -ceq $sentinelText) } catch { $sentinelOk = $false }
+    }
+    if (-not $sentinelOk) {
+        return [pscustomobject]@{ Ok = $false; Detail = "$full is not empty and has no trusted sentinel file from this script" }
+    }
+    try {
+        foreach ($sub in @('logs', 'runs')) {
+            $subPath = Join-Path $full $sub
+            if (-not (Test-Path -LiteralPath $subPath)) { [void][IO.Directory]::CreateDirectory($subPath) }
+            if (-not (Test-Path -LiteralPath $subPath -PathType Container)) {
+                return [pscustomobject]@{ Ok = $false; Detail = "$subPath is not a folder" }
+            }
+        }
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Detail = "could not create the logs and runs folders in ${full}: $($_.Exception.Message)" }
+    }
+    if (Test-PathTreeHasReparsePoint -Path $full -IncludeDescendants) {
+        return [pscustomobject]@{ Ok = $false; Detail = "$full contains a reparse point" }
+    }
+    return [pscustomobject]@{ Ok = $true; Detail = '' }
+}
+# --- Markers, run folders, last failure and retention (spec 7.1 step 5, 7.6, 7.7) ---
+
+# UpdaterPaths[0] is the updater's current marker and counts whenever it exists.
+# Every later entry is a legacy marker under a user-writable folder and counts
+# only when Test-TrustedLegacyMarker accepts it.
+function Find-ChangeMarkers {
+    param(
+        [Parameter(Mandatory = $true)][string] $WorkRoot,
+        [string[]] $UpdaterPaths = @(
+            'C:\ProgramData\VeeamPgUpdate\CHANGES-IN-PROGRESS.marker',
+            'C:\temp\VeeamPgUpdate\CHANGES-IN-PROGRESS.marker'
+        )
+    )
+    $found = New-Object System.Collections.ArrayList
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $own = Join-Path $WorkRoot 'CHANGES-IN-PROGRESS.marker'
+    [void]$seen.Add([IO.Path]::GetFullPath($own))
+    if (Test-Path -LiteralPath $own) { [void]$found.Add($own) }
+    $candidates = @($UpdaterPaths)
+    for ($i = 0; $i -lt $candidates.Count; $i++) {
+        $candidate = "$($candidates[$i])"
+        if (-not $candidate) { continue }
+        if (-not $seen.Add([IO.Path]::GetFullPath($candidate))) { continue }
+        if (-not (Test-Path -LiteralPath $candidate)) { continue }
+        if ($i -eq 0 -or (Test-TrustedLegacyMarker -Path $candidate)) { [void]$found.Add($candidate) }
+    }
+    return [string[]]$found.ToArray()
+}
+
+function New-RunFolder {
+    param(
+        [Parameter(Mandatory = $true)][string] $WorkRoot,
+        [Parameter(Mandatory = $true)][string] $Stamp
+    )
+    if ($Stamp -notmatch '^[0-9A-Za-z_-]+$') { throw "Invalid run stamp '$Stamp'." }
+    $path = Join-Path (Join-Path $WorkRoot 'runs') $Stamp
+    # Never reuse a folder: it may hold another run's backups.
+    if (Test-Path -LiteralPath $path) { throw "The run folder already exists: $path" }
+    [void][IO.Directory]::CreateDirectory($path)
+    return $path
+}
+
+function Write-ChangeMarker {
+    param(
+        [Parameter(Mandatory = $true)][string] $WorkRoot,
+        [Parameter(Mandatory = $true)][string] $RunDir,
+        [Parameter(Mandatory = $true)][string] $PathName,
+        [Parameter(Mandatory = $true)][string] $Stage
+    )
+    $marker = Join-Path $WorkRoot 'CHANGES-IN-PROGRESS.marker'
+    Write-AtomicJson -Path $marker -Object ([ordered]@{
+        RunDir = $RunDir
+        Path   = $PathName
+        Stage  = $Stage
+        Time   = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssK')
+    })
+}
+
+# Returns $true when no marker is left (removed now, or already absent).
+function Remove-ChangeMarker {
+    param([Parameter(Mandatory = $true)][string] $WorkRoot)
+    $marker = Join-Path $WorkRoot 'CHANGES-IN-PROGRESS.marker'
+    try {
+        if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force -ErrorAction Stop }
+    } catch {
+        Write-Log -Message "Could not remove the change marker ${marker}: $($_.Exception.Message)" -Level 'ERROR'
+    }
+    return (-not (Test-Path -LiteralPath $marker))
+}
+
+function Write-LastFailure {
+    param(
+        [Parameter(Mandatory = $true)][string] $WorkRoot,
+        [Parameter(Mandatory = $true)][string] $RunDir,
+        [Parameter(Mandatory = $true)][string] $Reason
+    )
+    Write-AtomicJson -Path (Join-Path $WorkRoot 'last-failure.json') -Object ([ordered]@{
+        Computer = $env:COMPUTERNAME
+        RunDir   = $RunDir
+        Reason   = $Reason
+        Time     = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssK')
+    })
+}
+
+function Test-LastFailure {
+    param([Parameter(Mandatory = $true)][string] $WorkRoot)
+    return [bool](Test-Path -LiteralPath (Join-Path $WorkRoot 'last-failure.json'))
+}
+
+# Deletes logs\VbrStandardise_*.log files and runs\* folders whose last write is
+# older than RetentionDays. Never deletes the marker or last-failure.json. Keeps
+# every run folder while a marker exists, and keeps the run folder named in
+# last-failure.json, because a person needs them to recover or investigate.
+function Remove-OldRunData {
+    param(
+        [Parameter(Mandatory = $true)][string] $WorkRoot,
+        [Parameter(Mandatory = $true)][int] $RetentionDays
+    )
+    if ($RetentionDays -lt 1) {
+        Write-Log -Message "RetentionDays is $RetentionDays, so no old run data is deleted." -Level 'WARN'
+        return
+    }
+    $cutoff = (Get-Date).AddDays(-$RetentionDays)
+    $removed = 0
+    $logs = Join-Path $WorkRoot 'logs'
+    if ((Test-Path -LiteralPath $logs -PathType Container) -and -not (Test-PathTreeHasReparsePoint -Path $logs)) {
+        foreach ($log in @(Get-ChildItem -LiteralPath $logs -File -Force -Filter 'VbrStandardise_*.log' -ErrorAction SilentlyContinue)) {
+            if (($log.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            if ($log.LastWriteTime -ge $cutoff) { continue }
+            Remove-Item -LiteralPath $log.FullName -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $log.FullName)) { $removed++ }
+        }
+    }
+    $runs = Join-Path $WorkRoot 'runs'
+    if (-not (Test-Path -LiteralPath $runs -PathType Container)) {
+        Write-Log -Message "Retention: removed $removed old item(s)."
+        return
+    }
+    if (Test-Path -LiteralPath (Join-Path $WorkRoot 'CHANGES-IN-PROGRESS.marker')) {
+        Write-Log -Message 'Retention: a change marker exists, so every run folder is kept.' -Level 'WARN'
+        return
+    }
+    if (Test-PathTreeHasReparsePoint -Path $runs) {
+        Write-Log -Message "Retention: $runs is or sits under a reparse point, so every run folder is kept." -Level 'WARN'
+        return
+    }
+    $keep = ''
+    $lastFailure = Join-Path $WorkRoot 'last-failure.json'
+    if (Test-Path -LiteralPath $lastFailure) {
+        try {
+            $failure = [IO.File]::ReadAllText($lastFailure) | ConvertFrom-Json
+            $keepDir = "$(Get-CfgValue -Object $failure -Name 'RunDir' -Default '')"
+            if ($keepDir) { $keep = [IO.Path]::GetFullPath($keepDir).TrimEnd('\') }
+        } catch {
+            Write-Log -Message 'Retention: last-failure.json cannot be read, so every run folder is kept.' -Level 'WARN'
+            return
+        }
+    }
+    foreach ($dir in @(Get-ChildItem -LiteralPath $runs -Directory -Force -ErrorAction SilentlyContinue)) {
+        if (($dir.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+        if ($dir.LastWriteTime -ge $cutoff) { continue }
+        $full = [IO.Path]::GetFullPath($dir.FullName).TrimEnd('\')
+        if ($keep -and $full -ieq $keep) { continue }
+        if (Test-PathTreeHasReparsePoint -Path $full -IncludeDescendants) {
+            Write-Log -Message "Retention: keeping $full because it contains a reparse point." -Level 'WARN'
+            continue
+        }
+        Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $full)) { $removed++ }
+    }
+    Write-Log -Message "Retention: removed $removed old item(s)."
+}
 #endregion Preflight
 
 #region Vbr
