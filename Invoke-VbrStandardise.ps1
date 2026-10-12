@@ -3658,6 +3658,9 @@ function Stop-ServicesBounded {
 # the time that is left. Start() can throw while a slow service is in fact coming up
 # (VBR 13 Backup Service), so the state read at the end decides. Each service gets
 # its Start() request even when the time is used up, so nothing is left unasked.
+# A Running service counts as started; a StopPending one is first waited for until
+# it is Stopped. A start request that fails while the service stays Stopped is not
+# waited for, so one refused service cannot use up the time of the others.
 function Start-ServicesBounded {
     param(
         [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][string[]] $Names,
@@ -3690,8 +3693,23 @@ function Start-ServicesBounded {
         }
         if ("$($sc.Status)" -eq 'Stopped') {
             Write-Log -Message "  starting $name" -Level 'INFO'
+            $startFailed = $false
             try { $sc.Start() }
-            catch { Write-Log -Message "  start request for $name reported: $(Format-ShortText -Text $_.Exception.Message -MaxLength 300)" -Level 'WARN' }
+            catch {
+                $startFailed = $true
+                Write-Log -Message "  start request for $name reported: $(Format-ShortText -Text $_.Exception.Message -MaxLength 300)" -Level 'WARN'
+            }
+            if ($startFailed) {
+                # A refused start (Disabled, access denied) leaves the service Stopped;
+                # a slow one that timed out is StartPending or Running. Waiting for a
+                # refused one would use up the time the later services need.
+                try { $sc.Refresh() } catch {}
+                if ("$($sc.Status)" -eq 'Stopped') {
+                    Write-Log -Message "  $name is still Stopped after the failed start request" -Level 'WARN'
+                    $notStarted += $name
+                    continue
+                }
+            }
         }
         $left = [math]::Max(0, $TimeoutSec - $timer.Elapsed.TotalSeconds)
         try { $sc.WaitForStatus('Running', [TimeSpan]::FromSeconds($left)) } catch {}
@@ -4516,6 +4534,34 @@ function Invoke-PathB {
     $Ctx['Snapshot'] = @(Get-VeeamServiceSnapshot)
     $Ctx['StopSet'] = @(Get-StopSet -Snapshot $Ctx['Snapshot'])
     $Ctx['Stopped'] = @()
+    # VBR must run before the switch: step 9 starts only what runs now, and step 10
+    # waits for VeeamBackupSvc. A stopped Backup Service (cold standby, crash,
+    # maintenance) would turn the switch into a rollback that ends in exit 50.
+    $backupSvc = @($Ctx['Snapshot'] | Where-Object { $null -ne $_ -and "$(Get-CfgValue -Object $_ -Name 'Name' -Default '')" -eq 'VeeamBackupSvc' })
+    $backupStatus = 'not installed'
+    if ($backupSvc.Count -gt 0) { $backupStatus = "$(Get-CfgValue -Object $backupSvc[0] -Name 'Status' -Default 'Unknown')" }
+    if ($backupStatus -ne 'Running') {
+        return [pscustomobject]@{
+            ExitCode = 5
+            Code     = 'VBR_SERVICE_NOT_RUNNING'
+            Detail   = "VeeamBackupSvc is $backupStatus, so the switch cannot be verified. Nothing was changed."
+            Action   = 'Start the Veeam Backup Service and check that VBR works, then re-run with -Apply'
+        }
+    }
+    # Spec 7.12: the script never changes a startup type, so a running service whose
+    # startup type is Disabled could be stopped but never started again.
+    $disabled = @($Ctx['Snapshot'] | Where-Object {
+        $null -ne $_ -and @($Ctx['StopSet']) -contains "$(Get-CfgValue -Object $_ -Name 'Name' -Default '')" -and
+        "$(Get-CfgValue -Object $_ -Name 'StartType' -Default '')" -eq 'Disabled'
+    } | ForEach-Object { "$(Get-CfgValue -Object $_ -Name 'Name' -Default '')" })
+    if ($disabled.Count -gt 0) {
+        return [pscustomobject]@{
+            ExitCode = 5
+            Code     = 'SERVICE_DISABLED_RUNNING'
+            Detail   = 'Running Veeam service(s) with the startup type Disabled, which could not be started again after a stop: ' + ($disabled -join ', ') + '. Nothing was changed.'
+            Action   = 'Set a startup type that allows a start (or stop the service) for the services named in Detail, then re-run with -Apply'
+        }
+    }
     $external = @()
     if ($Ctx['StopSet'].Count -gt 0) {
         $allServices = @(Get-Service -ErrorAction SilentlyContinue | ForEach-Object {
@@ -4558,9 +4604,14 @@ function Invoke-PathB {
     $script:Stage = 'PATH_B_CHANGING'
 
     Write-Log 'Path B step 5 - idle gate again, then stop the stop set' -Level STEP
+    # Nothing has changed yet on the two early exits below. A marker that cannot be
+    # removed would make the next run exit 50 MARKER_PRESENT, so it is reported here.
+    $markerPath = Join-Path $Ctx.WorkRoot 'CHANGES-IN-PROGRESS.marker'
     $gate = & $idleGate
     if ($null -ne $gate) {
-        $null = Remove-ChangeMarker -WorkRoot $Ctx.WorkRoot
+        if (-not (Remove-ChangeMarker -WorkRoot $Ctx.WorkRoot)) {
+            $null = Add-RunIssue -Code 'POST_CONVERSION_STEP_FAILED' -ExitCode 5 -Detail "Nothing was changed, but the marker could not be removed: $markerPath" -Action 'Delete the marker file named in Detail, then re-run'
+        }
         $script:Stage = 'UNTOUCHED'
         return $gate
     }
@@ -4569,24 +4620,28 @@ function Invoke-PathB {
         $Ctx['Stopped'] = @($stop.Stopped | Where-Object { $_ })
         if (-not $stop.Ok) {
             $notStopped = (@($stop.NotStopped) -join ', ')
-            Write-Log "Service(s) did not stop: $notStopped. Starting what this run stopped." -Level ERROR
-            if ($Ctx['Stopped'].Count -gt 0) {
-                $restart = Start-ServicesBounded -Names @(Get-StartOrder -Snapshot $Ctx['Snapshot'] -Names $Ctx['Stopped']) -TimeoutSec $timeoutSec
-                if (-not $restart.Ok) {
-                    return [pscustomobject]@{
-                        ExitCode = 50
-                        Code     = 'ROLLBACK_FAILED'
-                        Detail   = "SERVICES_WONT_STOP: $notStopped did not stop, and $(@($restart.NotStarted) -join ', ') did not start again. No file or registry value was changed. The marker stays."
-                        Action   = 'PAGE AN OPERATOR NOW. Start the stopped Veeam services, then delete the marker.'
-                    }
+            # Start the whole stop set, not only what reached Stopped: a service that was
+            # asked to stop and is still StopPending at the deadline stops later.
+            # Start-ServicesBounded waits out StopPending before it starts a service, and
+            # counts one that still runs as started (spec 7.14).
+            Write-Log "Service(s) did not stop: $notStopped. Starting every service this run asked to stop." -Level ERROR
+            $restart = Start-ServicesBounded -Names @(Get-StartOrder -Snapshot $Ctx['Snapshot'] -Names $Ctx['StopSet']) -TimeoutSec $timeoutSec
+            if (-not $restart.Ok) {
+                return [pscustomobject]@{
+                    ExitCode = 50
+                    Code     = 'ROLLBACK_FAILED'
+                    Detail   = "SERVICES_WONT_STOP: $notStopped did not stop, and $(@($restart.NotStarted) -join ', ') did not start again. No file or registry value was changed. The marker stays."
+                    Action   = 'PAGE AN OPERATOR NOW. Start the stopped Veeam services, then delete the marker.'
                 }
             }
-            $null = Remove-ChangeMarker -WorkRoot $Ctx.WorkRoot
+            if (-not (Remove-ChangeMarker -WorkRoot $Ctx.WorkRoot)) {
+                $null = Add-RunIssue -Code 'POST_CONVERSION_STEP_FAILED' -ExitCode 5 -Detail "Nothing was changed, but the marker could not be removed: $markerPath" -Action 'Delete the marker file named in Detail, then re-run'
+            }
             $script:Stage = 'UNTOUCHED'
             return [pscustomobject]@{
                 ExitCode = 10
                 Code     = 'SERVICES_WONT_STOP'
-                Detail   = "$notStopped did not stop within $timeoutSec seconds. The services this run stopped were started again; nothing else was changed."
+                Detail   = "$notStopped did not stop within $timeoutSec seconds. Every service this run asked to stop runs again; nothing else was changed."
                 Action   = ''
             }
         }

@@ -3459,6 +3459,61 @@ Check 'T13 stop source: never -Force' ($t13StopParams -contains 'Force') $false
     $t13R = Start-ServicesBounded -Names @() -TimeoutSec 10
     Check 'T13 start: empty list is Ok' "$($t13R.Ok)/$(@($t13R.Started).Count)" 'True/0'
 }
+# A refused start request (for example a Disabled service) leaves the service Stopped.
+# It is not waited for, so the next service still gets the time it needs. Each fake
+# WaitForStatus really waits: the refused one for its whole timeout, the slow one
+# reaches Running only when it is given at least one second.
+& {
+    $t13Events = New-Object System.Collections.ArrayList
+    $t13Refused = [pscustomobject]@{ Name = 'VeeamAaaDisabledSvc'; Status = 'Stopped'; Events = $t13Events }
+    $t13Refused | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
+    $t13Refused | Add-Member -MemberType ScriptMethod -Name Start -Value { throw 'Cannot start service VeeamAaaDisabledSvc on computer ''.''.' }
+    $t13Refused | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value {
+        param($Desired, $Timeout)
+        [void]$this.Events.Add("wait:$($this.Name)")
+        Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds ([int][math]::Min(3000, $Timeout.TotalMilliseconds))
+        throw 'Time out has expired and the operation has not been completed.'
+    }
+    $t13Slow = [pscustomobject]@{ Name = 'VeeamBbbSvc'; Status = 'Stopped'; Events = $t13Events }
+    $t13Slow | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
+    $t13Slow | Add-Member -MemberType ScriptMethod -Name Start -Value { $this.Status = 'StartPending' }
+    $t13Slow | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value {
+        param($Desired, $Timeout)
+        [void]$this.Events.Add("wait:$($this.Name)")
+        if ($Timeout.TotalSeconds -ge 1) { $this.Status = 'Running' } else { throw 'Time out has expired and the operation has not been completed.' }
+    }
+    function Get-Service {
+        [CmdletBinding()] param([Parameter(Position = 0)][string[]] $Name)
+        if ($Name[0] -eq 'VeeamAaaDisabledSvc') { $t13Refused }
+        if ($Name[0] -eq 'VeeamBbbSvc') { $t13Slow }
+    }
+    $t13R = Start-ServicesBounded -Names @('VeeamAaaDisabledSvc', 'VeeamBbbSvc') -TimeoutSec 2
+    Check 'T13 start: a refused start on a Stopped service is not waited for' (@($t13Events | Where-Object { $_ -eq 'wait:VeeamAaaDisabledSvc' }).Count) 0
+    Check 'T13 start: the next service still gets the time and starts' "$(@($t13R.Started) -join ',')|$(@($t13R.NotStarted) -join ',')" 'VeeamBbbSvc|VeeamAaaDisabledSvc'
+}
+# A service that was asked to stop and is still StopPending is waited out, then started
+# (Path B step 5 restarts the whole stop set). One that never leaves StopPending is
+# never sent Start() and is reported as not started.
+& {
+    $t13Events = New-Object System.Collections.ArrayList
+    function New-T13PendingService([string] $Name, [bool] $Stops) {
+        $o = [pscustomobject]@{ Name = $Name; Status = 'StopPending'; Stops = $Stops; Events = $t13Events }
+        $o | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
+        $o | Add-Member -MemberType ScriptMethod -Name Start -Value { [void]$this.Events.Add("start:$($this.Name)"); $this.Status = 'Running' }
+        $o | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value {
+            param($Desired, $Timeout)
+            [void]$this.Events.Add("wait:$($this.Name):$Desired")
+            if ("$Desired" -eq 'Stopped' -and $this.Stops) { $this.Status = 'Stopped' }
+            if ("$($this.Status)" -ne "$Desired") { throw 'Time out has expired and the operation has not been completed.' }
+        }
+        return $o
+    }
+    $t13Pending = @{ VeeamLateSvc = (New-T13PendingService 'VeeamLateSvc' $true); VeeamHungSvc = (New-T13PendingService 'VeeamHungSvc' $false) }
+    function Get-Service { [CmdletBinding()] param([Parameter(Position = 0)][string[]] $Name) if ($t13Pending.ContainsKey($Name[0])) { $t13Pending[$Name[0]] } }
+    $t13R = Start-ServicesBounded -Names @('VeeamLateSvc', 'VeeamHungSvc') -TimeoutSec 10
+    Check 'T13 start: a StopPending service is waited out, then started' (@($t13Events | Where-Object { $_ -like '*VeeamLateSvc*' }) -join ',') 'wait:VeeamLateSvc:Stopped,start:VeeamLateSvc,wait:VeeamLateSvc:Running'
+    Check 'T13 start: a service that never leaves StopPending is not started' "$(@($t13R.Started) -join ',')|$(@($t13R.NotStarted) -join ',')|$(@($t13Events | Where-Object { $_ -eq 'start:VeeamHungSvc' }).Count)" 'VeeamLateSvc|VeeamHungSvc|0'
+}
 
 # Test-ServiceStaysRunning: polls every 5 s; any non-Running read is a failure.
 & {
@@ -4124,6 +4179,7 @@ $t17Mocks = {
         LastFailure = $false; External = @(); NotStopped = @(); HealthOk = $true; ConnectOk = $true
         ClearOk = $true; OtherRoles = @('pg_native_admin'); RegRestoreOk = $true; SettleOk = $true
         LogLines = @(); AuthErrors = @(); WriteThrows = ''; LastFailureReason = ''; RemoveMarkerOk = $true
+        Snapshot = $null; NotStarted = @()
     }
     function Get-Process { [CmdletBinding()] param([string[]] $Name) }
     function Get-Service { [CmdletBinding()] param([string[]] $Name) }
@@ -4136,6 +4192,7 @@ $t17Mocks = {
     }
     function Get-VeeamServiceSnapshot {
         [void]$calls.Add('Get-VeeamServiceSnapshot')
+        if ($null -ne $fake.Snapshot) { return @($fake.Snapshot) }
         return @(
             [pscustomobject]@{ Name = 'VeeamBackupSvc'; Status = 'Running'; StartType = 'Automatic'; DependsOn = @(); Dependents = @() },
             [pscustomobject]@{ Name = 'VeeamBrokerSvc'; Status = 'Running'; StartType = 'Automatic'; DependsOn = @(); Dependents = @() }
@@ -4172,7 +4229,10 @@ $t17Mocks = {
         $ok = $true
         if ($startQueue.Count -gt 0) { $ok = [bool]$startQueue.Dequeue() }
         $notStarted = @()
-        if (-not $ok) { $notStarted = @(@($Names)[0]) }
+        if (-not $ok) {
+            $notStarted = @(@($Names)[0])
+            if (@($fake.NotStarted).Count -gt 0) { $notStarted = @($fake.NotStarted) }
+        }
         return [pscustomobject]@{ Ok = $ok; Started = @($Names | Where-Object { $notStarted -notcontains $_ }); NotStarted = $notStarted }
     }
     function New-PgIdentText { param($Lines, $RequiredNames, $LineEnding, $Stamp) return "veeam `"SYSTEM@NT AUTHORITY`" postgres$LineEnding" }
@@ -4297,6 +4357,46 @@ $t17Mocks = {
     Check 'T17 external dependent: no backup, no marker' (@($calls | Where-Object { $_ -like 'Backup-ConfFile*' -or $_ -like 'Write-ChangeMarker*' }).Count) 0
 }
 
+# Step 3: VeeamBackupSvc does not run (cold standby, crash, maintenance): step 9 would
+# never start it and step 10 could never pass, so Path B changes nothing.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $fake.Snapshot = @(
+        [pscustomobject]@{ Name = 'VeeamBackupSvc'; Status = 'Stopped'; StartType = 'Automatic'; DependsOn = @(); Dependents = @() },
+        [pscustomobject]@{ Name = 'VeeamBrokerSvc'; Status = 'Running'; StartType = 'Automatic'; DependsOn = @(); Dependents = @() }
+    )
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 Backup Service stopped: exit 5' $result.ExitCode 5
+    Check 'T17 Backup Service stopped: code' $result.Code 'VBR_SERVICE_NOT_RUNNING'
+    Check 'T17 Backup Service stopped: Detail names the status' ($result.Detail -like 'VeeamBackupSvc is Stopped*Nothing was changed.') 'True'
+    Check 'T17 Backup Service stopped: action' $result.Action 'Start the Veeam Backup Service and check that VBR works, then re-run with -Apply'
+    Check 'T17 Backup Service stopped: no run folder, backup, marker or stop' (@($calls | Where-Object { $_ -like 'New-RunFolder*' -or $_ -like 'Backup-ConfFile*' -or $_ -like 'Write-ChangeMarker*' -or $_ -like 'Stop-ServicesBounded*' }).Count) 0
+    Check 'T17 Backup Service stopped: stage stays UNTOUCHED' $script:Stage 'UNTOUCHED'
+    $calls.Clear()
+    $fake.Snapshot = @([pscustomobject]@{ Name = 'VeeamBrokerSvc'; Status = 'Running'; StartType = 'Automatic'; DependsOn = @(); Dependents = @() })
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 Backup Service missing: exit 5 VBR_SERVICE_NOT_RUNNING' "$($result.ExitCode) $($result.Code)" '5 VBR_SERVICE_NOT_RUNNING'
+    Check 'T17 Backup Service missing: Detail says not installed' ($result.Detail -like 'VeeamBackupSvc is not installed*') 'True'
+    Check 'T17 Backup Service missing: no marker or stop' (@($calls | Where-Object { $_ -like 'Write-ChangeMarker*' -or $_ -like 'Stop-ServicesBounded*' }).Count) 0
+}
+
+# Step 3: a running stop-set service with the startup type Disabled could be stopped
+# but never started again (the script never changes startup types).
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $fake.Snapshot = @(
+        [pscustomobject]@{ Name = 'VeeamBackupSvc'; Status = 'Running'; StartType = 'Automatic'; DependsOn = @(); Dependents = @() },
+        [pscustomobject]@{ Name = 'VeeamBrokerSvc'; Status = 'Running'; StartType = 'Disabled'; DependsOn = @(); Dependents = @() }
+    )
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 disabled running service: exit 5' $result.ExitCode 5
+    Check 'T17 disabled running service: code' $result.Code 'SERVICE_DISABLED_RUNNING'
+    Check 'T17 disabled running service: named in Detail' ($result.Detail -like '*VeeamBrokerSvc*') 'True'
+    Check 'T17 disabled running service: no run folder, backup, marker or stop' (@($calls | Where-Object { $_ -like 'New-RunFolder*' -or $_ -like 'Backup-ConfFile*' -or $_ -like 'Write-ChangeMarker*' -or $_ -like 'Stop-ServicesBounded*' }).Count) 0
+}
+
 # Both texts are rendered before step 4: a name that cannot be written as ASCII stops
 # Path B before any backup, marker or service stop, so there is no outage.
 & {
@@ -4312,6 +4412,7 @@ $t17Mocks = {
 & {
     . $t17Mocks
     $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
     $busyQueue.Enqueue([pscustomobject]@{ Busy = $false; Persistent = $false; Names = @() })
     $busyQueue.Enqueue([pscustomobject]@{ Busy = $true; Persistent = $false; Names = @('VeeamAgent') })
     $result = Invoke-PathB -Ctx (New-T17Ctx)
@@ -4319,23 +4420,52 @@ $t17Mocks = {
     Check 'T17 busy at step 5: marker removed' (@($calls)[-1]) 'Remove-ChangeMarker'
     Check 'T17 busy at step 5: nothing stopped' (@($calls | Where-Object { $_ -like 'Stop-ServicesBounded*' }).Count) 0
     Check 'T17 busy at step 5: stage back to UNTOUCHED' $script:Stage 'UNTOUCHED'
+    Check 'T17 busy at step 5: no issue while the marker is removed' @($script:Issues).Count 0
 }
 
-# Step 5: a service does not stop: start what was stopped, remove the marker, exit 10.
+# Step 5: busy again and the marker cannot be removed: the run says so, because the
+# next run would otherwise exit 50 MARKER_PRESENT with no hint.
 & {
     . $t17Mocks
     $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
+    $fake.RemoveMarkerOk = $false
+    $busyQueue.Enqueue([pscustomobject]@{ Busy = $false; Persistent = $false; Names = @() })
+    $busyQueue.Enqueue([pscustomobject]@{ Busy = $true; Persistent = $false; Names = @('VeeamAgent') })
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 busy at step 5, marker stuck: still exit 10 VEEAM_BUSY' "$($result.ExitCode) $($result.Code)" '10 VEEAM_BUSY'
+    Check 'T17 busy at step 5, marker stuck: issue names the marker' (@($script:Issues | Where-Object { $_.Code -eq 'POST_CONVERSION_STEP_FAILED' -and $_.ExitCode -eq 5 -and $_.Detail -like ('Nothing was changed, but the marker could not be removed: ' + (Join-Path $t16Root 'CHANGES-IN-PROGRESS.marker')) }).Count) 1
+    $script:Issues = New-Object System.Collections.ArrayList
+}
+
+# Step 5: a service does not stop. VeeamBrokerSvc was asked to stop and is left
+# StopPending at the deadline, so it stops later: every service of the stop set is
+# started again (Start-ServicesBounded waits out StopPending), then the marker goes.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
     $fake.NotStopped = @('VeeamBrokerSvc')
     $ctx = New-T17Ctx
     $result = Invoke-PathB -Ctx $ctx
     Check 'T17 wont stop: exit 10' $result.ExitCode 10
     Check 'T17 wont stop: code' $result.Code 'SERVICES_WONT_STOP'
     $afterStop = @($calls)[($calls.IndexOf('Stop-ServicesBounded:VeeamBackupSvc,VeeamBrokerSvc:PATH_B_CHANGING') + 1)..($calls.Count - 1)] -join ' > '
-    Check 'T17 wont stop: starts only what it stopped, then removes the marker' $afterStop 'Start-ServicesBounded:VeeamBackupSvc > Remove-ChangeMarker'
+    Check 'T17 wont stop: starts the whole stop set, including the StopPending one, then removes the marker' $afterStop 'Start-ServicesBounded:VeeamBackupSvc,VeeamBrokerSvc > Remove-ChangeMarker'
+    Check 'T17 wont stop: Detail says every service asked to stop runs again' ($result.Detail -like '*VeeamBrokerSvc did not stop*Every service this run asked to stop runs again*') 'True'
     Check 'T17 wont stop: no file written' (@($calls | Where-Object { $_ -like 'Write-ConfFileAtomic*' }).Count) 0
     Check 'T17 wont stop: no last-failure' (@($calls | Where-Object { $_ -eq 'Write-LastFailure' }).Count) 0
     Check 'T17 wont stop: stage back to UNTOUCHED' $script:Stage 'UNTOUCHED'
     Check 'T17 wont stop: Stopped is what stopped' ($ctx.Stopped -join ',') 'VeeamBackupSvc'
+    Check 'T17 wont stop: no issue while the marker is removed' @($script:Issues).Count 0
+
+    # The marker cannot be removed after the restart: reported, still exit 10.
+    $calls.Clear()
+    $fake.RemoveMarkerOk = $false
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 wont stop, marker stuck: still exit 10' "$($result.ExitCode) $($result.Code)" '10 SERVICES_WONT_STOP'
+    Check 'T17 wont stop, marker stuck: issue names the marker' (@($script:Issues | Where-Object { $_.Code -eq 'POST_CONVERSION_STEP_FAILED' -and $_.Detail -like '*marker could not be removed*CHANGES-IN-PROGRESS.marker' }).Count) 1
+    $script:Issues = New-Object System.Collections.ArrayList
 }
 
 # Step 5: a service does not stop and a stopped one does not start again -> 50, marker stays.
@@ -4348,6 +4478,21 @@ $t17Mocks = {
     Check 'T17 wont stop, wont start: exit 50' $result.ExitCode 50
     Check 'T17 wont stop, wont start: code' $result.Code 'ROLLBACK_FAILED'
     Check 'T17 wont stop, wont start: marker stays' (@($calls | Where-Object { $_ -eq 'Remove-ChangeMarker' }).Count) 0
+}
+
+# Step 5: the StopPending service never leaves StopPending, so it cannot be started
+# again -> 50, the marker stays, and Detail names it.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $fake.NotStopped = @('VeeamBrokerSvc')
+    $fake.NotStarted = @('VeeamBrokerSvc')
+    $startQueue.Enqueue($false)
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 wont stop, stays StopPending: exit 50 ROLLBACK_FAILED' "$($result.ExitCode) $($result.Code)" '50 ROLLBACK_FAILED'
+    Check 'T17 wont stop, stays StopPending: the restart asked for it' (@($calls | Where-Object { $_ -eq 'Start-ServicesBounded:VeeamBackupSvc,VeeamBrokerSvc' }).Count) 1
+    Check 'T17 wont stop, stays StopPending: Detail names it' ($result.Detail -like '*VeeamBrokerSvc did not stop, and VeeamBrokerSvc did not start again*') 'True'
+    Check 'T17 wont stop, stays StopPending: no Remove-ChangeMarker' (@($calls | Where-Object { $_ -eq 'Remove-ChangeMarker' }).Count) 0
 }
 
 # Step 7: SSPI test fails -> rollback before any registry change -> 40.
@@ -5048,6 +5193,23 @@ Check 'T18 main body passes the path Detail to Complete-Run on success too' ($t1
 $t18RequiredLine = @($t18MainText -split "`r?`n" | Where-Object { $_ -like '*Get-RequiredIdentNames -SvcMapName*' })
 Check 'T18 required names: the main body adds the translated SYSTEM name' (($t18RequiredLine.Count -eq 1) -and $t18RequiredLine[0].Contains('@("$($systemNames.Translated)")')) 'True'
 Check 'T18 required names: English SYSTEM line kept, translated one added' (@(Get-RequiredIdentNames -SvcMapName 'svc_veeam@VBR01' -ServiceAccountMapNames @('SISTEMA@AUTORIDADE NT', 'veeamsvc@CORP')) -join '|') 'SYSTEM@NT AUTHORITY|svc_veeam@VBR01|SISTEMA@AUTORIDADE NT|veeamsvc@CORP'
+
+# Every issue code the script writes as a literal (Code = '...' or -Code '...') has a
+# row in a README issue table and is listed in spec 6.3, so an RMM parser built from
+# the documents never meets an unknown code.
+$t18ReadmePath = Join-Path $PSScriptRoot 'README.md'
+$t18SpecPath = Join-Path $PSScriptRoot 'docs\superpowers\specs\2026-10-12-vbr-standardise-design.md'
+$t18ReadmeText = ''
+$t18SpecText = ''
+if (Test-Path -LiteralPath $t18ReadmePath) { $t18ReadmeText = [System.IO.File]::ReadAllText($t18ReadmePath) }
+if (Test-Path -LiteralPath $t18SpecPath) { $t18SpecText = [System.IO.File]::ReadAllText($t18SpecPath) }
+$t18SpecIssueTable = ''
+$t18SpecTableMatch = [regex]::Match($t18SpecText, '(?s)### 6\.3 Issue codes(.*?)### 6\.4')
+if ($t18SpecTableMatch.Success) { $t18SpecIssueTable = $t18SpecTableMatch.Groups[1].Value }
+$t18ScriptCodes = @([regex]::Matches($ScriptText, "(?:\bCode\s*=\s*|-Code\s+)'([A-Z][A-Z0-9_]+)'") | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+Check 'T18 issue codes: the script writes literal codes' ($t18ScriptCodes.Count -ge 40) 'True'
+Check 'T18 issue codes: every code has a README issue table row' (@($t18ScriptCodes | Where-Object { $t18ReadmeText -notmatch ('\|\s*`{0}`\s*\|\s*\d' -f $_) }) -join ',') ''
+Check 'T18 issue codes: every code is in spec 6.3' (@($t18ScriptCodes | Where-Object { $t18SpecIssueTable -notmatch ('`{0}`' -f $_) }) -join ',') ''
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue

@@ -150,9 +150,9 @@ Used when `DbAuth=NATIVE`, or for `DB_HOST_NOT_LOCAL` or `DB_WINDOWS_ROLE_NOT_PO
 
 1. If `<WorkRoot>\last-failure.json` exists: exit 5 `PATH_B_PREVIOUS_FAILURE` (see [last-failure.json](#last-failurejson)).
 2. Idle gate: no `Veeam.Backup.Manager`, `VeeamAgent` or `Veeam*Explorer*` process. Exit 10 `VEEAM_BUSY`, or exit 5 `VEEAM_BUSY_PERSISTENT` if the oldest one has run longer than 6 hours (log backup or CDP).
-3. Record the Veeam services and find the stop set (every running service whose name starts with `Veeam`). A running service outside the set that depends on one in it: exit 5 `SERVICE_DEPENDENT_OUTSIDE_SET`.
+3. Record the Veeam services and find the stop set (every running service whose name starts with `Veeam`). `VeeamBackupSvc` is not running (or not installed): exit 5 `VBR_SERVICE_NOT_RUNNING`, because the switch could not be verified. A service in the set has the startup type `Disabled`: exit 5 `SERVICE_DISABLED_RUNNING`, because it could not be started again. A running service outside the set that depends on one in it: exit 5 `SERVICE_DEPENDENT_OUTSIDE_SET`. Nothing is changed in any of these cases.
 4. Create the run folder: `pg_hba.conf.before`, `pg_ident.conf.before`, `services-before.json`, `registry-before.json` (old data of every registry value the script may change, or "absent") and `vbr-key.reg` (a `reg.exe export` of the `DatabaseConfigurations\PostgreSql` key, which must not be empty). Write the marker. Stage `PATH_B_CHANGING`. No backup means no change.
-5. Idle gate again, then stop the stop set (at most 5 minutes, never `-Force`, startup types unchanged). If a service does not stop: start what this run stopped, remove the marker, exit 10 `SERVICES_WONT_STOP`. Nothing else has changed.
+5. Idle gate again, then stop the stop set (at most 5 minutes, never `-Force`, startup types unchanged). If a service does not stop: start every service the script asked to stop again (a service that is still stopping is waited for first), remove the marker, exit 10 `SERVICES_WONT_STOP`. Nothing else has changed. If one of them does not start again: exit 50 `ROLLBACK_FAILED`, and the marker stays.
 6. Write `pg_ident.conf`, then `pg_hba.conf`.
 7. Test as in Path A. A failure runs the rollback.
 8. Switch the registry under `HKLM\SOFTWARE\Veeam\Veeam Backup and Replication\DatabaseConfigurations\PostgreSql`: `SqlUserName` and `SqlSecuredPassword` become empty strings, `PostgresUserForWindowsAuth` becomes `postgres` if needed, and `SqlHostName` becomes `127.0.0.1` (or `::1` if only `::1` listens) if it is not a loopback name. `SqlLockInfo` is never changed.
@@ -252,17 +252,19 @@ If a run finds more than one issue, the highest exit code wins. `IssueCode` is t
 | `VEEAM_BUSY` | 10 | A Veeam job or Explorer runs. | Retry later. |
 | `VEEAM_BUSY_PERSISTENT` | 5 | Veeam work has run for more than 6 hours (log backup or CDP). | Pause log backup or CDP jobs and re-run in a maintenance window. |
 | `SERVICE_DEPENDENT_OUTSIDE_SET` | 5 | A running non-Veeam service depends on a Veeam service. | Stop or reconfigure that service, then re-run. |
+| `VBR_SERVICE_NOT_RUNNING` | 5 | Path B: `VeeamBackupSvc` is not running (or not installed), so the switch could not be verified. Nothing was changed. | Start the Veeam Backup Service and check that VBR works, then re-run with `-Apply`. |
+| `SERVICE_DISABLED_RUNNING` | 5 | Path B: a running Veeam service has the startup type `Disabled`, so it could not be started again after a stop. `Detail` names it. Nothing was changed. | Set a startup type that allows a start (or stop the service) for the services named in `Detail`, then re-run with `-Apply`. |
 | `PATH_B_PREVIOUS_FAILURE` | 5 | `last-failure.json` exists from an earlier Path B rollback. | See [last-failure.json](#last-failurejson). |
 
 ### Change results
 
 | Code | Exit | Meaning | Action |
 |---|---|---|---|
-| `SERVICES_WONT_STOP` | 10 | A Veeam service did not stop within 5 minutes. The script started what it stopped; nothing else changed. | Retry later. If it repeats, find out why the service hangs. |
+| `SERVICES_WONT_STOP` | 10 | A Veeam service did not stop within 5 minutes. The script started every service it asked to stop again, including one that was still stopping; nothing else changed. (If one of them does not start again, the result is 50 `ROLLBACK_FAILED`.) | Retry later. If it repeats, find out why the service hangs. |
 | `PG_SSPI_TEST_FAILED` | 40 | After the write, SYSTEM could not log in or PostgreSQL rejected the files. The script restored them (and, in Path B, the registry and services). | Escalate. Read the transcript and the run folder. |
 | `VBR_DB_CONNECT_FAILED` | 40 | After the switch, VBR did not connect to its database within 10 minutes, or a service did not start. The script rolled back. | Escalate. Read `last-failure.json`, the run folder and `Svc.VeeamBackup.log`. |
 | `PG_PASSWORD_NOT_CLEARED` | 5 | VBR works with Windows authentication, but the `postgres` password could not be cleared. | Re-run with `-Apply`. |
-| `POST_CONVERSION_STEP_FAILED` | 5 | The change was verified and VBR works, but a later step failed (for example removing the marker). Nothing was rolled back. | Read the transcript, then re-run with `-Apply`. |
+| `POST_CONVERSION_STEP_FAILED` | 5 | The change was verified and VBR works, but a later step failed (for example removing the marker). Nothing was rolled back. Also reported when a Path B run stopped before any change (`VEEAM_BUSY`, `SERVICES_WONT_STOP`) and could not remove its marker: `Detail` names the marker file. | Read the transcript, then re-run with `-Apply`. For a marker named in `Detail`, delete it first. |
 | `ROLLBACK_FAILED` | 50 | A change failed and the restore or rollback also failed. VBR may be down. The marker stays. | Page an operator now. Follow [MARKER_PRESENT: manual recovery](#marker_present-manual-recovery). |
 | `UNHANDLED_ERROR` | 20, 40 | An unexpected error. Exit 20 before any database change. Exit 40 when the script restored the files or rolled back and VBR works. (If that restore fails, the result is 50 `ROLLBACK_FAILED`.) After the change was verified it is reported as `POST_CONVERSION_STEP_FAILED` instead. | Read the transcript. Escalate for 40. |
 

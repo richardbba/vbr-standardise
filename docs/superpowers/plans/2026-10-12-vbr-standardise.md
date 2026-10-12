@@ -11513,6 +11513,7 @@ $issueCodes = @(
     'DB_NATIVE_AUTH', 'DB_AUTH_UNKNOWN', 'DB_HOST_NOT_LOCAL', 'DB_WINDOWS_ROLE_NOT_POSTGRES', 'PG_HBA_NOT_STANDARD',
     'PG_IDENT_NOT_STANDARD', 'PG_POSTGRES_PASSWORD_SET', 'SERVICE_ACCOUNT_UNRESOLVED',
     'PG_PASSWORD_CONSUMER', 'PG_REMOTE_CONSUMER', 'VEEAM_BUSY', 'VEEAM_BUSY_PERSISTENT', 'SERVICE_DEPENDENT_OUTSIDE_SET', 'PATH_B_PREVIOUS_FAILURE',
+    'VBR_SERVICE_NOT_RUNNING', 'SERVICE_DISABLED_RUNNING',
     'SERVICES_WONT_STOP', 'PG_SSPI_TEST_FAILED', 'VBR_DB_CONNECT_FAILED', 'PG_PASSWORD_NOT_CLEARED', 'POST_CONVERSION_STEP_FAILED',
     'ROLLBACK_FAILED', 'UNHANDLED_ERROR'
 )
@@ -11530,7 +11531,7 @@ if ($missing.Count -eq 0) { "README check: all $($exitCodes.Count) exit codes an
 else { 'README check: missing ' + ($missing -join ', ') }
 ```
 
-Expected output: `README check: all 7 exit codes and 50 issue codes present`. Any other output names what is missing; add it to the tables and run the check again.
+Expected output: `README check: all 7 exit codes and 52 issue codes present`. Any other output names what is missing; add it to the tables and run the check again.
 
 - [ ] **Step 3: Commit**
 

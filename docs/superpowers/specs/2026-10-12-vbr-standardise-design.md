@@ -103,7 +103,7 @@ If a run finds more than one issue, the highest exit code wins. `IssueCode` is t
 | Preflight | `CONCURRENT_RUN`, `WRONG_POWERSHELL`, `NOT_ELEVATED`, `HOST_32BIT`, `CONSTRAINED_LANGUAGE`, `WORKROOT_UNSAFE`, `MARKER_PRESENT`, `DOMAIN_CONTROLLER`, `VBR_NOT_FOUND`, `VBR_DB_NOT_POSTGRES`, `STACKED_VBR_VB365`, `REMOTE_DB`, `NO_PG_FOUND`, `MULTIPLE_PG`, `PG_NOT_RUNNING`, `PG_INSTANCE_MISMATCH`, `PG_NOT_LISTENING`, `PG_CONF_OVERRIDE`, `PG_HBA_INCLUDE`, `PG_IDENT_LOCALISED` |
 | Account | `SVC_ACCOUNT_MISSING`, `SVC_PASSWORD_REQUIRED`, `SVC_PASSWORD_POLICY`, `SVC_NAME_IN_USE`, `SVC_NOT_ADMIN`, `SVC_FLAGS_DRIFT`, `SVC_DISABLED`, `SVC_LOCKED_OUT`, `SVC_PASSWORD_EXPIRED` |
 | Database state | `DB_NATIVE_AUTH`, `DB_AUTH_UNKNOWN`, `DB_HOST_NOT_LOCAL`, `DB_WINDOWS_ROLE_NOT_POSTGRES`, `PG_HBA_NOT_STANDARD`, `PG_IDENT_NOT_STANDARD`, `PG_POSTGRES_PASSWORD_SET`, `SERVICE_ACCOUNT_UNRESOLVED` |
-| Blockers | `PG_PASSWORD_CONSUMER`, `PG_REMOTE_CONSUMER`, `VEEAM_BUSY`, `VEEAM_BUSY_PERSISTENT`, `SERVICE_DEPENDENT_OUTSIDE_SET`, `PATH_B_PREVIOUS_FAILURE` |
+| Blockers | `PG_PASSWORD_CONSUMER`, `PG_REMOTE_CONSUMER`, `VEEAM_BUSY`, `VEEAM_BUSY_PERSISTENT`, `SERVICE_DEPENDENT_OUTSIDE_SET`, `PATH_B_PREVIOUS_FAILURE`, `VBR_SERVICE_NOT_RUNNING`, `SERVICE_DISABLED_RUNNING` |
 | Change results | `SERVICES_WONT_STOP`, `PG_SSPI_TEST_FAILED`, `VBR_DB_CONNECT_FAILED`, `PG_PASSWORD_NOT_CLEARED`, `POST_CONVERSION_STEP_FAILED`, `ROLLBACK_FAILED`, `UNHANDLED_ERROR` |
 
 ### 6.4 RMM summary fields
@@ -257,9 +257,9 @@ If every item is compliant, the script changes nothing and stops no service.
 
 1. If `<WorkRoot>\last-failure.json` exists: exit 5 `PATH_B_PREVIOUS_FAILURE`. A person reads the earlier run folder and deletes the file. This stops a scheduled job from causing the same outage again and again.
 2. Idle gate (section 7.11).
-3. Save the state of the Veeam services (name, status, startup type). Find the stop set: every running service whose name starts with `Veeam`. If a running service outside the stop set depends on one in the set: exit 5 `SERVICE_DEPENDENT_OUTSIDE_SET`.
+3. Save the state of the Veeam services (name, status, startup type). Find the stop set: every running service whose name starts with `Veeam`. If `VeeamBackupSvc` is missing or its status is not `Running`: exit 5 `VBR_SERVICE_NOT_RUNNING` (step 9 would not start it, so step 10 could never pass and the rollback would end in 50). If a service in the stop set has the startup type `Disabled`: exit 5 `SERVICE_DISABLED_RUNNING` (the script never changes startup types, so it could not start that service again). If a running service outside the stop set depends on one in the set: exit 5 `SERVICE_DEPENDENT_OUTSIDE_SET`. Nothing is changed in these cases.
 4. Create the run folder. Back up `pg_hba.conf` and `pg_ident.conf`, and record their SDDL. Run `reg.exe export` of the VBR key, and check that the file is not empty. Write `registry-before.json` with every value the script will change: its old data, or "absent" if it does not exist. Write the marker. Stage = `PATH_B_CHANGING`, so an unexpected error from here on runs the rollback, which also starts the services again. No backup means no change.
-5. Idle gate again, then stop the stop set in the updater's stop order, bounded by `ServiceStopTimeoutSec` (section 7.12). The script does not change startup types. If a service does not stop: start the services that this run stopped, remove the marker, and exit 10 `SERVICES_WONT_STOP`. Nothing else has changed yet.
+5. Idle gate again, then stop the stop set in the updater's stop order, bounded by `ServiceStopTimeoutSec` (section 7.12). The script does not change startup types. If a service does not stop: start every service of the stop set again (a service that is still `StopPending` is waited for until it stops, then started; one that still runs counts as started), remove the marker, and exit 10 `SERVICES_WONT_STOP`. Nothing else has changed yet. If a service does not start again: exit 50 `ROLLBACK_FAILED`, and the marker stays. If the marker cannot be removed on this exit or on the busy exit of the idle gate, the run also reports `POST_CONVERSION_STEP_FAILED` (exit 5) with the marker path in `Detail`.
 6. Write `pg_ident.conf`, then `pg_hba.conf` (section 7.8).
 7. Test (section 7.9). If it fails: rollback.
 8. Change the registry (section 9). This includes `PostgresUserForWindowsAuth` = `postgres`, and `SqlHostName` = a loopback address if it is not one already.
@@ -334,7 +334,7 @@ One routine does every write and every restore (Path A, Path B, rollback, trap).
 
 - Copy the updater's stop order and dependency-order start. Do not copy the step that sets services to Disabled.
 - Stop with `Stop-Service -NoWait`, then poll until stopped or until `ServiceStopTimeoutSec` ends. Never `-Force`.
-- Start with `ServiceController.Start()` and `WaitForStatus('Running', timeout)`, bounded by `ServiceStopTimeoutSec` in total.
+- Start with `ServiceController.Start()` and `WaitForStatus('Running', timeout)`, bounded by `ServiceStopTimeoutSec` in total. A `StopPending` service is first waited for until it stops. If `Start()` fails and the service is still `Stopped` (for example it is disabled), it is not waited for, so the services after it keep their time.
 
 ### 7.13 VBR connect check (Path B step 10)
 
@@ -347,7 +347,7 @@ All three must be true before `VbrConnectTimeoutSec` ends:
 
 - `hba_file` or `ident_file` set on the PostgreSQL service command line (`-c`) is not detected in preflight. The post-write checks catch it, and the run rolls back (exit 40).
 - On success, `Detail` also lists the `pg_hba.conf` lines that were commented out and the roles that still have a password.
-- Path B: if a service this run stopped does not start again after `SERVICES_WONT_STOP`, the result is 50 and the marker stays. A service that does not start in step 9 counts as `VBR_DB_CONNECT_FAILED` and runs the rollback.
+- Path B: if a service this run asked to stop (including one still `StopPending` at the deadline) does not start again after `SERVICES_WONT_STOP`, the result is 50 and the marker stays. A service that does not start in step 9 counts as `VBR_DB_CONNECT_FAILED` and runs the rollback.
 - Path A sets `PATH_A_DONE` just before it removes the marker, so an error during the removal never restores verified files.
 
 ## 8. Security
