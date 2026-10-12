@@ -2266,6 +2266,237 @@ function Invoke-ServiceAccountStep {
 #endregion Account
 
 #region ConfFiles
+# Latin-1 (code page 28591) maps every byte 0-255 to the char with the same number and
+# back, so text work on pg_hba.conf / pg_ident.conf never changes a byte it does not
+# touch (CP1252 or UTF-8 bytes in a comment survive unchanged).
+function ConvertFrom-Latin1Bytes {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]] $Bytes)
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+    return $latin1.GetString($Bytes)
+}
+
+# The reverse of ConvertFrom-Latin1Bytes. A char above U+00FF has no Latin-1 byte, so
+# the encoder throws instead of writing '?' into a config file. The leading comma
+# returns the byte[] as one object; PowerShell would otherwise unroll it byte by byte.
+function ConvertTo-Latin1Bytes {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string] $Text)
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591,
+        [System.Text.EncoderFallback]::ExceptionFallback,
+        [System.Text.DecoderFallback]::ExceptionFallback)
+    $bytes = $latin1.GetBytes($Text)
+    return ,$bytes
+}
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]] $Bytes)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash($Bytes)
+    } finally {
+        $sha.Dispose()
+    }
+    return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+}
+
+# Reads a config file as bytes. Text is the Latin-1 text of the bytes after a UTF-8
+# BOM (the BOM is never written back). LineEnding is CRLF when the first line break
+# is CRLF, else LF. Sddl is recorded so every later write can prove the ACL is kept.
+function Read-ConfFile {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $bytes = [System.IO.File]::ReadAllBytes($full)
+    $hadBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+    $body = $bytes
+    if ($hadBom) {
+        $body = New-Object byte[] ($bytes.Length - 3)
+        [System.Array]::Copy($bytes, 3, $body, 0, $body.Length)
+    }
+    $text = ConvertFrom-Latin1Bytes -Bytes $body
+    $lineEnding = "`n"
+    $firstLf = $text.IndexOf([char]10)
+    if ($firstLf -gt 0 -and $text[$firstLf - 1] -eq [char]13) { $lineEnding = "`r`n" }
+    $sddl = (Get-Acl -LiteralPath $full).Sddl
+    return [pscustomobject]@{
+        Path       = $full
+        Bytes      = $bytes
+        Text       = $text
+        LineEnding = $lineEnding
+        HadBom     = $hadBom
+        Sddl       = $sddl
+    }
+}
+
+# Splits on LF and removes one trailing CR from each line. A final line break does not
+# make an empty last line, and empty text gives no lines. Callers wrap the result in
+# @(), because PowerShell returns a single line as a plain string.
+function Split-ConfLines {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string] $Text)
+    if ($Text.Length -eq 0) { return }
+    $parts = $Text.Split([char[]]@([char]10))
+    $count = $parts.Length
+    if ($Text[$Text.Length - 1] -eq [char]10) { $count-- }
+    $lines = New-Object string[] $count
+    for ($i = 0; $i -lt $count; $i++) {
+        $line = $parts[$i]
+        if ($line.Length -gt 0 -and $line[$line.Length - 1] -eq [char]13) {
+            $line = $line.Substring(0, $line.Length - 1)
+        }
+        $lines[$i] = $line
+    }
+    return $lines
+}
+
+# Joins lines with LineEnding and ends the text with one LineEnding. No lines give an
+# empty text, so an empty file survives Split-ConfLines + Join-ConfLines unchanged.
+function Join-ConfLines {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]] $Lines,
+        [Parameter(Mandatory = $true)][string] $LineEnding
+    )
+    if ($LineEnding -cne "`n" -and $LineEnding -cne "`r`n") {
+        throw 'Join-ConfLines: LineEnding must be LF or CRLF.'
+    }
+    if ($Lines.Length -eq 0) { return '' }
+    return ([string]::Join($LineEnding, $Lines) + $LineEnding)
+}
+
+# The one routine for every write and every restore of pg_hba.conf and pg_ident.conf
+# (spec 7.8). The new bytes go to a temp file next to the live file and are swapped in
+# with [IO.File]::Replace. Its backup file also sits next to the live file and is never
+# $null. File.Replace keeps the live file's DACL but takes owner and group from the temp
+# file, so the temp file first gets the live file's owner and group (Set-Acl enables
+# the restore privilege for that). Then the live file must exist, hold exactly these
+# bytes (SHA-256) and have ExpectedSddl. On any failure the previous bytes go back the
+# same way, and the function throws.
+function Write-ConfFileAtomic {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]] $Bytes,
+        [Parameter(Mandatory = $true)][string] $ExpectedSddl
+    )
+    $full = [System.IO.Path]::GetFullPath($Path)
+    if (-not [System.IO.File]::Exists($full)) {
+        throw "Write-ConfFileAtomic: '$full' does not exist. The script only replaces an existing file."
+    }
+    $dir = [System.IO.Path]::GetDirectoryName($full)
+    $leaf = [System.IO.Path]::GetFileName($full)
+    $previous = [System.IO.File]::ReadAllBytes($full)
+    $sddlBefore = (Get-Acl -LiteralPath $full).Sddl
+    $ownerAndGroup = [System.Security.AccessControl.AccessControlSections]'Owner, Group'
+
+    # One swap. Returns { Failure = '' when every check passed, else the reason;
+    # Backup = the File.Replace backup path }.
+    $swap = {
+        param([byte[]] $Data, [string] $WantSddl)
+        $tag = '{0}-{1}' -f $PID, [guid]::NewGuid().ToString('N')
+        $tmp = Join-Path $dir ('{0}.vbrstd-{1}.tmp' -f $leaf, $tag)
+        $bak = Join-Path $dir ('{0}.vbrstd-{1}.old' -f $leaf, $tag)
+        $failure = ''
+        try {
+            [System.IO.File]::WriteAllBytes($tmp, $Data)
+            $tmpAcl = Get-Acl -LiteralPath $tmp -ErrorAction Stop
+            $tmpAcl.SetSecurityDescriptorSddlForm($sddlBefore, $ownerAndGroup)
+            Set-Acl -LiteralPath $tmp -AclObject $tmpAcl -ErrorAction Stop
+            [System.IO.File]::Replace($tmp, $full, $bak)
+        } catch {
+            $failure = "swap failed: $($_.Exception.Message)"
+        }
+        # File.Replace can fail after it renamed the live file to the backup name
+        # (ERROR_UNABLE_TO_MOVE_REPLACEMENT_2). That backup is the live file itself,
+        # with its own ACL, so rename it back.
+        if (-not [System.IO.File]::Exists($full) -and [System.IO.File]::Exists($bak)) {
+            try {
+                [System.IO.File]::Move($bak, $full)
+            } catch {
+                $failure = "$failure; could not rename '$bak' back: $($_.Exception.Message)"
+            }
+        }
+        if (-not $failure) {
+            if (-not [System.IO.File]::Exists($full)) {
+                $failure = 'the file is missing after the swap'
+            } elseif ((Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($full))) -cne (Get-Sha256Hex -Bytes $Data)) {
+                $failure = 'the SHA-256 of the file does not match the bytes written'
+            } else {
+                $sddlNow = (Get-Acl -LiteralPath $full).Sddl
+                if ($sddlNow -cne $WantSddl) { $failure = "the SDDL is '$sddlNow', expected '$WantSddl'" }
+            }
+        }
+        try { [System.IO.File]::Delete($tmp) } catch { $failure = "$failure; could not delete '$tmp'" }
+        return [pscustomobject]@{ Failure = $failure; Backup = $bak }
+    }
+
+    $first = & $swap $Bytes $ExpectedSddl
+    if (-not $first.Failure) {
+        try {
+            [System.IO.File]::Delete($first.Backup)
+        } catch {
+            Write-Log -Message "Could not delete the swap backup '$($first.Backup)': $($_.Exception.Message)" -Level 'WARN'
+        }
+        Write-Log -Message "Wrote '$full' ($($Bytes.Length) bytes, sha256 $(Get-Sha256Hex -Bytes $Bytes))."
+        return
+    }
+
+    # The write failed. Is the live file still the previous file?
+    $unchanged = ([System.IO.File]::Exists($full) -and
+        (Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($full))) -ceq (Get-Sha256Hex -Bytes $previous) -and
+        (Get-Acl -LiteralPath $full).Sddl -ceq $sddlBefore)
+    if ($unchanged) {
+        try { [System.IO.File]::Delete($first.Backup) } catch { $null = $_ }
+        throw "Write-ConfFileAtomic: writing '$full' failed ($($first.Failure)). The file still holds its previous bytes."
+    }
+    $second = & $swap $previous $sddlBefore
+    if (-not $second.Failure) {
+        try { [System.IO.File]::Delete($second.Backup) } catch { $null = $_ }
+        try { [System.IO.File]::Delete($first.Backup) } catch { $null = $_ }
+        throw "Write-ConfFileAtomic: writing '$full' failed ($($first.Failure)). The previous bytes were put back."
+    }
+    $kept = ''
+    if ([System.IO.File]::Exists($first.Backup)) { $kept = " The previous file is kept as '$($first.Backup)'." }
+    throw "Write-ConfFileAtomic: writing '$full' failed ($($first.Failure)), and putting the previous bytes back also failed ($($second.Failure)).$kept"
+}
+
+# Copies the exact original bytes to <RunDir>\<filename>.before. A backup is never
+# overwritten.
+function Backup-ConfFile {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $RunDir
+    )
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $dest = Join-Path ([System.IO.Path]::GetFullPath($RunDir)) ([System.IO.Path]::GetFileName($full) + '.before')
+    if ([System.IO.File]::Exists($dest)) {
+        throw "Backup-ConfFile: '$dest' already exists. A backup is never overwritten."
+    }
+    $bytes = [System.IO.File]::ReadAllBytes($full)
+    [System.IO.File]::WriteAllBytes($dest, $bytes)
+    $hash = Get-Sha256Hex -Bytes $bytes
+    if ((Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($dest))) -cne $hash) {
+        throw "Backup-ConfFile: '$dest' does not hold the same bytes as '$full'."
+    }
+    Write-Log -Message "Backed up '$full' to '$dest' (sha256 $hash)."
+    return $dest
+}
+
+# Puts a run-folder backup back through Write-ConfFileAtomic. A run-folder file is never
+# moved or copied into the data folder: it would keep the run folder's ACL (SYSTEM and
+# Administrators only), and the PostgreSQL service could no longer read it.
+function Restore-ConfFile {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $BackupPath,
+        [Parameter(Mandatory = $true)][string] $ExpectedSddl
+    )
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $bytes = [System.IO.File]::ReadAllBytes($BackupPath)
+    if ([System.IO.File]::Exists($full) -and
+        (Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($full))) -ceq (Get-Sha256Hex -Bytes $bytes) -and
+        (Get-Acl -LiteralPath $full).Sddl -ceq $ExpectedSddl) {
+        Write-Log -Message "'$full' already holds the backup bytes. Nothing to restore."
+        return
+    }
+    Write-ConfFileAtomic -Path $full -Bytes $bytes -ExpectedSddl $ExpectedSddl
+    Write-Log -Message "Restored '$full' from '$BackupPath'." -Level 'OK'
+}
 #endregion ConfFiles
 
 #region PgHba

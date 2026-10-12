@@ -1904,6 +1904,245 @@ $t7StepMocks = {
 }
 [System.Environment]::SetEnvironmentVariable($t7EnvName, $null, 'Process')
 $script:Issues = New-Object System.Collections.ArrayList
+# --- Task 8: Config file byte IO and atomic write ---
+# Static rules for the config file routine (spec 7.8).
+& {
+    try {
+        $fnText = @{}
+        foreach ($fn in $ScriptAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+            $fnText[$fn.Name] = $fn.Extent.Text
+        }
+        Check 'T8 Restore-ConfFile exists and never moves or copies a file into the data folder' ($fnText.ContainsKey('Restore-ConfFile') -and $fnText['Restore-ConfFile'] -notmatch 'Move-Item|Copy-Item|::Move\(|::Copy\(') $true
+        Check 'T8 Restore-ConfFile writes through Write-ConfFileAtomic' ($fnText.ContainsKey('Restore-ConfFile') -and $fnText['Restore-ConfFile'] -match 'Write-ConfFileAtomic') $true
+        Check 'T8 Write-ConfFileAtomic swaps with [IO.File]::Replace' ($fnText.ContainsKey('Write-ConfFileAtomic') -and $fnText['Write-ConfFileAtomic'] -match '\[System\.IO\.File\]::Replace\(') $true
+        Check 'T8 Write-ConfFileAtomic never passes a null backup path to Replace' ($fnText.ContainsKey('Write-ConfFileAtomic') -and $fnText['Write-ConfFileAtomic'] -notmatch '::Replace\([^)]*\$null') $true
+        $ioText = ''
+        foreach ($name in @('Write-ConfFileAtomic', 'Backup-ConfFile', 'Restore-ConfFile')) {
+            if ($fnText.ContainsKey($name)) { $ioText += $fnText[$name] }
+        }
+        Check 'T8 config file writers never write text or a BOM' (($ioText.Length -gt 0) -and ($ioText -notmatch 'WriteAllText|Set-Content|Add-Content|UTF8')) $true
+    } catch {
+        Check 'T8 static checks ran without an error' $_.Exception.Message ''
+    }
+}
+
+# Latin-1 and SHA-256.
+& {
+    try {
+        $all = New-Object byte[] 256
+        for ($i = 0; $i -lt 256; $i++) { $all[$i] = [byte]$i }
+        $allText = ConvertFrom-Latin1Bytes -Bytes $all
+        Check 'T8 Latin-1 decode gives one char per byte' $allText.Length 256
+        Check 'T8 Latin-1 byte 0x80 decodes to U+0080' ([int]$allText[128]) 128
+        Check 'T8 Latin-1 byte 0xE9 decodes to U+00E9' ([int]$allText[233]) 233
+        $allBack = ConvertTo-Latin1Bytes -Text $allText
+        Check 'T8 Latin-1 encode returns one byte[]' ($allBack -is [byte[]]) $true
+        Check 'T8 Latin-1 round trip keeps all 256 byte values' (Get-Sha256Hex -Bytes $allBack) (Get-Sha256Hex -Bytes $all)
+        Check 'T8 Latin-1 decode of no bytes is empty' (ConvertFrom-Latin1Bytes -Bytes (New-Object byte[] 0)) ''
+        Check 'T8 Latin-1 encode of empty text gives no bytes' ((ConvertTo-Latin1Bytes -Text '').Length) 0
+        Throws 'T8 Latin-1 encode refuses a char above U+00FF' { ConvertTo-Latin1Bytes -Text ('euro ' + [char]0x20AC) }
+        Check 'T8 SHA-256 of abc' (Get-Sha256Hex -Bytes ([System.Text.Encoding]::ASCII.GetBytes('abc'))) 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+        Check 'T8 SHA-256 of no bytes' (Get-Sha256Hex -Bytes (New-Object byte[] 0)) 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    } catch {
+        Check 'T8 Latin-1 and SHA-256 checks ran without an error' $_.Exception.Message ''
+    }
+}
+
+# Read -> Split -> Join -> ConvertTo-Latin1Bytes keeps every byte (CRLF, LF, BOM,
+# CP1252 and UTF-8 bytes in comments).
+& {
+    try {
+        $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+        $dir = New-TestFolder 't8io'
+        # Two comments with non-ASCII bytes: CP1252 e-acute, euro and an undefined 0x9D,
+        # then UTF-8 e-acute and euro.
+        $body = {
+            param([string] $Eol)
+            ,([byte[]]($latin1.GetBytes("# pg_hba.conf fixture$Eol# CP1252: caf") + [byte[]](0xE9, 0x20, 0x80, 0x20, 0x9D) +
+                $latin1.GetBytes("$Eol# UTF-8: caf") + [byte[]](0xC3, 0xA9, 0x20, 0xE2, 0x82, 0xAC) +
+                $latin1.GetBytes("${Eol}host    all    all    127.0.0.1/32    sspi map=veeam$Eol")))
+        }
+        $roundTrip = {
+            param([string] $File)
+            $read = Read-ConfFile -Path $File
+            $text = Join-ConfLines -Lines @(Split-ConfLines -Text $read.Text) -LineEnding $read.LineEnding
+            ConvertTo-Latin1Bytes -Text $text
+        }
+
+        $crlf = Join-Path $dir 'crlf.conf'
+        $crlfBytes = & $body "`r`n"
+        [System.IO.File]::WriteAllBytes($crlf, $crlfBytes)
+        $read = Read-ConfFile -Path $crlf
+        Check 'T8 Read-ConfFile returns the full path' $read.Path ([System.IO.Path]::GetFullPath($crlf))
+        Check 'T8 Read-ConfFile keeps the raw bytes' (Get-Sha256Hex -Bytes $read.Bytes) (Get-Sha256Hex -Bytes $crlfBytes)
+        Check 'T8 Read-ConfFile Text is the Latin-1 text of the bytes' ($read.Text -ceq $latin1.GetString($crlfBytes)) $true
+        Check 'T8 Read-ConfFile finds CRLF' ($read.LineEnding -ceq "`r`n") $true
+        Check 'T8 Read-ConfFile finds no BOM' $read.HadBom $false
+        Check 'T8 Read-ConfFile records the SDDL' $read.Sddl ((Get-Acl -LiteralPath $crlf).Sddl)
+        $lines = @(Split-ConfLines -Text $read.Text)
+        Check 'T8 CRLF file splits into 4 lines' $lines.Count 4
+        Check 'T8 split lines carry no CR' (($lines -join '|').Contains("`r")) $false
+        Check 'T8 CRLF round trip is byte-exact' (Get-Sha256Hex -Bytes (& $roundTrip $crlf)) (Get-Sha256Hex -Bytes $crlfBytes)
+
+        $lf = Join-Path $dir 'lf.conf'
+        $lfBytes = & $body "`n"
+        [System.IO.File]::WriteAllBytes($lf, $lfBytes)
+        Check 'T8 Read-ConfFile finds LF' ((Read-ConfFile -Path $lf).LineEnding -ceq "`n") $true
+        Check 'T8 LF round trip is byte-exact' (Get-Sha256Hex -Bytes (& $roundTrip $lf)) (Get-Sha256Hex -Bytes $lfBytes)
+
+        $bom = Join-Path $dir 'bom.conf'
+        [System.IO.File]::WriteAllBytes($bom, [byte[]]([byte[]](0xEF, 0xBB, 0xBF) + $crlfBytes))
+        $bomRead = Read-ConfFile -Path $bom
+        Check 'T8 Read-ConfFile finds the BOM' $bomRead.HadBom $true
+        Check 'T8 Read-ConfFile keeps the BOM in Bytes' $bomRead.Bytes.Length ($crlfBytes.Length + 3)
+        Check 'T8 Read-ConfFile Text has no BOM' ($bomRead.Text -ceq $latin1.GetString($crlfBytes)) $true
+        Check 'T8 BOM file round trip drops only the BOM' (Get-Sha256Hex -Bytes (& $roundTrip $bom)) (Get-Sha256Hex -Bytes $crlfBytes)
+
+        $noFinal = Join-Path $dir 'nofinal.conf'
+        [System.IO.File]::WriteAllBytes($noFinal, $latin1.GetBytes("a`r`nb"))
+        Check 'T8 a missing final line break is added' (Get-Sha256Hex -Bytes (& $roundTrip $noFinal)) (Get-Sha256Hex -Bytes $latin1.GetBytes("a`r`nb`r`n"))
+
+        $mixed = Join-Path $dir 'mixed.conf'
+        [System.IO.File]::WriteAllBytes($mixed, $latin1.GetBytes("a`nb`r`nc`n"))
+        Check 'T8 the first line break decides the line ending' ((Read-ConfFile -Path $mixed).LineEnding -ceq "`n") $true
+        Check 'T8 mixed line endings become the first one' (Get-Sha256Hex -Bytes (& $roundTrip $mixed)) (Get-Sha256Hex -Bytes $latin1.GetBytes("a`nb`nc`n"))
+
+        $empty = Join-Path $dir 'empty.conf'
+        [System.IO.File]::WriteAllBytes($empty, (New-Object byte[] 0))
+        $emptyRead = Read-ConfFile -Path $empty
+        Check 'T8 empty file reads as empty text' $emptyRead.Text ''
+        Check 'T8 empty file round trip stays empty' ((& $roundTrip $empty).Length) 0
+
+        Check 'T8 split keeps an empty middle line' (@(Split-ConfLines -Text "a`r`n`r`nb`r`n") -join '|') 'a||b'
+        Check 'T8 split of empty text gives no lines' (@(Split-ConfLines -Text '').Count) 0
+        Check 'T8 split keeps a last line without a line break' (@(Split-ConfLines -Text "a`nb") -join '|') 'a|b'
+        Check 'T8 split removes only one CR' ((@(Split-ConfLines -Text "a`r`r`n"))[0] -ceq "a`r") $true
+        Check 'T8 join ends with one line ending' ((Join-ConfLines -Lines @('a', 'b') -LineEnding "`r`n") -ceq "a`r`nb`r`n") $true
+        Check 'T8 join of no lines is empty' (Join-ConfLines -Lines @() -LineEnding "`n") ''
+        Throws 'T8 join refuses a line ending that is not LF or CRLF' { Join-ConfLines -Lines @('a') -LineEnding "`r" }
+    } catch {
+        Check 'T8 read, split and join checks ran without an error' $_.Exception.Message ''
+    }
+}
+
+# Write-ConfFileAtomic keeps the SDDL, and puts the previous bytes back on any failure.
+& {
+    try {
+        $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+        $data = New-TestFolder 't8data'
+        $live = Join-Path $data 'pg_hba.conf'
+        [System.IO.File]::WriteAllBytes($live, $latin1.GetBytes("# original`r`nhost all all 127.0.0.1/32 scram-sha-256`r`n"))
+        # A distinctive ACL, like a real data folder file that this run did not create:
+        # owner and group SYSTEM, protected DACL with a NetworkService read entry. A new
+        # file in this folder gets none of these (owner Administrators, inherited DACL).
+        $acl = Get-Acl -LiteralPath $live
+        $acl.SetSecurityDescriptorSddlForm('O:SYG:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;NS)')
+        Set-Acl -LiteralPath $live -AclObject $acl
+        $sddl = (Get-Acl -LiteralPath $live).Sddl
+        Check 'T8 fixture ACL is distinctive' (($sddl -like 'O:SYG:SYD:PAI*') -and ($sddl -like '*;;;NS)*')) $true
+        $probe = Join-Path $data 'probe.bin'
+        [System.IO.File]::WriteAllBytes($probe, [byte[]](1))
+        Check 'T8 a new file in the folder gets another SDDL' ((Get-Acl -LiteralPath $probe).Sddl -cne $sddl) $true
+        [System.IO.File]::Delete($probe)
+        $others = { @(Get-ChildItem -LiteralPath $data -Force | Where-Object { $_.Name -ne 'pg_hba.conf' }).Count }
+
+        $new = $latin1.GetBytes("# new`r`nlocal all all sspi map=veeam`r`n")
+        Write-ConfFileAtomic -Path $live -Bytes $new -ExpectedSddl $sddl
+        Check 'T8 atomic write puts the new bytes in place' (Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($live))) (Get-Sha256Hex -Bytes $new)
+        Check 'T8 atomic write keeps owner, group and DACL' ((Get-Acl -LiteralPath $live).Sddl) $sddl
+        Check 'T8 atomic write leaves no temp or backup file' (& $others) 0
+        $wrote = "Wrote '$([System.IO.Path]::GetFullPath($live))'"
+        Check 'T8 atomic write logs the write' (@($script:LogLines | Where-Object { $_.Contains($wrote) }).Count -gt 0) $true
+
+        $before = [System.IO.File]::ReadAllBytes($live)
+        $other = $latin1.GetBytes("# other`r`n")
+        $err = ''
+        try { Write-ConfFileAtomic -Path $live -Bytes $other -ExpectedSddl 'O:BAG:BAD:PAI(A;;FA;;;BA)' } catch { $err = $_.Exception.Message }
+        Check 'T8 an SDDL mismatch throws and says the previous bytes were put back' ($err -like '*SDDL*previous bytes were put back*') $true
+        Check 'T8 after an SDDL mismatch the previous bytes are back' (Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($live))) (Get-Sha256Hex -Bytes $before)
+        Check 'T8 after an SDDL mismatch the SDDL is unchanged' ((Get-Acl -LiteralPath $live).Sddl) $sddl
+        Check 'T8 after an SDDL mismatch no temp or backup file is left' (& $others) 0
+
+        # Another process holds the file without delete sharing (like an AV scanner):
+        # File.Replace fails and the live file stays as it was.
+        $lock = [System.IO.File]::Open($live, 'Open', 'Read', 'ReadWrite')
+        $err = ''
+        try {
+            try { Write-ConfFileAtomic -Path $live -Bytes $other -ExpectedSddl $sddl } catch { $err = $_.Exception.Message }
+        } finally {
+            $lock.Dispose()
+        }
+        Check 'T8 a blocked swap throws and says the file is unchanged' ($err -like '*swap failed*still holds its previous bytes*') $true
+        Check 'T8 after a blocked swap the previous bytes are there' (Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($live))) (Get-Sha256Hex -Bytes $before)
+        Check 'T8 after a blocked swap no temp or backup file is left' (& $others) 0
+
+        $missing = Join-Path $data 'pg_ident.conf'
+        Throws 'T8 atomic write refuses a file that does not exist' { Write-ConfFileAtomic -Path $missing -Bytes $new -ExpectedSddl $sddl }
+        Check 'T8 a refused write creates nothing' (Test-Path -LiteralPath $missing) $false
+
+        $emptyBytes = New-Object byte[] 0
+        Write-ConfFileAtomic -Path $live -Bytes $emptyBytes -ExpectedSddl $sddl
+        Check 'T8 atomic write can write an empty file' ((Get-Item -LiteralPath $live).Length) 0
+        Write-ConfFileAtomic -Path $live -Bytes $before -ExpectedSddl $sddl
+
+        # The usual data folder case: the file has only ACEs inherited from a folder with
+        # its own ACL, and its owner and group are not this identity's defaults.
+        $inherit = New-TestFolder 't8inherit'
+        $folderAcl = Get-Acl -LiteralPath $inherit
+        $folderAcl.SetSecurityDescriptorSddlForm('D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;NS)', [System.Security.AccessControl.AccessControlSections]::Access)
+        Set-Acl -LiteralPath $inherit -AclObject $folderAcl
+        $inheritFile = Join-Path $inherit 'pg_hba.conf'
+        [System.IO.File]::WriteAllBytes($inheritFile, $latin1.GetBytes("host all all 127.0.0.1/32 md5`n"))
+        $fileAcl = Get-Acl -LiteralPath $inheritFile
+        $fileAcl.SetSecurityDescriptorSddlForm('O:SYG:SY', ([System.Security.AccessControl.AccessControlSections]'Owner, Group'))
+        Set-Acl -LiteralPath $inheritFile -AclObject $fileAcl
+        $inheritRead = Read-ConfFile -Path $inheritFile
+        Check 'T8 inherited fixture has only inherited ACEs' (($inheritRead.Sddl -like 'O:SYG:SYD:AI(A;ID;*') -and ($inheritRead.Sddl -notlike '*(A;;*')) $true
+        Write-ConfFileAtomic -Path $inheritFile -Bytes $new -ExpectedSddl $inheritRead.Sddl
+        Check 'T8 atomic write keeps an inherited ACL with its owner and group' ((Get-Acl -LiteralPath $inheritFile).Sddl) $inheritRead.Sddl
+        Check 'T8 atomic write on the inherited file puts the new bytes in place' (Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($inheritFile))) (Get-Sha256Hex -Bytes $new)
+    } catch {
+        Check 'T8 atomic write checks ran without an error' $_.Exception.Message ''
+    }
+}
+
+# Backup-ConfFile and Restore-ConfFile.
+& {
+    try {
+        $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+        $data = New-TestFolder 't8restore'
+        $run = New-TestFolder 't8run'
+        $runAcl = Get-Acl -LiteralPath $run
+        $runAcl.SetSecurityDescriptorSddlForm('D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)', [System.Security.AccessControl.AccessControlSections]::Access)
+        Set-Acl -LiteralPath $run -AclObject $runAcl
+        $live = Join-Path $data 'pg_ident.conf'
+        $original = [byte[]]($latin1.GetBytes("# caf") + [byte[]](0xE9) + $latin1.GetBytes("`r`nveeam `"SYSTEM@NT AUTHORITY`" postgres`r`n"))
+        [System.IO.File]::WriteAllBytes($live, $original)
+        $acl = Get-Acl -LiteralPath $live
+        $acl.SetSecurityDescriptorSddlForm('G:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;NS)', ([System.Security.AccessControl.AccessControlSections]'Group, Access'))
+        Set-Acl -LiteralPath $live -AclObject $acl
+        $sddl = (Get-Acl -LiteralPath $live).Sddl
+
+        $backup = Backup-ConfFile -Path $live -RunDir $run
+        Check 'T8 backup path is <RunDir>\<name>.before' $backup (Join-Path ([System.IO.Path]::GetFullPath($run)) 'pg_ident.conf.before')
+        Check 'T8 backup holds the exact original bytes' (Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($backup))) (Get-Sha256Hex -Bytes $original)
+        Check 'T8 backup file has the run folder ACL, not the live one' ((Get-Acl -LiteralPath $backup).Sddl -cne $sddl) $true
+        Throws 'T8 backup never overwrites an existing backup' { Backup-ConfFile -Path $live -RunDir $run }
+
+        Write-ConfFileAtomic -Path $live -Bytes ($latin1.GetBytes("veeam `"SYSTEM@NT AUTHORITY`" postgres`r`n")) -ExpectedSddl $sddl
+        Restore-ConfFile -Path $live -BackupPath $backup -ExpectedSddl $sddl
+        Check 'T8 restore puts the backup bytes back' (Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($live))) (Get-Sha256Hex -Bytes $original)
+        Check 'T8 restore keeps the live SDDL, not the run folder ACL' ((Get-Acl -LiteralPath $live).Sddl) $sddl
+        Check 'T8 restore leaves no temp or backup file in the data folder' (@(Get-ChildItem -LiteralPath $data -Force).Count) 1
+        $logCount = $script:LogLines.Count
+        Restore-ConfFile -Path $live -BackupPath $backup -ExpectedSddl $sddl
+        Check 'T8 restoring identical bytes writes nothing' (@($script:LogLines | Select-Object -Skip $logCount | Where-Object { $_ -like '*Nothing to restore*' }).Count) 1
+        Throws 'T8 restore with a wrong SDDL throws' { Restore-ConfFile -Path $live -BackupPath $backup -ExpectedSddl 'O:BAG:BAD:PAI(A;;FA;;;BA)' }
+        Check 'T8 a failed restore leaves the live bytes as they were' (Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($live))) (Get-Sha256Hex -Bytes $original)
+    } catch {
+        Check 'T8 backup and restore checks ran without an error' $_.Exception.Message ''
+    }
+}
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue
