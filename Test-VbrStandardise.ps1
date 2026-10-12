@@ -3484,6 +3484,135 @@ Check 'T13 stop source: never -Force' ($t13StopParams -contains 'Force') $false
     Check 'T13 settle: zero seconds is one read' (Test-ServiceStaysRunning -Name 'VeeamBackupSvc' -Seconds 0) $true
 }
 Check 'T13 settle: a missing service fails' (Test-ServiceStaysRunning -Name "NoSuchService-VbrStd-$PID" -Seconds 0) $false
+# --- Task 14: Registry switch, backup and restore ---
+
+Check 'T14 reg path: HKLM' (ConvertTo-RegExePath -KeyPath 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication') 'HKLM\SOFTWARE\Veeam\Veeam Backup and Replication'
+Check 'T14 reg path: HKCU, trailing slash' (ConvertTo-RegExePath -KeyPath 'HKCU:\Software\X\') 'HKCU\Software\X'
+Check 'T14 reg path: lower-case hive' (ConvertTo-RegExePath -KeyPath 'hklm:\software\x') 'HKLM\software\x'
+Check 'T14 reg path: provider path' (ConvertTo-RegExePath -KeyPath 'Microsoft.PowerShell.Core\Registry::HKEY_LOCAL_MACHINE\SOFTWARE\X') 'HKLM\SOFTWARE\X'
+Throws 'T14 reg path: file path refused' { ConvertTo-RegExePath -KeyPath 'C:\Windows' }
+Throws 'T14 reg path: other hive refused' { ConvertTo-RegExePath -KeyPath 'HKCR:\x' }
+
+$t14Db = [pscustomobject]@{ HostName = 'VBR01'; Port = 5432; DatabaseName = 'VeeamBackup'; UserName = 'postgres'; PasswordSet = $true; WindowsAuthRole = $null }
+$t14T = Get-RegistryTargets -DbConfig $t14Db -Addresses @('127.0.0.1', '::1')
+Check 'T14 targets: ordered dictionary' ($t14T -is [System.Collections.Specialized.OrderedDictionary]) $true
+Check 'T14 targets: names in order' (@($t14T.Keys) -join ',') 'SqlUserName,SqlSecuredPassword,PostgresUserForWindowsAuth,SqlHostName'
+Check 'T14 targets: values' (@($t14T.Values | ForEach-Object { "<$_>" }) -join '') '<><><postgres><127.0.0.1>'
+Check 'T14 targets: only ::1 listens' (Get-RegistryTargets -DbConfig $t14Db -Addresses @('::1'))['SqlHostName'] '::1'
+Check 'T14 targets: 127.0.0.1 preferred' (Get-RegistryTargets -DbConfig $t14Db -Addresses @('::1', '127.0.0.1'))['SqlHostName'] '127.0.0.1'
+$t14Win = [pscustomobject]@{ HostName = 'localhost'; WindowsAuthRole = 'postgres' }
+Check 'T14 targets: loopback host and postgres role kept' (@((Get-RegistryTargets -DbConfig $t14Win -Addresses @('127.0.0.1')).Keys) -join ',') 'SqlUserName,SqlSecuredPassword'
+$t14Case = @{ HostName = '::1'; WindowsAuthRole = 'Postgres' }
+Check 'T14 targets: role compared case-sensitively, ::1 kept' (@((Get-RegistryTargets -DbConfig $t14Case -Addresses @('::1')).Keys) -join ',') 'SqlUserName,SqlSecuredPassword,PostgresUserForWindowsAuth'
+
+# A throwaway copy of the spec 9 native-auth key, with PostgresUserForWindowsAuth absent
+# and a non-loopback SqlHostName so that every switch rule changes something. The key
+# names have spaces, like the real VBR key, so reg.exe quoting is exercised.
+$t14Root = "HKCU:\Software\VbrStdTest-$PID"
+$t14Vbr = "$t14Root\Veeam Backup and Replication"
+$t14Key = "$t14Vbr\DatabaseConfigurations\PostgreSql"
+$t14Names = @('SqlUserName', 'SqlSecuredPassword', 'PostgresUserForWindowsAuth', 'SqlHostName')
+$t14Lock = '<CLockInfo><Computer>VBR01</Computer><UserName>SYSTEM</UserName><Time>2026-10-01T10:00:00</Time></CLockInfo>'
+$t14Show = { param($Entry) "$($Entry.Exists)|$($Entry.Kind)|$($Entry.Data)" }
+try {
+    if (Test-Path -LiteralPath $t14Root) { Remove-Item -LiteralPath $t14Root -Recurse -Force }
+    $null = New-Item -Path $t14Key -Force
+    $null = New-ItemProperty -LiteralPath $t14Key -Name 'SqlDatabaseName' -Value 'VeeamBackup' -PropertyType String
+    $null = New-ItemProperty -LiteralPath $t14Key -Name 'SqlHostName' -Value 'VBR01' -PropertyType String
+    $null = New-ItemProperty -LiteralPath $t14Key -Name 'SqlHostPort' -Value 5432 -PropertyType DWord
+    $null = New-ItemProperty -LiteralPath $t14Key -Name 'SqlUserName' -Value 'postgres' -PropertyType String
+    $null = New-ItemProperty -LiteralPath $t14Key -Name 'SqlSecuredPassword' -Value 'AQAAANCM-fake' -PropertyType String
+    $null = New-ItemProperty -LiteralPath $t14Key -Name 'SqlLockInfo' -Value $t14Lock -PropertyType String
+    $t14LogStart = $script:LogLines.Count
+
+    $t14Snap = Get-RegistryValueSnapshot -KeyPath $t14Key -Names $t14Names
+    Check 'T14 snapshot: is a hashtable' ($t14Snap -is [hashtable]) $true
+    Check 'T14 snapshot: SqlUserName' (& $t14Show $t14Snap['SqlUserName']) 'True|String|postgres'
+    Check 'T14 snapshot: SqlSecuredPassword' (& $t14Show $t14Snap['SqlSecuredPassword']) 'True|String|AQAAANCM-fake'
+    Check 'T14 snapshot: PostgresUserForWindowsAuth absent' (& $t14Show $t14Snap['PostgresUserForWindowsAuth']) 'False||'
+    Check 'T14 snapshot: SqlHostName' (& $t14Show $t14Snap['SqlHostName']) 'True|String|VBR01'
+    Check 'T14 snapshot: DWord kind' (& $t14Show (Get-RegistryValueSnapshot -KeyPath $t14Key -Names @('SqlHostPort'))['SqlHostPort']) 'True|DWord|5432'
+    Check 'T14 snapshot: missing key reads as absent' (& $t14Show (Get-RegistryValueSnapshot -KeyPath "$t14Root\No Such Key" -Names @('A'))['A']) 'False||'
+
+    $t14Run = New-TestFolder 'reg'
+    $t14Backup = Save-RegistryBackup -KeyPath $t14Key -ExportKeyPath $t14Vbr -RunDir $t14Run -Snapshot $t14Snap
+    Check 'T14 backup: json path' $t14Backup.JsonPath (Join-Path $t14Run 'registry-before.json')
+    Check 'T14 backup: reg path' $t14Backup.RegPath (Join-Path $t14Run 'vbr-key.reg')
+    $t14Doc = [IO.File]::ReadAllText($t14Backup.JsonPath) | ConvertFrom-Json
+    Check 'T14 backup: json keeps the old password data' $t14Doc.Values.SqlSecuredPassword.Data 'AQAAANCM-fake'
+    Check 'T14 backup: json present value' "$($t14Doc.Values.SqlUserName.State)|$($t14Doc.Values.SqlUserName.Kind)|$($t14Doc.Values.SqlUserName.Data)" 'present|String|postgres'
+    Check 'T14 backup: json absent value' $t14Doc.Values.PostgresUserForWindowsAuth.State 'absent'
+    Check 'T14 backup: json export key in reg.exe form' $t14Doc.ExportKey "HKCU\Software\VbrStdTest-$PID\Veeam Backup and Replication"
+    Check 'T14 backup: reg export not empty' ((Get-Item -LiteralPath $t14Backup.RegPath).Length -gt 0) $true
+    $t14RegText = [IO.File]::ReadAllText($t14Backup.RegPath)
+    Check 'T14 backup: reg export holds the key' ($t14RegText.Contains("VbrStdTest-$PID\Veeam Backup and Replication\DatabaseConfigurations\PostgreSql")) $true
+    Check 'T14 backup: reg export holds the values' ($t14RegText.Contains('"SqlSecuredPassword"="AQAAANCM-fake"')) $true
+    $t14Run2 = New-TestFolder 'reg'
+    $t14Backup2 = Save-RegistryBackup -KeyPath $t14Key -ExportKeyPath (ConvertTo-RegExePath -KeyPath $t14Vbr) -RunDir $t14Run2 -Snapshot $t14Snap
+    Check 'T14 backup: reg.exe form export key accepted' (Test-Path -LiteralPath $t14Backup2.RegPath) $true
+    $t14Run3 = New-TestFolder 'reg'
+    Throws 'T14 backup: throws when the export fails' { Save-RegistryBackup -KeyPath $t14Key -ExportKeyPath "$t14Root\No Such Key" -RunDir $t14Run3 -Snapshot $t14Snap }
+    Check 'T14 backup: no empty export left behind' (Test-Path -LiteralPath (Join-Path $t14Run3 'vbr-key.reg')) $false
+    Throws 'T14 backup: throws when the run folder is missing' { Save-RegistryBackup -KeyPath $t14Key -ExportKeyPath $t14Vbr -RunDir (Join-Path $t14Run3 'missing') -Snapshot $t14Snap }
+
+    Set-RegistryTargets -KeyPath $t14Key -Targets (Get-RegistryTargets -DbConfig $t14Db -Addresses @('127.0.0.1'))
+    $t14After = Get-RegistryValueSnapshot -KeyPath $t14Key -Names ($t14Names + @('SqlHostPort', 'SqlLockInfo', 'SqlDatabaseName'))
+    Check 'T14 switch: SqlUserName empty String' (& $t14Show $t14After['SqlUserName']) 'True|String|'
+    Check 'T14 switch: SqlSecuredPassword empty String' (& $t14Show $t14After['SqlSecuredPassword']) 'True|String|'
+    Check 'T14 switch: PostgresUserForWindowsAuth created' (& $t14Show $t14After['PostgresUserForWindowsAuth']) 'True|String|postgres'
+    Check 'T14 switch: SqlHostName loopback' (& $t14Show $t14After['SqlHostName']) 'True|String|127.0.0.1'
+    Check 'T14 switch: SqlHostPort untouched' (& $t14Show $t14After['SqlHostPort']) 'True|DWord|5432'
+    Check 'T14 switch: SqlLockInfo untouched' (& $t14Show $t14After['SqlLockInfo']) "True|String|$t14Lock"
+    Check 'T14 switch: SqlDatabaseName untouched' (& $t14Show $t14After['SqlDatabaseName']) 'True|String|VeeamBackup'
+    & {
+        function New-ItemProperty { [CmdletBinding()] param([string] $LiteralPath, [string] $Name, $Value, [string] $PropertyType, [switch] $Force) }
+        Throws 'T14 switch: throws when a value does not read back' { Set-RegistryTargets -KeyPath $t14Key -Targets ([ordered]@{ SqlHostName = '::1' }) }
+    }
+    Throws 'T14 switch: throws when the key is missing' { Set-RegistryTargets -KeyPath "$t14Root\No Such Key" -Targets ([ordered]@{ SqlUserName = '' }) }
+
+    $t14LogMark = $script:LogLines.Count
+    Check 'T14 restore: direct restore succeeds' (Restore-RegistrySnapshot -KeyPath $t14Key -Snapshot $t14Snap -RegExportPath $t14Backup.RegPath) $true
+    $t14Back = Get-RegistryValueSnapshot -KeyPath $t14Key -Names $t14Names
+    foreach ($t14Name in $t14Names) {
+        Check "T14 restore: $t14Name round-trips" (& $t14Show $t14Back[$t14Name]) (& $t14Show $t14Snap[$t14Name])
+    }
+    Check 'T14 restore: value absent before is deleted' ($t14Back['PostgresUserForWindowsAuth'].Exists) $false
+    Check 'T14 restore: no reg import needed' (@($script:LogLines | Select-Object -Skip $t14LogMark | Where-Object { $_ -like '*Imported the reg.exe export*' }).Count) 0
+
+    # Fallback: the direct writes and the first delete fail, so the export is imported
+    # and the value that was absent is deleted after the import.
+    Set-RegistryTargets -KeyPath $t14Key -Targets (Get-RegistryTargets -DbConfig $t14Db -Addresses @('127.0.0.1'))
+    $t14LogMark = $script:LogLines.Count
+    & {
+        $t14Removals = @{ N = 0 }
+        function New-ItemProperty { [CmdletBinding()] param([string] $LiteralPath, [string] $Name, $Value, [string] $PropertyType, [switch] $Force) }
+        function Remove-ItemProperty {
+            [CmdletBinding()] param([string] $LiteralPath, [string] $Name)
+            $t14Removals.N++
+            if ($t14Removals.N -gt 1) { Microsoft.PowerShell.Management\Remove-ItemProperty -LiteralPath $LiteralPath -Name $Name -ErrorAction Stop }
+        }
+        Check 'T14 fallback: restore succeeds through reg import' (Restore-RegistrySnapshot -KeyPath $t14Key -Snapshot $t14Snap -RegExportPath $t14Backup.RegPath) $true
+        Check 'T14 fallback: absent value deleted after the import' $t14Removals.N 2
+    }
+    $t14Back = Get-RegistryValueSnapshot -KeyPath $t14Key -Names $t14Names
+    foreach ($t14Name in $t14Names) {
+        Check "T14 fallback: $t14Name round-trips" (& $t14Show $t14Back[$t14Name]) (& $t14Show $t14Snap[$t14Name])
+    }
+    Check 'T14 fallback: import logged' (@($script:LogLines | Select-Object -Skip $t14LogMark | Where-Object { $_ -like '*Imported the reg.exe export*' }).Count) 1
+
+    # Without a usable export the restore reports failure instead of throwing.
+    Set-RegistryTargets -KeyPath $t14Key -Targets (Get-RegistryTargets -DbConfig $t14Db -Addresses @('127.0.0.1'))
+    & {
+        function New-ItemProperty { [CmdletBinding()] param([string] $LiteralPath, [string] $Name, $Value, [string] $PropertyType, [switch] $Force) }
+        Check 'T14 fallback: no export path gives false' (Restore-RegistrySnapshot -KeyPath $t14Key -Snapshot $t14Snap) $false
+        Check 'T14 fallback: missing export file gives false' (Restore-RegistrySnapshot -KeyPath $t14Key -Snapshot $t14Snap -RegExportPath (Join-Path $t14Run3 'none.reg')) $false
+    }
+    Check 'T14 restore: real restore after the failed ones' (Restore-RegistrySnapshot -KeyPath $t14Key -Snapshot $t14Snap) $true
+    Check 'T14 log: never holds the password data' (@($script:LogLines | Select-Object -Skip $t14LogStart | Where-Object { $_ -like '*AQAAANCM*' }).Count) 0
+} finally {
+    if (Test-Path -LiteralPath $t14Root) { Remove-Item -LiteralPath $t14Root -Recurse -Force }
+}
+Check 'T14 cleanup: throwaway key removed' (Test-Path -LiteralPath $t14Root) $false
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue

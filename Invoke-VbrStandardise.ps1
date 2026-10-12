@@ -3740,6 +3740,222 @@ function Test-ServiceStaysRunning {
 #endregion Services
 
 #region Registry
+# Read each named value of one key as { Exists; Kind; Data }. Data is exactly what
+# the registry holds (REG_EXPAND_SZ is not expanded), so a restore writes the same
+# bytes back. A missing key reads as every value absent. Never log Data: for
+# SqlSecuredPassword it is the DPAPI blob (spec 9).
+function Get-RegistryValueSnapshot {
+    param(
+        [Parameter(Mandatory)][string] $KeyPath,
+        [Parameter(Mandatory)][string[]] $Names
+    )
+    $result = @{}
+    $item = Get-Item -LiteralPath $KeyPath -ErrorAction SilentlyContinue
+    $present = @()
+    if ($item) { $present = @($item.GetValueNames()) }
+    foreach ($name in @($Names | Where-Object { $_ })) {
+        if ($present -contains $name) {
+            $result[$name] = [pscustomobject]@{
+                Exists = $true
+                Kind   = "$($item.GetValueKind($name))"
+                Data   = $item.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            }
+        } else {
+            $result[$name] = [pscustomobject]@{ Exists = $false; Kind = ''; Data = $null }
+        }
+    }
+    return $result
+}
+
+# reg.exe wants HKLM\SOFTWARE\X where PowerShell uses HKLM:\SOFTWARE\X (HKCU is for the tests).
+function ConvertTo-RegExePath {
+    param([Parameter(Mandatory)][string] $KeyPath)
+    $path = $KeyPath.Trim().TrimEnd('\')
+    if ($path -match '^(?i)(HKLM|HKCU):\\(.+)$') { return ($Matches[1].ToUpperInvariant() + '\' + $Matches[2]) }
+    if ($path -match '^(?i)(?:Microsoft\.PowerShell\.Core\\)?Registry::HKEY_LOCAL_MACHINE\\(.+)$') { return ('HKLM\' + $Matches[1]) }
+    if ($path -match '^(?i)(?:Microsoft\.PowerShell\.Core\\)?Registry::HKEY_CURRENT_USER\\(.+)$') { return ('HKCU\' + $Matches[1]) }
+    throw "Unsupported registry path for reg.exe: $KeyPath"
+}
+
+# Path B step 4: registry-before.json (every value the switch will change, with its
+# old kind and data, or "absent") and a reg.exe export of ExportKeyPath, both in the
+# protected run folder. No verified export means no change, so this throws.
+function Save-RegistryBackup {
+    param(
+        [Parameter(Mandatory)][string] $KeyPath,
+        [Parameter(Mandatory)][string] $ExportKeyPath,
+        [Parameter(Mandatory)][string] $RunDir,
+        [Parameter(Mandatory)][hashtable] $Snapshot
+    )
+    if (-not (Test-Path -LiteralPath $RunDir -PathType Container)) { throw "Run folder $RunDir does not exist" }
+    if ($ExportKeyPath -match '^(?i)(HKLM|HKCU)\\.+') { $nativeKey = $ExportKeyPath.Trim().TrimEnd('\') }
+    else { $nativeKey = ConvertTo-RegExePath -KeyPath $ExportKeyPath }
+    $jsonPath = Join-Path $RunDir 'registry-before.json'
+    $regPath = Join-Path $RunDir 'vbr-key.reg'
+
+    $values = [ordered]@{}
+    foreach ($name in @($Snapshot.Keys | ForEach-Object { "$_" } | Sort-Object)) {
+        $entry = $Snapshot[$name]
+        if ($entry.Exists) {
+            $values[$name] = [ordered]@{ State = 'present'; Kind = "$($entry.Kind)"; Data = $entry.Data }
+        } else {
+            $values[$name] = [ordered]@{ State = 'absent'; Kind = ''; Data = $null }
+        }
+    }
+    $doc = [ordered]@{
+        KeyPath   = $KeyPath
+        ExportKey = $nativeKey
+        RegExport = $regPath
+        Time      = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssK')
+        Values    = $values
+    }
+    Write-AtomicJson -Path $jsonPath -Object $doc
+    if (-not (Test-Path -LiteralPath $jsonPath -PathType Leaf)) { throw "registry-before.json was not written to $RunDir" }
+
+    if (Test-Path -LiteralPath $regPath) { Remove-Item -LiteralPath $regPath -Force -ErrorAction Stop }
+    $regExe = Join-Path $env:SystemRoot 'System32\reg.exe'
+    $export = Invoke-Native -FilePath $regExe -Arguments @('export', $nativeKey, $regPath, '/y')
+    $length = 0
+    if (Test-Path -LiteralPath $regPath -PathType Leaf) { $length = (Get-Item -LiteralPath $regPath).Length }
+    if ($export.ExitCode -ne 0 -or $length -le 0) {
+        throw "reg.exe export of $nativeKey failed (exit $($export.ExitCode), $length bytes): $(Format-ShortText -Text $export.StdErr -MaxLength 300)"
+    }
+    Write-Log -Message "Registry backup: $jsonPath and $regPath ($length bytes)" -Level 'OK'
+    return [pscustomobject]@{ JsonPath = $jsonPath; RegPath = $regPath }
+}
+
+# The values the switch writes (spec 9). SqlUserName and SqlSecuredPassword always
+# become empty Strings (DBConfig keeps them as empty values, so they are not deleted).
+# PostgresUserForWindowsAuth only when it is not exactly 'postgres' (role names are
+# case-sensitive). SqlHostName only when it is not already a loopback name.
+function Get-RegistryTargets {
+    param(
+        [Parameter(Mandatory)] $DbConfig,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][string[]] $Addresses
+    )
+    $targets = [ordered]@{}
+    $targets['SqlUserName'] = ''
+    $targets['SqlSecuredPassword'] = ''
+    $role = "$(Get-CfgValue -Object $DbConfig -Name 'WindowsAuthRole' -Default '')"
+    if ($role -cne 'postgres') { $targets['PostgresUserForWindowsAuth'] = 'postgres' }
+    $hostName = "$(Get-CfgValue -Object $DbConfig -Name 'HostName' -Default '')"
+    if (@('127.0.0.1', '::1', 'localhost') -notcontains $hostName) {
+        $listening = @($Addresses | Where-Object { $_ })
+        if ($listening -notcontains '127.0.0.1' -and $listening -contains '::1') { $targets['SqlHostName'] = '::1' }
+        else { $targets['SqlHostName'] = '127.0.0.1' }
+    }
+    return $targets
+}
+
+# Path B step 8: write every target as a String, then read every one back. Values not
+# in Targets (SqlLockInfo, SqlHostPort, SqlDatabaseName) are never touched.
+function Set-RegistryTargets {
+    param(
+        [Parameter(Mandatory)][string] $KeyPath,
+        [Parameter(Mandatory)][System.Collections.IDictionary] $Targets
+    )
+    if (-not (Test-Path -LiteralPath $KeyPath)) { throw "Registry key $KeyPath does not exist" }
+    $names = @($Targets.Keys | ForEach-Object { "$_" })
+    foreach ($name in $names) {
+        $value = [string]$Targets[$name]
+        $null = New-ItemProperty -LiteralPath $KeyPath -Name $name -Value $value -PropertyType String -Force -ErrorAction Stop
+        if ($name -like '*Password*') {
+            if ($value) { $shown = '(set)' } else { $shown = '(empty)' }
+        } else { $shown = "'$value'" }
+        Write-Log -Message "  registry: $name = $shown" -Level 'INFO'
+    }
+    $after = Get-RegistryValueSnapshot -KeyPath $KeyPath -Names $names
+    $wrong = @()
+    foreach ($name in $names) {
+        $have = $after[$name]
+        if (-not $have.Exists -or "$($have.Kind)" -ne 'String' -or "$($have.Data)" -cne [string]$Targets[$name]) { $wrong += $name }
+    }
+    if ($wrong.Count -gt 0) { throw "Registry values did not read back as written: $($wrong -join ', ')" }
+    Write-Log -Message "Registry switched: $($names -join ', ')" -Level 'OK'
+}
+
+# Path B rollback step 3 (spec 7.6): write each old value back with its old kind and
+# delete each value that was absent, then read every value back and compare kind and
+# data. If any differs, import the reg.exe export (it only adds and overwrites), delete
+# the absent values again, and compare again. Returns $false, never throws, when the
+# registry still differs; the caller turns that into exit 50.
+function Restore-RegistrySnapshot {
+    param(
+        [Parameter(Mandatory)][string] $KeyPath,
+        [Parameter(Mandatory)][hashtable] $Snapshot,
+        [string] $RegExportPath = ''
+    )
+    $names = @($Snapshot.Keys | ForEach-Object { "$_" } | Sort-Object)
+    $removeAbsent = {
+        foreach ($name in $names) {
+            if ($Snapshot[$name].Exists) { continue }
+            try {
+                $item = Get-Item -LiteralPath $KeyPath -ErrorAction SilentlyContinue
+                if ($item -and (@($item.GetValueNames()) -contains $name)) {
+                    Remove-ItemProperty -LiteralPath $KeyPath -Name $name -ErrorAction Stop
+                }
+            } catch {
+                Write-Log -Message "  could not delete registry value ${name}: $(Format-ShortText -Text $_.Exception.Message -MaxLength 200)" -Level 'WARN'
+            }
+        }
+    }
+    $findWrong = {
+        $current = Get-RegistryValueSnapshot -KeyPath $KeyPath -Names $names
+        foreach ($name in $names) {
+            $want = $Snapshot[$name]
+            $have = $current[$name]
+            if ([bool]$want.Exists -ne [bool]$have.Exists) { $name; continue }
+            if (-not $want.Exists) { continue }
+            if ("$($want.Kind)" -ne "$($have.Kind)") { $name; continue }
+            $a = @($want.Data | ForEach-Object { "$_" })
+            $b = @($have.Data | ForEach-Object { "$_" })
+            if ($a.Count -ne $b.Count) { $name; continue }
+            for ($i = 0; $i -lt $a.Count; $i++) {
+                if ($a[$i] -cne $b[$i]) { $name; break }
+            }
+        }
+    }
+    try {
+        foreach ($name in $names) {
+            $entry = $Snapshot[$name]
+            if (-not $entry.Exists) { continue }
+            try {
+                $null = New-ItemProperty -LiteralPath $KeyPath -Name $name -Value $entry.Data -PropertyType "$($entry.Kind)" -Force -ErrorAction Stop
+            } catch {
+                Write-Log -Message "  could not write registry value ${name}: $(Format-ShortText -Text $_.Exception.Message -MaxLength 200)" -Level 'WARN'
+            }
+        }
+        & $removeAbsent
+        $wrong = @(& $findWrong)
+        if ($wrong.Count -eq 0) {
+            Write-Log -Message 'Registry values restored from the snapshot' -Level 'OK'
+            return $true
+        }
+        Write-Log -Message "Registry values still differ after the restore: $($wrong -join ', ')" -Level 'WARN'
+        if (-not $RegExportPath -or -not (Test-Path -LiteralPath $RegExportPath -PathType Leaf)) {
+            Write-Log -Message 'No reg.exe export to import; the registry was not restored' -Level 'ERROR'
+            return $false
+        }
+        $regExe = Join-Path $env:SystemRoot 'System32\reg.exe'
+        $import = Invoke-Native -FilePath $regExe -Arguments @('import', $RegExportPath)
+        if ($import.ExitCode -ne 0) {
+            Write-Log -Message "reg.exe import of $RegExportPath failed (exit $($import.ExitCode)): $(Format-ShortText -Text $import.StdErr -MaxLength 300)" -Level 'WARN'
+        } else {
+            Write-Log -Message "Imported the reg.exe export $RegExportPath" -Level 'INFO'
+        }
+        & $removeAbsent
+        $wrong = @(& $findWrong)
+        if ($wrong.Count -eq 0) {
+            Write-Log -Message 'Registry values restored from the reg.exe export' -Level 'OK'
+            return $true
+        }
+        Write-Log -Message "Registry values still differ after the reg.exe import: $($wrong -join ', ')" -Level 'ERROR'
+        return $false
+    } catch {
+        Write-Log -Message "Registry restore failed: $(Format-ShortText -Text $_.Exception.Message -MaxLength 300)" -Level 'ERROR'
+        return $false
+    }
+}
 #endregion Registry
 
 #region ConnectCheck
