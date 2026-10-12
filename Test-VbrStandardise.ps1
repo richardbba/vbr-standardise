@@ -2229,8 +2229,34 @@ $T9Prefix = "# [VbrStandardise $T9Stamp] "
         Check 'T9 quotes keep a token whole and are removed' (@(Split-ConfTokens -Line 'veeam   "SYSTEM@NT AUTHORITY"   postgres') -join '|') 'veeam|SYSTEM@NT AUTHORITY|postgres'
         Check 'T9 # inside quotes is not a comment' (@(Split-ConfTokens -Line 'host all "a#b" 10.0.0.0/8 md5') -join '|') 'host|all|a#b|10.0.0.0/8|md5'
         Check 'T9 a non-breaking space is not a separator' (@(Split-ConfTokens -Line ('a' + [char]0xA0 + 'b c')).Count) 2
+        Check 'T9 whitespace after a comma keeps a list in one token' (@(Split-ConfTokens -Line 'host all other, postgres 127.0.0.1/32 md5') -join '|') 'host|all|other,postgres|127.0.0.1/32|md5'
+        Check 'T9 whitespace after a comma also joins quoted list items' (@(Split-ConfTokens -Line 'host "VeeamBackup",   other all 127.0.0.1/32 md5') -join '|') 'host|VeeamBackup,other|all|127.0.0.1/32|md5'
+        Check 'T9 a comma inside quotes does not join the next token' (@(Split-ConfTokens -Line 'host all "a," b md5') -join '|') 'host|all|a,|b|md5'
+        Check 'T9 a trailing comma before a comment stays on its token' (@(Split-ConfTokens -Line 'host all other, # c') -join '|') 'host|all|other,'
     } catch {
         Check 'T9 token checks ran without an error' $_.Exception.Message ''
+    }
+}
+
+# Get-ConfLogicalLines.
+& {
+    try {
+        $join = @(Get-ConfLogicalLines -Lines @('host all \', 'postgres 127.0.0.1/32 md5', 'host all all ::1/128 sspi'))
+        Check 'T9 a trailing backslash joins the next line' ('{0}|{1}|{2}' -f $join.Count, $join[0].LineIndex, $join[0].Text) '2|0|host all postgres 127.0.0.1/32 md5'
+        Check 'T9 the line after a joined pair keeps its own line index' $join[1].LineIndex 2
+        $chain = @(Get-ConfLogicalLines -Lines @('host all \', 'postgres \', '127.0.0.1/32 md5', 'local all all peer'))
+        Check 'T9 a chain of backslash lines is one line' ('{0}|{1}|{2}' -f $chain.Count, $chain[0].Text, $chain[1].LineIndex) '2|host all postgres 127.0.0.1/32 md5|3'
+        $comment = @(Get-ConfLogicalLines -Lines @('# data is in C:\pgdata\', 'host all all 127.0.0.1/32 md5'))
+        Check 'T9 a comment ending in a backslash does not swallow the next line' ('{0}|{1}' -f $comment.Count, $comment[1].Text) '2|host all all 127.0.0.1/32 md5'
+        $last = @(Get-ConfLogicalLines -Lines @('local all all md5 \'))
+        Check 'T9 a backslash on the last line is dropped' ('{0}|{1}' -f $last.Count, $last[0].Text) '1|local all all md5 '
+        $blanks = @(Get-ConfLogicalLines -Lines @('local all all md5 \ ', 'host all all ::1/128 md5'))
+        Check 'T9 a backslash followed by a blank is not a continuation' $blanks.Count 2
+        $inner = @(Get-ConfLogicalLines -Lines @('host all DOM\bob 127.0.0.1/32 md5'))
+        Check 'T9 a backslash inside a line is an ordinary character' $inner[0].Text 'host all DOM\bob 127.0.0.1/32 md5'
+        Check 'T9 no lines give no logical lines' (@(Get-ConfLogicalLines -Lines @()).Count) 0
+    } catch {
+        Check 'T9 logical line checks ran without an error' $_.Exception.Message ''
     }
 }
 
@@ -2256,6 +2282,9 @@ $T9Prefix = "# [VbrStandardise $T9Stamp] "
         $include = @(Get-PgHbaRules -Lines @('include_dir conf.d'))
         Check 'T9 an include line is still a rule' ('{0}|{1}' -f $include[0].Type, $include[0].Database) 'include_dir|conf.d'
         Check 'T9 no rules from comments only' (@(Get-PgHbaRules -Lines @('# nothing', '')).Count) 0
+        $cont = @(Get-PgHbaRules -Lines @('host all \', 'postgres 127.0.0.1/32 md5', 'host all all 127.0.0.1/32 sspi map=veeam'))
+        Check 'T9 a backslash-continued line is one rule with the first line index' ('{0}|{1}|{2}|{3}|{4}|{5}' -f $cont.Count, $cont[0].Database, $cont[0].User, $cont[0].Address, $cont[0].Method, $cont[0].LineIndex) '2|all|postgres|127.0.0.1/32|md5|0'
+        Check 'T9 the rule after a continued line keeps its own line index' $cont[1].LineIndex 2
 
         Check 'T9 stock native file has no include' (Test-PgHbaHasInclude -Lines @(Split-ConfLines -Text $T9Native)) $false
         Check 'T9 Veeam default file has no include' (Test-PgHbaHasInclude -Lines @(Split-ConfLines -Text $T9Veeam)) $false
@@ -2265,6 +2294,7 @@ $T9Prefix = "# [VbrStandardise $T9Stamp] "
         Check 'T9 @file in the user column is an include' (Test-PgHbaHasInclude -Lines @($T9AtFile)) $true
         Check 'T9 @file inside a comma list is an include' (Test-PgHbaHasInclude -Lines @('host VeeamBackup,@dbs.txt all 127.0.0.1/32 md5')) $true
         Check 'T9 a commented include is not an include' (Test-PgHbaHasInclude -Lines @('# include_dir conf.d')) $false
+        Check 'T9 an include keyword split by a backslash is an include' (Test-PgHbaHasInclude -Lines @('inc\', 'lude "extra.conf"')) $true
     } catch {
         Check 'T9 rule parsing checks ran without an error' $_.Exception.Message ''
     }
@@ -2351,12 +2381,14 @@ $T9Prefix = "# [VbrStandardise $T9Stamp] "
         Check 'T9 hostssl counts as a match' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1').LineIndex 0
         $rules = @(Get-PgHbaRules -Lines @('host all pg_native_admin 127.0.0.1/32 md5', 'host all all 127.0.0.1/32 sspi map=veeam'))
         Check 'T9 another user name does not match' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1').LineIndex 1
-        $rules = @(Get-PgHbaRules -Lines @('host all all 10.1.1.1 sspi map=veeam', 'host all all 127.0.0.1/32 md5'))
-        Check 'T9 a bare IPv4 address is one host, not every host' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1').LineIndex 1
-        $rules = @(Get-PgHbaRules -Lines @('host all all ::1 sspi map=veeam', 'host all all 127.0.0.1/32 md5'))
-        Check 'T9 a bare IPv6 address is one host, not every host' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1').LineIndex 1
-        $rules = @(Get-PgHbaRules -Lines @('host all all 127.0.0.1 sspi map=veeam'))
-        Check 'T9 a bare IPv4 address matches its own client' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1').LineIndex 0
+        $rules = @(Get-PgHbaRules -Lines @('host all other, postgres 127.0.0.1/32 md5', 'host all all 127.0.0.1/32 sspi map=veeam'))
+        Check 'T9 a space after a comma keeps a user list whole' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1').LineIndex 0
+        Check 'T9 a space after a comma: a user outside the list skips the line' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'someone' -Address '127.0.0.1').LineIndex 1
+        $rules = @(Get-PgHbaRules -Lines @('host VeeamBackup, other all 127.0.0.1/32 md5', 'host all all 127.0.0.1/32 sspi map=veeam'))
+        Check 'T9 a space after a comma keeps a database list whole' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1').LineIndex 0
+        $rules = @(Get-PgHbaRules -Lines @('host all \', 'postgres 127.0.0.1/32 md5', 'host all all 127.0.0.1/32 sspi map=veeam'))
+        $hit = Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1'
+        Check 'T9 a backslash-continued line is the first match, not the sspi line after it' ('{0}|{1}' -f $hit.LineIndex, $hit.Method) '0|md5'
         Throws 'T9 a client address that is not an IP throws' { Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address 'localhost' }
     } catch {
         Check 'T9 first-match checks ran without an error' $_.Exception.Message ''
@@ -2411,6 +2443,10 @@ host    replication     all             ::1/128                 sspi map=veeam
         $lanOut = @(Split-ConfLines -Text (New-PgHbaText -Lines @(Split-ConfLines -Text $T9Lan) -LineEnding "`r`n" -Stamp $T9Stamp))
         Check 'T9 the LAN line is commented out' ($lanOut -ccontains ($T9Prefix + 'host    all             all             10.0.0.0/24             scram-sha-256')) $true
         Check 'T9 rendered LAN file has no non-loopback rule' (@(Get-NonLoopbackHbaRules -Rules @(Get-PgHbaRules -Lines $lanOut)).Count) 0
+
+        $contOut = @(Split-ConfLines -Text (New-PgHbaText -Lines @('host all \', 'postgres 127.0.0.1/32 md5') -LineEnding "`n" -Stamp $T9Stamp))
+        Check 'T9 a backslash-continued original is commented out line by line' (($contOut[7] -ceq ($T9Prefix + 'host all \')) -and ($contOut[8] -ceq ($T9Prefix + 'postgres 127.0.0.1/32 md5'))) $true
+        Check 'T9 a rendered backslash-continued original leaves the file standard' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines $contOut)) $true
 
         # CP1252 and UTF-8 bytes in a comment line and in an active line's trailing
         # comment survive byte for byte; only the ASCII prefix is added.

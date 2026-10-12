@@ -2502,14 +2502,16 @@ function Restore-ConfFile {
 #region PgHba
 # Splits one pg_hba.conf or pg_ident.conf line into tokens. Space, tab, CR and LF
 # separate tokens (PostgreSQL's blanks; a Latin-1 0xA0 is not one). Double quotes keep
-# a token whole and are removed. '#' outside quotes starts a comment. Callers wrap the
-# result in @().
+# a token whole and are removed. '#' outside quotes starts a comment. Blanks after an
+# unquoted comma do not end the token, so 'a, b' is the one list 'a,b', as in
+# PostgreSQL. Callers wrap the result in @().
 function Split-ConfTokens {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string] $Line)
     $tokens = New-Object System.Collections.Generic.List[string]
     $current = New-Object System.Text.StringBuilder
     $inQuote = $false
     $hasToken = $false
+    $afterComma = $false
     foreach ($ch in $Line.ToCharArray()) {
         if ($inQuote) {
             if ($ch -eq [char]34) { $inQuote = $false } else { [void]$current.Append($ch) }
@@ -2518,10 +2520,12 @@ function Split-ConfTokens {
         if ($ch -eq [char]34) {
             $inQuote = $true
             $hasToken = $true
+            $afterComma = $false
             continue
         }
         if ($ch -eq [char]35) { break }
         if ($ch -eq [char]32 -or $ch -eq [char]9 -or $ch -eq [char]13 -or $ch -eq [char]10) {
+            if ($afterComma) { continue }
             if ($hasToken) {
                 $tokens.Add($current.ToString())
                 [void]$current.Clear()
@@ -2531,9 +2535,40 @@ function Split-ConfTokens {
         }
         [void]$current.Append($ch)
         $hasToken = $true
+        $afterComma = ($ch -eq [char]44)
     }
     if ($hasToken) { $tokens.Add($current.ToString()) }
     return $tokens.ToArray()
+}
+
+# Joins continued lines the way PostgreSQL 16 does: an active line whose last character
+# is a backslash loses it, and the next physical line is appended directly (a backslash
+# followed by a blank is an ordinary character). One object per logical line:
+# { LineIndex; Text }, LineIndex being its first physical line. A blank or comment line
+# is never joined, so the line after a comment that ends in a backslash (a Windows
+# path, say) still counts as active, which is the safe side for Get-HbaFirstMatch and
+# Test-PgHbaStandard. A backslash on the last line is dropped. Callers wrap the result
+# in @().
+function Get-ConfLogicalLines {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]] $Lines)
+    $result = New-Object System.Collections.ArrayList
+    $i = 0
+    while ($i -lt $Lines.Length) {
+        $start = $i
+        $text = [string]$Lines[$i]
+        $i++
+        $trimmed = $text.TrimStart([char[]]@([char]32, [char]9))
+        if ($trimmed.Length -gt 0 -and $trimmed[0] -ne [char]35) {
+            while ($text.Length -gt 0 -and $text[$text.Length - 1] -eq [char]92) {
+                $text = $text.Substring(0, $text.Length - 1)
+                if ($i -ge $Lines.Length) { break }
+                $text = $text + [string]$Lines[$i]
+                $i++
+            }
+        }
+        [void]$result.Add([pscustomobject]@{ LineIndex = $start; Text = $text })
+    }
+    return $result.ToArray()
 }
 
 # One object per active pg_hba.conf line: { LineIndex; Type; Database; User; Address;
@@ -2541,6 +2576,8 @@ function Split-ConfTokens {
 # column becomes address/prefix. Options is the rest of the line joined by one space.
 # A line of any other type (include, include_dir, ...) is still returned, with its
 # arguments in Database, so no active line is ever invisible to Test-PgHbaStandard.
+# A line continued with a trailing backslash is one rule; its LineIndex is the first
+# physical line.
 function Get-PgHbaRules {
     param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]] $Lines)
     $isIpLiteral = {
@@ -2549,9 +2586,10 @@ function Get-PgHbaRules {
         return ((($Text -match '^\d{1,3}(\.\d{1,3}){3}$') -or $Text.Contains(':')) -and
             [System.Net.IPAddress]::TryParse($Text, [ref]$ip))
     }
+    $logical = @(Get-ConfLogicalLines -Lines $Lines)
     $rules = New-Object System.Collections.ArrayList
-    for ($i = 0; $i -lt $Lines.Length; $i++) {
-        $t = @(Split-ConfTokens -Line $Lines[$i])
+    for ($i = 0; $i -lt $logical.Count; $i++) {
+        $t = @(Split-ConfTokens -Line $logical[$i].Text)
         if ($t.Count -eq 0) { continue }
         $type = $t[0]
         $database = ''
@@ -2592,7 +2630,7 @@ function Get-PgHbaRules {
             $database = ($t[1..($t.Count - 1)]) -join ' '
         }
         [void]$rules.Add([pscustomobject]@{
-            LineIndex = $i
+            LineIndex = $logical[$i].LineIndex
             Type      = $type
             Database  = $database
             User      = $user
@@ -2609,8 +2647,8 @@ function Get-PgHbaRules {
 # see or safely edit included rules (spec 7.1 step 13).
 function Test-PgHbaHasInclude {
     param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]] $Lines)
-    foreach ($line in $Lines) {
-        $t = @(Split-ConfTokens -Line $line)
+    foreach ($entry in @(Get-ConfLogicalLines -Lines $Lines)) {
+        $t = @(Split-ConfTokens -Line $entry.Text)
         if ($t.Count -eq 0) { continue }
         if (@('include', 'include_if_exists', 'include_dir') -contains $t[0]) { return $true }
         foreach ($token in $t) {
@@ -2727,13 +2765,6 @@ function Get-HbaFirstMatch {
 
         $addressOk = $true
         $ruleAddress = [string](Get-CfgValue -Object $rule -Name 'Address' -Default '')
-        $bareIp = $null
-        if ($ruleAddress -notmatch '/' -and ($ruleAddress -match '^\d{1,3}(\.\d{1,3}){3}$' -or $ruleAddress.Contains(':')) -and [System.Net.IPAddress]::TryParse($ruleAddress, [ref]$bareIp)) {
-            # A bare IP literal names one host: /32 for IPv4, /128 for IPv6.
-            $hostBits = 32
-            if ($bareIp.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) { $hostBits = 128 }
-            $ruleAddress = "$ruleAddress/$hostBits"
-        }
         if ($ruleAddress -match '^([^/]+)/(\d{1,3})$') {
             $prefix = [int]$Matches[2]
             $network = $null
