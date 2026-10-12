@@ -3959,6 +3959,143 @@ function Restore-RegistrySnapshot {
 #endregion Registry
 
 #region ConnectCheck
+# Length of a file as the open stream sees it (0 when it is missing or cannot be
+# opened). Full sharing, so Veeam can keep writing and rolling its log.
+function Get-FileLength {
+    param([Parameter(Mandatory)][string] $Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [long]0 }
+    $stream = $null
+    try {
+        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $stream = New-Object -TypeName System.IO.FileStream -ArgumentList @($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        return [long]$stream.Length
+    } catch {
+        return [long]0
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
+# Lines written after FromOffset. If the file is now shorter than the offset (the
+# log rolled over), the whole file is new. Decoded as UTF-8; the signatures we look
+# for are ASCII. Empty lines are dropped.
+function Read-LogTail {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][long]   $FromOffset
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [string[]]@() }
+    $stream = $null
+    $buffer = $null
+    $read = 0
+    try {
+        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $stream = New-Object -TypeName System.IO.FileStream -ArgumentList @($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        $length = [long]$stream.Length
+        $start = $FromOffset
+        if ($start -lt 0 -or $start -gt $length) { $start = [long]0 }
+        $size = [int]($length - $start)
+        if ($size -le 0) { return [string[]]@() }
+        $null = $stream.Seek($start, [IO.SeekOrigin]::Begin)
+        $buffer = New-Object byte[] $size
+        while ($read -lt $size) {
+            $n = $stream.Read($buffer, $read, $size - $read)
+            if ($n -le 0) { break }
+            $read += $n
+        }
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+    $text = [Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+    return [string[]]@($text -split '\r?\n' | Where-Object { $_ -ne '' })
+}
+
+# The spec 7.13 authentication-failure signatures. The SQLSTATE codes catch a
+# server whose lc_messages is not English.
+function Find-AuthErrors {
+    param([AllowEmptyCollection()][string[]] $Lines)
+    $pattern = 'SSPI authentication failed|no match in usermap|password authentication failed|no pg_hba\.conf entry|\b28000:|\b28P01:'
+    return [string[]]@(@($Lines) | Where-Object { $null -ne $_ -and $_ -match $pattern })
+}
+
+# Spec 7.13 backend rule: a session that started after T, on the VBR database
+# (case-insensitive), as postgres, from 127.0.0.1 or ::1. Get-PgLiveState already
+# leaves out the script's own session. A local-time T is converted to UTC.
+function Test-VbrConnectEvidence {
+    param(
+        [object[]] $Backends,
+        [Parameter(Mandatory)][DateTime] $SinceUtc,
+        [Parameter(Mandatory)][string]   $Database
+    )
+    $since = $SinceUtc
+    if ($since.Kind -eq [DateTimeKind]::Local) { $since = $since.ToUniversalTime() }
+    foreach ($backend in @($Backends)) {
+        if ($null -eq $backend) { continue }
+        $start = Get-CfgValue -Object $backend -Name 'BackendStartUtc' -Default $null
+        if ($start -isnot [DateTime]) { continue }
+        if ($start.Kind -eq [DateTimeKind]::Local) { $start = $start.ToUniversalTime() }
+        if ($start -le $since) { continue }
+        if ("$(Get-CfgValue -Object $backend -Name 'DatName' -Default '')" -ine $Database) { continue }
+        if ("$(Get-CfgValue -Object $backend -Name 'UseName' -Default '')" -cne 'postgres') { continue }
+        $address = "$(Get-CfgValue -Object $backend -Name 'ClientAddr' -Default '')".Trim()
+        if ($address -ne '127.0.0.1' -and $address -ne '::1') { continue }
+        return $true
+    }
+    return $false
+}
+
+# Spec 7.13: wait until the Backup Service runs and a new VBR session exists, and
+# fail at once if Svc.VeeamBackup.log shows an authentication error after the
+# offset. Each poll reads the whole tail from LogOffset, so a line cut in half by
+# one read is still whole in the next.
+function Wait-VbrDbConnected {
+    param(
+        [Parameter(Mandatory)][string]   $Psql,
+        [Parameter(Mandatory)][int]      $Port,
+        [Parameter(Mandatory)][string]   $Address,
+        [Parameter(Mandatory)][string]   $Database,
+        [Parameter(Mandatory)][DateTime] $SinceUtc,
+        [Parameter(Mandatory)][int]      $TimeoutSec,
+        [Parameter(Mandatory)][string]   $LogPath,
+        [Parameter(Mandatory)][long]     $LogOffset,
+        [int]    $PollSec = 10,
+        [string] $ServiceName = 'VeeamBackupSvc'
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $polls = 0
+    while ($true) {
+        $polls++
+        $missing = New-Object System.Collections.ArrayList
+        $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        $status = 'missing'
+        if ($null -ne $service) { $status = "$($service.Status)" }
+        if ($status -ne 'Running') { [void]$missing.Add("$ServiceName is $status") }
+        $live = Get-PgLiveState -Psql $Psql -Port $Port -Address $Address -Database $Database
+        if (-not $live.Ok) {
+            [void]$missing.Add('the SSPI query of pg_stat_activity failed')
+        } elseif (-not (Test-VbrConnectEvidence -Backends @($live.Backends) -SinceUtc $SinceUtc -Database $Database)) {
+            [void]$missing.Add("no new '$Database' session as postgres from loopback")
+        }
+        $authErrors = @(Find-AuthErrors -Lines @(Read-LogTail -Path $LogPath -FromOffset $LogOffset))
+        if ($authErrors.Count -gt 0) {
+            $detail = Format-ShortText -Text "Authentication error in $(Split-Path -Leaf $LogPath) after the services started: $($authErrors[0])" -MaxLength 400
+            Write-Log -Message $detail -Level ERROR
+            return [pscustomobject]@{ Ok = $false; Detail = $detail }
+        }
+        if ($missing.Count -eq 0) {
+            $detail = "VBR connected to '$Database' as postgres over SSPI (check $polls)"
+            Write-Log -Message $detail -Level OK
+            return [pscustomobject]@{ Ok = $true; Detail = $detail }
+        }
+        if ((Get-Date) -ge $deadline) {
+            $detail = "VBR did not connect to PostgreSQL within $TimeoutSec s: $($missing -join '; ')"
+            Write-Log -Message $detail -Level ERROR
+            return [pscustomobject]@{ Ok = $false; Detail = $detail }
+        }
+        Write-Log -Message "Waiting for VBR to connect (check $polls): $($missing -join '; ')" -Level INFO
+        Start-Sleep -Seconds $PollSec
+    }
+}
 #endregion ConnectCheck
 
 #region PathA

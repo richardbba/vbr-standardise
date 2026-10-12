@@ -3613,6 +3613,171 @@ try {
     if (Test-Path -LiteralPath $t14Root) { Remove-Item -LiteralPath $t14Root -Recurse -Force }
 }
 Check 'T14 cleanup: throwaway key removed' (Test-Path -LiteralPath $t14Root) $false
+# --- Task 15: VBR connect check ---
+try {
+    & {
+        $dir = New-TestFolder 'logtail'
+        $missing = Join-Path $dir 'missing.log'
+        Check 'file length: missing file is 0'                (Get-FileLength -Path $missing) 0
+        Check 'file length: returns a long'                   (Get-FileLength -Path $missing).GetType().Name 'Int64'
+        $five = Join-Path $dir 'five.txt'
+        [IO.File]::WriteAllBytes($five, [byte[]](65, 66, 67, 68, 69))
+        Check 'file length: five bytes'                       (Get-FileLength -Path $five) 5
+
+        $log = Join-Path $dir 'Svc.VeeamBackup.log'
+        [IO.File]::WriteAllText($log, "[12.10.2026 10:00:00] <01> Info  old line one`r`n[12.10.2026 10:00:01] <01> Error no match in usermap `"veeam`" (old)`r`n", [Text.Encoding]::ASCII)
+        $offset = Get-FileLength -Path $log
+        [IO.File]::AppendAllText($log, "[12.10.2026 10:05:00] <01> Info  new line one`r`n[12.10.2026 10:05:01] <01> Info  new line two`r`n", [Text.Encoding]::ASCII)
+        $tail = @(Read-LogTail -Path $log -FromOffset $offset)
+        Check 'log tail: only lines after the offset'         $tail.Count 2
+        Check 'log tail: first new line'                      $tail[0] '[12.10.2026 10:05:00] <01> Info  new line one'
+        Check 'log tail: second new line'                     $tail[1] '[12.10.2026 10:05:01] <01> Info  new line two'
+        Check 'log tail: nothing new at the end'              @(Read-LogTail -Path $log -FromOffset (Get-FileLength -Path $log)).Count 0
+        Check 'log tail: offset 0 reads the whole file'       @(Read-LogTail -Path $log -FromOffset 0).Count 4
+
+        $short = Join-Path $dir 'rolled.log'
+        [IO.File]::WriteAllText($short, "a`r`nb`n", [Text.Encoding]::ASCII)
+        $rolled = @(Read-LogTail -Path $short -FromOffset 100000)
+        Check 'log tail: shorter file is read from the start' ($rolled -join ',') 'a,b'
+        Check 'log tail: missing file gives no lines'         @(Read-LogTail -Path $missing -FromOffset 0).Count 0
+
+        $held = Join-Path $dir 'held.log'
+        $writer = New-Object -TypeName System.IO.FileStream -ArgumentList @($held, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+        try {
+            $bytes = [Text.Encoding]::ASCII.GetBytes("held open line`r`n")
+            $writer.Write($bytes, 0, $bytes.Length)
+            $writer.Flush()
+            Check 'log tail: length of a file held open for writing' (Get-FileLength -Path $held) 16
+            Check 'log tail: reads a file held open for writing'     ((@(Read-LogTail -Path $held -FromOffset 0)) -join ',') 'held open line'
+        } finally {
+            $writer.Dispose()
+        }
+    }
+} catch {
+    Check 'Task 15: log tail tests ran to the end' $_.Exception.Message ''
+}
+
+try {
+    & {
+        $lines = @(
+            '[12.10.2026 10:05:00] <01> Info  Starting Veeam Backup Service',
+            '[12.10.2026 10:05:01] <07> Error Npgsql.PostgresException (0x80004005): 28000: no pg_hba.conf entry for host "127.0.0.1", user "postgres", database "VeeamBackup", no encryption',
+            '[12.10.2026 10:05:02] <07> Error 28P01: Passwort-Authentifizierung fehlgeschlagen',
+            '[12.10.2026 10:05:03] <07> Error FATAL: SSPI authentication failed for user "postgres"',
+            '[12.10.2026 10:05:04] <01> Info  Received 28000 bytes',
+            '[12.10.2026 10:05:05] <01> Info  SSPI package negotiated',
+            '[12.10.2026 10:05:06] <07> Error no match in usermap "veeam" for user "postgres" authenticated as "Administrator@VBR01"',
+            '[12.10.2026 10:05:07] <07> Error password authentication failed for user "postgres"'
+        )
+        $found = @(Find-AuthErrors -Lines $lines)
+        Check 'auth errors: five matching lines'              $found.Count 5
+        Check 'auth errors: SQLSTATE 28000 line first'        $found[0] $lines[1]
+        Check 'auth errors: localised 28P01 line'             ($found -contains $lines[2]) 'True'
+        Check 'auth errors: byte count is not 28000'          ($found -contains $lines[4]) 'False'
+        Check 'auth errors: bare SSPI is not an error'        ($found -contains $lines[5]) 'False'
+        Check 'auth errors: no lines'                         @(Find-AuthErrors -Lines @()).Count 0
+    }
+} catch {
+    Check 'Task 15: Find-AuthErrors tests ran to the end' $_.Exception.Message ''
+}
+
+try {
+    & {
+        $since = New-Object DateTime 2026, 10, 12, 10, 0, 0, ([DateTimeKind]::Utc)
+        $be = { param($Db, $User, $Addr, [int] $Minutes) [pscustomobject]@{ Pid = 9; UseName = $User; DatName = $Db; ClientAddr = $Addr; BackendStartUtc = $since.AddMinutes($Minutes) } }
+        $evidence = { param($Backends, $Since) Test-VbrConnectEvidence -Backends $Backends -SinceUtc $Since -Database 'VeeamBackup' }
+        Check 'connect evidence: new loopback postgres session'      (& $evidence @(& $be 'VeeamBackup' 'postgres' '127.0.0.1' 5) $since) 'True'
+        Check 'connect evidence: session older than T'               (& $evidence @(& $be 'VeeamBackup' 'postgres' '127.0.0.1' -5) $since) 'False'
+        Check 'connect evidence: session started exactly at T'       (& $evidence @(& $be 'VeeamBackup' 'postgres' '127.0.0.1' 0) $since) 'False'
+        Check 'connect evidence: database name case-insensitive, ::1' (& $evidence @(& $be 'veeambackup' 'postgres' '::1' 1) $since) 'True'
+        Check 'connect evidence: other role'                         (& $evidence @(& $be 'VeeamBackup' 'pg_native_admin' '127.0.0.1' 5) $since) 'False'
+        Check 'connect evidence: LAN address'                        (& $evidence @(& $be 'VeeamBackup' 'postgres' '192.168.1.10' 5) $since) 'False'
+        Check 'connect evidence: other database'                     (& $evidence @(& $be 'postgres' 'postgres' '127.0.0.1' 5) $since) 'False'
+        Check 'connect evidence: no sessions'                        (& $evidence @() $since) 'False'
+        Check 'connect evidence: one good session among others'      (& $evidence @((& $be 'postgres' 'postgres' '127.0.0.1' 5), (& $be 'VeeamBackup' 'postgres' '127.0.0.1' -1), (& $be 'VeeamBackup' 'postgres' '::1' 2)) $since) 'True'
+        Check 'connect evidence: local-time T is converted to UTC'   (& $evidence @(& $be 'VeeamBackup' 'postgres' '127.0.0.1' 5) $since.ToLocalTime()) 'True'
+        Check 'connect evidence: local-time T, older session'        (& $evidence @(& $be 'VeeamBackup' 'postgres' '127.0.0.1' -5) $since.ToLocalTime()) 'False'
+    }
+} catch {
+    Check 'Task 15: Test-VbrConnectEvidence tests ran to the end' $_.Exception.Message ''
+}
+
+try {
+    & {
+        $dir = New-TestFolder 'connect'
+        $log = Join-Path $dir 'Svc.VeeamBackup.log'
+        [IO.File]::WriteAllText($log, "[old] <07> Error no match in usermap `"veeam`" written before the services started`r`n", [Text.Encoding]::ASCII)
+        $offset = Get-FileLength -Path $log
+        $since = New-Object DateTime 2026, 10, 12, 10, 0, 0, ([DateTimeKind]::Utc)
+        $calls = New-Object System.Collections.ArrayList
+        $plan = @{ Service = 'Running'; GoodFromPoll = 2; LiveOk = $true }
+        function Get-Service {
+            [CmdletBinding()] param([string] $Name)
+            [void]$calls.Add("svc:$Name")
+            [pscustomobject]@{ Name = $Name; Status = $plan.Service }
+        }
+        function Start-Sleep {
+            [CmdletBinding()] param([int] $Seconds)
+            [void]$calls.Add("sleep:$Seconds")
+        }
+        function Get-PgLiveState {
+            param([string] $Psql, [int] $Port, [string] $Address, [string] $Database)
+            [void]$calls.Add("live:$Address|$Port|$Database")
+            $poll = @($calls | Where-Object { "$_" -like 'live:*' }).Count
+            $start = $since.AddSeconds(-30)
+            if ($poll -ge $plan.GoodFromPoll) { $start = $since.AddSeconds(30) }
+            [pscustomobject]@{
+                Ok          = $plan.LiveOk
+                PasswordSet = $true
+                Backends    = @([pscustomobject]@{ Pid = 7; UseName = 'postgres'; DatName = 'VeeamBackup'; ClientAddr = '127.0.0.1'; BackendStartUtc = $start })
+            }
+        }
+        $wait = {
+            param([int] $TimeoutSec, [long] $LogOffset, [string] $ServiceName = 'VeeamBackupSvc')
+            Wait-VbrDbConnected -Psql 'psql.exe' -Port 5432 -Address '127.0.0.1' -Database 'VeeamBackup' -SinceUtc $since -TimeoutSec $TimeoutSec -LogPath $log -LogOffset $LogOffset -PollSec 7 -ServiceName $ServiceName
+        }
+
+        $r = & $wait 600 $offset
+        Check 'connect wait: succeeds once a new session appears'  $r.Ok 'True'
+        Check 'connect wait: polled pg_stat_activity twice'        (@($calls | Where-Object { "$_" -like 'live:*' }).Count) 2
+        Check 'connect wait: queried the given address and database' ($calls -contains 'live:127.0.0.1|5432|VeeamBackup') 'True'
+        Check 'connect wait: slept once with the poll interval'    (@($calls | Where-Object { "$_" -like 'sleep:*' }) -join ',') 'sleep:7'
+        Check 'connect wait: checked VeeamBackupSvc'               ($calls -contains 'svc:VeeamBackupSvc') 'True'
+
+        $calls.Clear()
+        [IO.File]::AppendAllText($log, "[new] <07> Error Npgsql.PostgresException (0x80004005): 28000: no pg_hba.conf entry for host `"127.0.0.1`"`r`n", [Text.Encoding]::ASCII)
+        $plan.GoodFromPoll = 1
+        $r = & $wait 600 $offset
+        Check 'connect wait: auth error in the log fails'          $r.Ok 'False'
+        Check 'connect wait: auth error line in Detail'            ($r.Detail -match 'no pg_hba\.conf entry') 'True'
+        Check 'connect wait: auth error fails without waiting'     (@($calls | Where-Object { "$_" -like 'sleep:*' }).Count) 0
+
+        $offset = Get-FileLength -Path $log
+        $calls.Clear()
+        $plan.Service = 'Stopped'
+        $plan.GoodFromPoll = 99
+        $r = & $wait 0 $offset
+        Check 'connect wait: times out'                            $r.Ok 'False'
+        Check 'connect wait: timeout names the stopped service'    ($r.Detail -match 'VeeamBackupSvc is Stopped') 'True'
+        Check 'connect wait: timeout names the missing session'    ($r.Detail -match 'no new') 'True'
+
+        $calls.Clear()
+        $plan.Service = 'Running'
+        $plan.LiveOk = $false
+        $r = & $wait 0 $offset
+        Check 'connect wait: failed SSPI query is not success'     $r.Ok 'False'
+        Check 'connect wait: failed SSPI query named in Detail'    ($r.Detail -match 'SSPI query') 'True'
+
+        $calls.Clear()
+        $plan.LiveOk = $true
+        $plan.GoodFromPoll = 1
+        $r = & $wait 0 $offset 'VeeamFakeSvc'
+        Check 'connect wait: other service name is used'           ($calls -contains 'svc:VeeamFakeSvc') 'True'
+        Check 'connect wait: success on the first poll'            $r.Ok 'True'
+    }
+} catch {
+    Check 'Task 15: Wait-VbrDbConnected tests ran to the end' $_.Exception.Message ''
+}
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue
