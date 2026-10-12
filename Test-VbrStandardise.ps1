@@ -3220,6 +3220,270 @@ try {
 } catch {
     Check 'Task 12: Get-ConsumerIssues tests ran to the end' $_.Exception.Message ''
 }
+# --- Task 13: Idle gate and bounded service stop/start ---
+
+# Get-BusyVeeamWork: process names compare without .exe, case-insensitively.
+$t13Now = Get-Date -Year 2026 -Month 10 -Day 12 -Hour 12 -Minute 0 -Second 0
+$t13Procs = @(
+    [pscustomobject]@{ Name = 'Veeam.Backup.Manager'; StartTime = $t13Now.AddMinutes(-30) }
+    [pscustomobject]@{ Name = 'VEEAMAGENT.EXE';       StartTime = $t13Now.AddHours(-7) }
+    [pscustomobject]@{ Name = 'Veeam.Exchange.Explorer'; StartTime = $t13Now.AddMinutes(-5) }
+    [pscustomobject]@{ Name = 'Veeam.Backup.Shell';   StartTime = $t13Now.AddDays(-3) }
+    [pscustomobject]@{ Name = 'Veeam.Backup.Service'; StartTime = $t13Now.AddDays(-30) }
+    [pscustomobject]@{ Name = 'notepad';              StartTime = $t13Now.AddDays(-1) }
+)
+$t13Busy = Get-BusyVeeamWork -Processes $t13Procs -Now $t13Now -PersistentHours 6
+Check 'T13 busy: manager, agent and explorer are busy' $t13Busy.Busy $true
+Check 'T13 busy: names without .exe, sorted, console and services ignored' (@($t13Busy.Names) -join ',') 'Veeam.Backup.Manager,Veeam.Exchange.Explorer,VEEAMAGENT'
+Check 'T13 busy: oldest busy process over 6 h is persistent' $t13Busy.Persistent $true
+$t13Young = Get-BusyVeeamWork -Processes @($t13Procs[0], $t13Procs[2], $t13Procs[3]) -Now $t13Now -PersistentHours 6
+Check 'T13 busy: young processes are busy' $t13Young.Busy $true
+Check 'T13 busy: young processes are not persistent' $t13Young.Persistent $false
+$t13Edge = Get-BusyVeeamWork -Processes @([pscustomobject]@{ Name = 'VeeamAgent'; StartTime = $t13Now.AddHours(-6) }) -Now $t13Now -PersistentHours 6
+Check 'T13 busy: exactly 6 h is not longer than 6 h' $t13Edge.Persistent $false
+$t13NoStart = Get-BusyVeeamWork -Processes @([pscustomobject]@{ Name = 'Veeam.Backup.Manager.exe' }, [pscustomobject]@{ Name = 'VeeamAgent'; StartTime = $null }) -Now $t13Now -PersistentHours 6
+Check 'T13 busy: unknown start time is busy' $t13NoStart.Busy $true
+Check 'T13 busy: unknown start time is never persistent' $t13NoStart.Persistent $false
+Check 'T13 busy: duplicate names reported once' (@((Get-BusyVeeamWork -Processes @($t13Procs[0], $t13Procs[0]) -Now $t13Now -PersistentHours 6).Names).Count) 1
+$t13Idle = Get-BusyVeeamWork -Processes @($t13Procs[3], $t13Procs[4], $t13Procs[5]) -Now $t13Now -PersistentHours 6
+Check 'T13 busy: console and services only is idle' $t13Idle.Busy $false
+Check 'T13 busy: idle has no names' (@($t13Idle.Names).Count) 0
+$t13Empty = Get-BusyVeeamWork -Processes @() -Now $t13Now -PersistentHours 6
+Check 'T13 busy: no processes is idle' "$($t13Empty.Busy)/$($t13Empty.Persistent)" 'False/False'
+Check 'T13 busy: null process list is idle' (Get-BusyVeeamWork -Processes $null -Now $t13Now -PersistentHours 6).Busy $false
+
+# Get-VeeamServiceSnapshot: shape, from a mocked Get-Service.
+& {
+    $t13Calls = New-Object System.Collections.ArrayList
+    function Get-Service {
+        [CmdletBinding()] param([Parameter(Position = 0)][string[]] $Name)
+        [void]$t13Calls.Add(($Name -join ','))
+        [pscustomobject]@{ Name = 'VeeamBackupSvc'; Status = 'Running'; StartType = 'Automatic'
+            ServicesDependedOn = @([pscustomobject]@{ Name = 'RpcSs' }, [pscustomobject]@{ Name = 'Winmgmt' })
+            DependentServices = @([pscustomobject]@{ Name = 'VeeamBrokerSvc' }) }
+        [pscustomobject]@{ Name = 'VeeamBrokerSvc'; Status = 'Stopped'; StartType = 'Manual'
+            ServicesDependedOn = @([pscustomobject]@{ Name = 'VeeamBackupSvc' }); DependentServices = @() }
+        [pscustomobject]@{ Name = 'VeeamOldSvc'; Status = 'Running' }
+        [pscustomobject]@{ Name = 'NotVeeam'; Status = 'Running'; StartType = 'Automatic'; ServicesDependedOn = @(); DependentServices = @() }
+    }
+    $t13SnapOut = @(Get-VeeamServiceSnapshot)
+    Check 'T13 snapshot: asks for Veeam*' ($t13Calls -join '|') 'Veeam*'
+    Check 'T13 snapshot: only Veeam services' (@($t13SnapOut | ForEach-Object { $_.Name }) -join ',') 'VeeamBackupSvc,VeeamBrokerSvc,VeeamOldSvc'
+    Check 'T13 snapshot: status is a string' $t13SnapOut[0].Status 'Running'
+    Check 'T13 snapshot: start type kept' "$($t13SnapOut[0].StartType)/$($t13SnapOut[1].StartType)" 'Automatic/Manual'
+    Check 'T13 snapshot: DependsOn names' (@($t13SnapOut[0].DependsOn) -join ',') 'RpcSs,Winmgmt'
+    Check 'T13 snapshot: Dependents names' (@($t13SnapOut[0].Dependents) -join ',') 'VeeamBrokerSvc'
+    Check 'T13 snapshot: missing members tolerated' "$($t13SnapOut[2].StartType)/$(@($t13SnapOut[2].DependsOn).Count)/$(@($t13SnapOut[2].Dependents).Count)" 'Unknown/0/0'
+}
+& {
+    function Get-Service { [CmdletBinding()] param([Parameter(Position = 0)][string[]] $Name) throw 'Cannot open Service Control Manager on computer .' }
+    Throws 'T13 snapshot: a failed enumeration throws' { Get-VeeamServiceSnapshot }
+}
+$t13RealOk = $true
+try { $null = @(Get-VeeamServiceSnapshot) } catch { $t13RealOk = $false }
+Check 'T13 snapshot: runs read-only on this machine' $t13RealOk $true
+
+# Get-StopSet: every service that is not Stopped, alphabetical (ordinal), Management Agent last.
+$t13Snap = @(
+    [pscustomobject]@{ Name = 'VeeamWebSvc';             Status = 'Running' }
+    [pscustomobject]@{ Name = 'VeeamManagementAgentSvc'; Status = 'Running' }
+    [pscustomobject]@{ Name = 'VeeamBackupSvc';          Status = 'Running' }
+    [pscustomobject]@{ Name = 'VeeamNFSSvc';             Status = 'Stopped' }
+    [pscustomobject]@{ Name = 'Veeam.Something.Svc';     Status = 'StartPending' }
+    [pscustomobject]@{ Name = 'VeeamBrokerSvc';          Status = 'StopPending' }
+    [pscustomobject]@{ Name = 'VeeamBackupSvc';          Status = 'Running' }
+)
+Check 'T13 stop set: order' (@(Get-StopSet -Snapshot $t13Snap) -join ',') 'Veeam.Something.Svc,VeeamBackupSvc,VeeamBrokerSvc,VeeamWebSvc,VeeamManagementAgentSvc'
+Check 'T13 stop set: empty snapshot' (@(Get-StopSet -Snapshot @()).Count) 0
+Check 'T13 stop set: all stopped' (@(Get-StopSet -Snapshot @([pscustomobject]@{ Name = 'VeeamX'; Status = 'Stopped' })).Count) 0
+
+# Get-ExternalDependents: running, outside the set, direct dependency on a member.
+$t13All = @(
+    [pscustomobject]@{ Name = 'VeeamBackupSvc'; Status = 'Running'; DependsOn = @('RpcSs') }
+    [pscustomobject]@{ Name = 'VeeamBrokerSvc'; Status = 'Running'; DependsOn = @('VeeamBackupSvc') }
+    [pscustomobject]@{ Name = 'ThirdPartySvc';  Status = 'Running'; DependsOn = @('RpcSs', 'VeeamBackupSvc') }
+    [pscustomobject]@{ Name = 'lowercase-dep';  Status = 'StartPending'; DependsOn = @('veeambrokersvc') }
+    [pscustomobject]@{ Name = 'StoppedDep';     Status = 'Stopped'; DependsOn = @('VeeamBackupSvc') }
+    [pscustomobject]@{ Name = 'Unrelated';      Status = 'Running'; DependsOn = @('RpcSs') }
+    [pscustomobject]@{ Name = 'NoDepsMember';   Status = 'Running'; DependsOn = $null }
+    [pscustomobject]@{ Name = 'ScLikeSvc';      Status = 'Running'; ServicesDependedOn = @([pscustomobject]@{ Name = 'VeeamBrokerSvc' }) }
+)
+Check 'T13 external: found, sorted' (@(Get-ExternalDependents -StopSet @('VeeamBackupSvc', 'VeeamBrokerSvc') -AllServices $t13All) -join ',') 'lowercase-dep,ScLikeSvc,ThirdPartySvc'
+Check 'T13 external: empty stop set' (@(Get-ExternalDependents -StopSet @() -AllServices $t13All).Count) 0
+Check 'T13 external: no services' (@(Get-ExternalDependents -StopSet @('VeeamBackupSvc') -AllServices @()).Count) 0
+
+# Get-StartOrder: real VBR 13.0.1 dependency data, listed in Get-Service order.
+$t13Vbr = @(
+    [pscustomobject]@{ Name = 'VeeamAHVSvc';          DependsOn = @('RpcSs', 'Winmgmt') }
+    [pscustomobject]@{ Name = 'VeeamBackupCdpSvc';    DependsOn = @('RpcSs', 'VeeamBackupSvc') }
+    [pscustomobject]@{ Name = 'VeeamBackupRESTSvc';   DependsOn = @('Winmgmt', 'RpcSs', 'VeeamBackupSvc') }
+    [pscustomobject]@{ Name = 'VeeamBackupSvc';       DependsOn = @('RpcSs', 'Winmgmt') }
+    [pscustomobject]@{ Name = 'VeeamBrokerSvc';       DependsOn = @('RpcSs', 'VeeamBackupSvc') }
+    [pscustomobject]@{ Name = 'VeeamCloudSvc';        DependsOn = @('RpcSs', 'VeeamBackupSvc') }
+    [pscustomobject]@{ Name = 'VeeamDataAnalyzerSvc'; DependsOn = @('RpcSs', 'VeeamBackupSvc') }
+    [pscustomobject]@{ Name = 'VeeamGCPSvc';          DependsOn = @() }
+    [pscustomobject]@{ Name = 'VeeamTransportSvc';    DependsOn = @('RpcSs', 'Winmgmt') }
+    [pscustomobject]@{ Name = 'VeeamWebSvc';          DependsOn = @('VeeamBackupRESTSvc', 'RpcSs', 'VeeamBackupSvc') }
+)
+$t13AllNames = @($t13Vbr | ForEach-Object { $_.Name })
+Check 'T13 start order: dependencies first, waves alphabetical' (@(Get-StartOrder -Snapshot $t13Vbr -Names $t13AllNames) -join ',') 'VeeamAHVSvc,VeeamBackupSvc,VeeamGCPSvc,VeeamTransportSvc,VeeamBackupCdpSvc,VeeamBackupRESTSvc,VeeamBrokerSvc,VeeamCloudSvc,VeeamDataAnalyzerSvc,VeeamWebSvc'
+Check 'T13 start order: only the given names' (@(Get-StartOrder -Snapshot $t13Vbr -Names @('VeeamWebSvc', 'VeeamBackupSvc')) -join ',') 'VeeamBackupSvc,VeeamWebSvc'
+$t13Cycle = @(
+    [pscustomobject]@{ Name = 'B'; DependsOn = @('A') }
+    [pscustomobject]@{ Name = 'A'; DependsOn = @('B') }
+    [pscustomobject]@{ Name = 'C'; DependsOn = @() }
+)
+Check 'T13 start order: cycle kept, free one first' (@(Get-StartOrder -Snapshot $t13Cycle -Names @('B', 'A', 'C')) -join ',') 'C,A,B'
+Check 'T13 start order: missing DependsOn and unknown name tolerated' (@(Get-StartOrder -Snapshot @([pscustomobject]@{ Name = 'X' }) -Names @('Y', 'X')) -join ',') 'X,Y'
+Check 'T13 start order: duplicate names once' (@(Get-StartOrder -Snapshot $t13Vbr -Names @('VeeamGCPSvc', 'veeamgcpsvc')) -join ',') 'VeeamGCPSvc'
+Check 'T13 start order: empty' (@(Get-StartOrder -Snapshot $t13Vbr -Names @()).Count) 0
+
+# Stop-ServicesBounded: -NoWait, never -Force, retries while a dependent is still stopping.
+& {
+    $t13State = @{ VeeamBackupSvc = 'Running'; VeeamBrokerSvc = 'Running' }
+    $t13Deps = @{ VeeamBackupSvc = @('VeeamBrokerSvc') }
+    $t13Stops = New-Object System.Collections.ArrayList
+    $t13Sleeps = New-Object System.Collections.ArrayList
+    function Get-Service {
+        [CmdletBinding()] param([Parameter(Position = 0)][string[]] $Name)
+        $n = $Name[0]
+        if (-not $t13State.ContainsKey($n)) { return }
+        if ($t13State[$n] -eq 'StopPending') { $t13State[$n] = 'Stopped' }
+        [pscustomobject]@{ Name = $n; Status = $t13State[$n] }
+    }
+    function Stop-Service {
+        [CmdletBinding()] param([string] $Name, [switch] $NoWait, [switch] $Force)
+        [void]$t13Stops.Add([pscustomobject]@{ Name = $Name; NoWait = $NoWait.IsPresent; Force = $Force.IsPresent })
+        foreach ($d in @($t13Deps[$Name] | Where-Object { $_ })) {
+            if ($t13State[$d] -ne 'Stopped') { throw "Cannot stop service '$Name' because it has dependent services." }
+        }
+        $t13State[$Name] = 'StopPending'
+    }
+    function Start-Sleep { [CmdletBinding()] param([int] $Seconds, [int] $Milliseconds) [void]$t13Sleeps.Add($Milliseconds) }
+    $t13R = Stop-ServicesBounded -Names @('VeeamBackupSvc', 'VeeamBrokerSvc') -TimeoutSec 30
+    Check 'T13 stop: Ok' $t13R.Ok $true
+    Check 'T13 stop: both stopped' (@($t13R.Stopped) -join ',') 'VeeamBackupSvc,VeeamBrokerSvc'
+    Check 'T13 stop: none left' (@($t13R.NotStopped).Count) 0
+    Check 'T13 stop: every call uses -NoWait' (@($t13Stops | Where-Object { -not $_.NoWait }).Count) 0
+    Check 'T13 stop: no call uses -Force' (@($t13Stops | Where-Object { $_.Force }).Count) 0
+    Check 'T13 stop: parent asked again until its dependent stopped' (@($t13Stops | Where-Object { $_.Name -eq 'VeeamBackupSvc' }).Count) 3
+    Check 'T13 stop: polls every 2 s' $t13Sleeps[0] 2000
+}
+& {
+    $t13State = @{ VeeamAaaSvc = 'Running'; VeeamStuckSvc = 'StopPending' }
+    $t13Stops = New-Object System.Collections.ArrayList
+    function Get-Service {
+        [CmdletBinding()] param([Parameter(Position = 0)][string[]] $Name)
+        $n = $Name[0]
+        if (-not $t13State.ContainsKey($n)) { return }
+        if ($t13State[$n] -eq 'StopPending' -and $n -ne 'VeeamStuckSvc') { $t13State[$n] = 'Stopped' }
+        [pscustomobject]@{ Name = $n; Status = $t13State[$n] }
+    }
+    function Stop-Service {
+        [CmdletBinding()] param([string] $Name, [switch] $NoWait, [switch] $Force)
+        [void]$t13Stops.Add([pscustomobject]@{ Name = $Name; NoWait = $NoWait.IsPresent; Force = $Force.IsPresent })
+        $t13State[$Name] = 'StopPending'
+    }
+    function Start-Sleep { [CmdletBinding()] param([int] $Seconds, [int] $Milliseconds) Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds 200 }
+    $t13LogMark = $script:LogLines.Count
+    $t13Clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $t13R = Stop-ServicesBounded -Names @('VeeamAaaSvc', 'VeeamStuckSvc', 'VeeamGoneSvc') -TimeoutSec 1
+    $t13Clock.Stop()
+    Check 'T13 stop timeout: not Ok' $t13R.Ok $false
+    Check 'T13 stop timeout: the normal one stopped' (@($t13R.Stopped) -join ',') 'VeeamAaaSvc'
+    Check 'T13 stop timeout: stuck and missing are NotStopped' (@($t13R.NotStopped) -join ',') 'VeeamStuckSvc,VeeamGoneSvc'
+    Check 'T13 stop timeout: a StopPending service is not asked again' (@($t13Stops | Where-Object { $_.Name -eq 'VeeamStuckSvc' }).Count) 0
+    Check 'T13 stop timeout: waited about TimeoutSec' ($t13Clock.Elapsed.TotalSeconds -ge 1 -and $t13Clock.Elapsed.TotalSeconds -lt 10) $true
+    Check 'T13 stop timeout: warning names the stuck service' (@($script:LogLines | Select-Object -Skip $t13LogMark | Where-Object { $_ -like '`[WARN`]*VeeamStuckSvc=StopPending*' }).Count) 1
+}
+& {
+    $t13Stops = New-Object System.Collections.ArrayList
+    function Stop-Service { [CmdletBinding()] param([string] $Name, [switch] $NoWait, [switch] $Force) [void]$t13Stops.Add($Name) }
+    $t13R = Stop-ServicesBounded -Names @() -TimeoutSec 5
+    Check 'T13 stop: empty list is Ok' "$($t13R.Ok)/$(@($t13R.Stopped).Count)/$(@($t13R.NotStopped).Count)/$($t13Stops.Count)" 'True/0/0/0'
+}
+$t13StopFn = $ScriptAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Stop-ServicesBounded' }, $true)
+$t13StopCalls = @($t13StopFn.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Stop-Service' }, $true))
+$t13StopParams = @($t13StopCalls | ForEach-Object { $_.CommandElements } | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } | ForEach-Object { $_.ParameterName })
+Check 'T13 stop source: one Stop-Service call' $t13StopCalls.Count 1
+Check 'T13 stop source: uses -NoWait' ($t13StopParams -contains 'NoWait') $true
+Check 'T13 stop source: never -Force' ($t13StopParams -contains 'Force') $false
+
+# Start-ServicesBounded: Start() then WaitForStatus with the time left; the final state decides.
+& {
+    $t13Events = New-Object System.Collections.ArrayList
+    function New-T13FakeService([string] $Name, [string] $Status, [string] $Behaviour) {
+        $o = [pscustomobject]@{ Name = $Name; Status = $Status; Behaviour = $Behaviour; Events = $t13Events }
+        $o | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
+        $o | Add-Member -MemberType ScriptMethod -Name Start -Value {
+            [void]$this.Events.Add("start:$($this.Name)")
+            if ($this.Behaviour -eq 'fails') { throw 'The service did not respond to the start or control request in a timely fashion.' }
+            if ($this.Behaviour -eq 'slow') { $this.Status = 'Running'; throw 'Time out has expired.' }
+            $this.Status = 'Running'
+        }
+        $o | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value {
+            param($Desired, $Timeout)
+            [void]$this.Events.Add("wait:$($this.Name):${Desired}:$([math]::Round($Timeout.TotalSeconds))")
+            if ("$($this.Status)" -ne "$Desired") { throw 'Time out has expired and the operation has not been completed.' }
+        }
+        return $o
+    }
+    $t13Fakes = @{
+        VeeamBackupSvc  = (New-T13FakeService 'VeeamBackupSvc' 'Stopped' 'ok')
+        VeeamAlreadySvc = (New-T13FakeService 'VeeamAlreadySvc' 'Running' 'ok')
+        VeeamBrokenSvc  = (New-T13FakeService 'VeeamBrokenSvc' 'Stopped' 'fails')
+        VeeamSlowSvc    = (New-T13FakeService 'VeeamSlowSvc' 'Stopped' 'slow')
+    }
+    function Get-Service {
+        [CmdletBinding()] param([Parameter(Position = 0)][string[]] $Name)
+        if ($t13Fakes.ContainsKey($Name[0])) { $t13Fakes[$Name[0]] }
+    }
+    $t13R = Start-ServicesBounded -Names @('VeeamBackupSvc', 'VeeamAlreadySvc', 'VeeamBrokenSvc', 'VeeamSlowSvc', 'VeeamGoneSvc') -TimeoutSec 30
+    Check 'T13 start: not Ok when one fails' $t13R.Ok $false
+    Check 'T13 start: started includes running and slow' (@($t13R.Started) -join ',') 'VeeamBackupSvc,VeeamAlreadySvc,VeeamSlowSvc'
+    Check 'T13 start: broken and missing not started' (@($t13R.NotStarted) -join ',') 'VeeamBrokenSvc,VeeamGoneSvc'
+    Check 'T13 start: Start() called in order, never for a running one' (@($t13Events | Where-Object { $_ -like 'start:*' }) -join ',') 'start:VeeamBackupSvc,start:VeeamBrokenSvc,start:VeeamSlowSvc'
+    $t13Waits = @($t13Events | Where-Object { $_ -like 'wait:*' })
+    Check 'T13 start: waits for Running' (@($t13Waits | Where-Object { $_ -notlike 'wait:*:Running:*' }).Count) 0
+    Check 'T13 start: first wait gets the whole budget' $t13Waits[0] 'wait:VeeamBackupSvc:Running:30'
+    Check 'T13 start: no wait is longer than the budget' (@($t13Waits | Where-Object { [int]($_ -replace '^.*:', '') -gt 30 }).Count) 0
+}
+& {
+    $t13Fake = [pscustomobject]@{ Name = 'VeeamOkSvc'; Status = 'Stopped' }
+    $t13Fake | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
+    $t13Fake | Add-Member -MemberType ScriptMethod -Name Start -Value { $this.Status = 'Running' }
+    $t13Fake | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value { param($Desired, $Timeout) if ("$($this.Status)" -ne "$Desired") { throw 'timeout' } }
+    function Get-Service { [CmdletBinding()] param([Parameter(Position = 0)][string[]] $Name) if ($Name[0] -eq 'VeeamOkSvc') { $t13Fake } }
+    $t13R = Start-ServicesBounded -Names @('VeeamOkSvc') -TimeoutSec 10
+    Check 'T13 start: all started is Ok' "$($t13R.Ok)/$(@($t13R.Started) -join ',')/$(@($t13R.NotStarted).Count)" 'True/VeeamOkSvc/0'
+    $t13R = Start-ServicesBounded -Names @() -TimeoutSec 10
+    Check 'T13 start: empty list is Ok' "$($t13R.Ok)/$(@($t13R.Started).Count)" 'True/0'
+}
+
+# Test-ServiceStaysRunning: polls every 5 s; any non-Running read is a failure.
+& {
+    $t13Reads = @{ N = 0 }
+    $t13Sleeps = New-Object System.Collections.ArrayList
+    function Get-Service {
+        [CmdletBinding()] param([Parameter(Position = 0)][string[]] $Name)
+        $t13Reads.N++
+        if ($t13Reads.N -ge 3) { [pscustomobject]@{ Name = $Name[0]; Status = 'Stopped' } }
+        else { [pscustomobject]@{ Name = $Name[0]; Status = 'Running' } }
+    }
+    function Start-Sleep { [CmdletBinding()] param([int] $Seconds, [int] $Milliseconds) [void]$t13Sleeps.Add($Milliseconds) }
+    Check 'T13 settle: a stop during the window fails' (Test-ServiceStaysRunning -Name 'VeeamBackupSvc' -Seconds 300) $false
+    Check 'T13 settle: stopped at the third read' $t13Reads.N 3
+    Check 'T13 settle: polls every 5 s' $t13Sleeps[0] 5000
+}
+& {
+    $t13Sleeps = New-Object System.Collections.ArrayList
+    function Get-Service { [CmdletBinding()] param([Parameter(Position = 0)][string[]] $Name) [pscustomobject]@{ Name = $Name[0]; Status = 'Running' } }
+    function Start-Sleep { [CmdletBinding()] param([int] $Seconds, [int] $Milliseconds) [void]$t13Sleeps.Add($Milliseconds); Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds 300 }
+    Check 'T13 settle: running for the whole window passes' (Test-ServiceStaysRunning -Name 'VeeamBackupSvc' -Seconds 1) $true
+    Check 'T13 settle: never sleeps past the window' (@($t13Sleeps | Where-Object { $_ -gt 1000 }).Count) 0
+    Check 'T13 settle: zero seconds is one read' (Test-ServiceStaysRunning -Name 'VeeamBackupSvc' -Seconds 0) $true
+}
+Check 'T13 settle: a missing service fails' (Test-ServiceStaysRunning -Name "NoSuchService-VbrStd-$PID" -Seconds 0) $false
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue

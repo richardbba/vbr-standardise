@@ -3392,6 +3392,351 @@ function Get-ConsumerIssues {
 #endregion State
 
 #region Services
+# Idle gate (spec 7.11). Busy means a running job process (Veeam.Backup.Manager),
+# a data mover (VeeamAgent) or an Explorer, which can be running an item-level
+# restore. The console (Veeam.Backup.Shell) is a client and is not busy. Persistent
+# means the OLDEST busy process has run longer than PersistentHours, which is what a
+# SQL/Oracle log backup or a CDP policy looks like: waiting will never help there.
+# A process whose start time cannot be read is busy but never counts as persistent.
+function Get-BusyVeeamWork {
+    param(
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][object[]] $Processes,
+        [Parameter(Mandatory)][datetime] $Now,
+        [Parameter(Mandatory)][ValidateRange(0, 8760)][int] $PersistentHours
+    )
+    $busyNames = New-Object System.Collections.ArrayList
+    $busy = $false
+    $oldest = $null
+    foreach ($proc in @($Processes | Where-Object { $null -ne $_ })) {
+        $nameProp = $proc.PSObject.Properties['Name']
+        if ($null -eq $nameProp) { continue }
+        $name = "$($nameProp.Value)" -replace '(?i)\.exe$', ''
+        $isBusy = ($name -ieq 'Veeam.Backup.Manager') -or ($name -ieq 'VeeamAgent') -or ($name -ilike 'Veeam*Explorer*')
+        if (-not $isBusy) { continue }
+        $busy = $true
+        if (-not ($busyNames -icontains $name)) { [void]$busyNames.Add($name) }
+        $start = $null
+        try {
+            # Reading StartTime of a protected process throws; that only loses the age.
+            $startProp = $proc.PSObject.Properties['StartTime']
+            if ($null -ne $startProp -and $null -ne $startProp.Value) { $start = [datetime]$startProp.Value }
+        } catch { $start = $null }
+        if ($null -ne $start -and ($null -eq $oldest -or $start -lt $oldest)) { $oldest = $start }
+    }
+    $persistent = $false
+    if ($busy -and $null -ne $oldest) { $persistent = (($Now - $oldest).TotalHours -gt $PersistentHours) }
+    $sortedNames = [string[]]@($busyNames)
+    [Array]::Sort($sortedNames, [System.StringComparer]::OrdinalIgnoreCase)
+    return [pscustomobject]@{
+        Busy       = $busy
+        Persistent = $persistent
+        Names      = $sortedNames
+    }
+}
+
+# Every service whose Name starts with Veeam, as plain data (spec 7.6 Path B step 3).
+# StartType is recorded for the report and the run folder only: this script never
+# changes a startup type (spec 7.12). Dependents comes from DependentServices, which
+# Windows fills with direct and indirect dependents. A failed enumeration throws
+# (no match is not an error for a wildcard): an empty snapshot must mean "no Veeam
+# service", never "could not look", or Path B would switch with services running.
+function Get-VeeamServiceSnapshot {
+    $result = @()
+    foreach ($svc in @(Get-Service -Name 'Veeam*' -ErrorAction Stop | Where-Object { $null -ne $_ })) {
+        $name = "$($svc.Name)"
+        if ($name -notlike 'Veeam*') { continue }
+        $startType = 'Unknown'
+        try {
+            $startTypeProp = $svc.PSObject.Properties['StartType']
+            if ($null -ne $startTypeProp -and "$($startTypeProp.Value)") { $startType = "$($startTypeProp.Value)" }
+        } catch { $startType = 'Unknown' }
+        $dependsOn = @()
+        try { $dependsOn = @($svc.ServicesDependedOn | ForEach-Object { "$($_.Name)" } | Where-Object { $_ }) } catch { $dependsOn = @() }
+        $dependents = @()
+        try { $dependents = @($svc.DependentServices | ForEach-Object { "$($_.Name)" } | Where-Object { $_ }) } catch { $dependents = @() }
+        $result += [pscustomobject]@{
+            Name       = $name
+            Status     = "$($svc.Status)"
+            StartType  = $startType
+            DependsOn  = [string[]]$dependsOn
+            Dependents = [string[]]$dependents
+        }
+    }
+    return $result
+}
+
+# The stop set and the updater's stop order: alphabetical (ordinal, so 5.1 and 7
+# agree), with any *Management*Agent* service last. "Running" means any state other
+# than Stopped: a service that is starting, paused or already stopping can still
+# hold a database connection, so it must be down before the switch.
+function Get-StopSet {
+    param([Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][object[]] $Snapshot)
+    $plain = New-Object System.Collections.ArrayList
+    $agents = New-Object System.Collections.ArrayList
+    $seen = @{}
+    foreach ($svc in @($Snapshot | Where-Object { $null -ne $_ })) {
+        $name = "$($svc.Name)"
+        if (-not $name -or $seen.ContainsKey($name)) { continue }
+        if ("$($svc.Status)" -eq 'Stopped') { continue }
+        $seen[$name] = $true
+        if ($name -like '*Management*Agent*') { [void]$agents.Add($name) } else { [void]$plain.Add($name) }
+    }
+    $first = [string[]]@($plain)
+    $last = [string[]]@($agents)
+    [Array]::Sort($first, [System.StringComparer]::OrdinalIgnoreCase)
+    [Array]::Sort($last, [System.StringComparer]::OrdinalIgnoreCase)
+    return [string[]]@($first + $last)
+}
+
+# Running services outside the stop set that depend directly on a member of it
+# (spec 7.6 Path B step 3, SERVICE_DEPENDENT_OUTSIDE_SET). Objects carry Name, Status
+# and DependsOn; a raw Get-Service object (ServicesDependedOn) is accepted too.
+function Get-ExternalDependents {
+    param(
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][string[]] $StopSet,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][object[]] $AllServices
+    )
+    $inSet = @{}
+    foreach ($n in @($StopSet | Where-Object { $_ })) { $inSet["$n"] = $true }
+    $found = @{}
+    if ($inSet.Count -gt 0) {
+        foreach ($svc in @($AllServices | Where-Object { $null -ne $_ })) {
+            $name = "$($svc.Name)"
+            if (-not $name -or $inSet.ContainsKey($name)) { continue }
+            if ("$($svc.Status)" -eq 'Stopped') { continue }
+            $deps = @()
+            $dependsOnProp = $svc.PSObject.Properties['DependsOn']
+            if ($null -ne $dependsOnProp) {
+                $deps = @($dependsOnProp.Value | Where-Object { $_ } | ForEach-Object { "$_" })
+            } else {
+                try { $deps = @($svc.ServicesDependedOn | Where-Object { $_ } | ForEach-Object { "$($_.Name)" }) } catch { $deps = @() }
+            }
+            foreach ($dep in $deps) {
+                if ($dep -and $inSet.ContainsKey($dep)) { $found[$name] = $true; break }
+            }
+        }
+    }
+    $result = [string[]]@($found.Keys)
+    [Array]::Sort($result, [System.StringComparer]::OrdinalIgnoreCase)
+    return $result
+}
+
+# Adapted from the updater's Get-VeeamServiceStartOrder: a topological sort over
+# DependsOn, in waves. Only dependencies that are themselves in Names are waited for
+# (Windows starts RpcSs and friends on its own). Each wave is sorted alphabetically.
+# Anything left in a cycle is appended alphabetically, never dropped. A name with no
+# snapshot entry has no known dependencies.
+function Get-StartOrder {
+    param(
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][object[]] $Snapshot,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][string[]] $Names
+    )
+    $wanted = New-Object System.Collections.ArrayList
+    $inSet = @{}
+    foreach ($n in @($Names | Where-Object { $_ })) {
+        if ($inSet.ContainsKey("$n")) { continue }
+        $inSet["$n"] = $true
+        [void]$wanted.Add("$n")
+    }
+    $deps = @{}
+    foreach ($rec in @($Snapshot | Where-Object { $null -ne $_ })) {
+        $nameProp = $rec.PSObject.Properties['Name']
+        if ($null -eq $nameProp) { continue }
+        $name = "$($nameProp.Value)"
+        if (-not $inSet.ContainsKey($name)) { continue }
+        $list = @()
+        $depProp = $rec.PSObject.Properties['DependsOn']
+        if ($null -ne $depProp) {
+            $list = @($depProp.Value | Where-Object { $_ } | ForEach-Object { "$_" } |
+                Where-Object { $inSet.ContainsKey($_) -and $_ -ne $name })
+        }
+        $deps[$name] = $list
+    }
+    $ordered = New-Object System.Collections.ArrayList
+    $done = @{}
+    $remaining = @($wanted)
+    while ($remaining.Count -gt 0) {
+        $ready = @()
+        foreach ($n in $remaining) {
+            $open = @()
+            if ($deps.ContainsKey($n)) { $open = @($deps[$n] | Where-Object { -not $done.ContainsKey($_) }) }
+            if ($open.Count -eq 0) { $ready += $n }
+        }
+        if ($ready.Count -eq 0) {
+            $rest = [string[]]@($remaining)
+            [Array]::Sort($rest, [System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($n in $rest) { [void]$ordered.Add($n) }
+            break
+        }
+        $wave = [string[]]@($ready)
+        [Array]::Sort($wave, [System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($n in $wave) {
+            $done[$n] = $true
+            [void]$ordered.Add($n)
+        }
+        $remaining = @($remaining | Where-Object { -not $done.ContainsKey($_) })
+    }
+    return [string[]]@($ordered)
+}
+
+# Stop the named services, bounded by TimeoutSec in total (spec 7.12). Never the Force switch:
+# Windows must refuse to stop a service whose dependents still run, rather than
+# cascade into a service outside the plan. That refusal is expected while the
+# dependents are still stopping, so every poll (every 2 s) asks again for each
+# service that is up and not already StopPending, which gives the updater's
+# multi-pass stop order. The final state decides, not the request calls. A service
+# that no longer exists counts as NotStopped, because the inventory changed.
+function Stop-ServicesBounded {
+    param(
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][string[]] $Names,
+        [Parameter(Mandatory)][ValidateRange(0, 86400)][int] $TimeoutSec
+    )
+    $order = New-Object System.Collections.ArrayList
+    $seen = @{}
+    foreach ($n in @($Names | Where-Object { $_ })) {
+        if ($seen.ContainsKey("$n")) { continue }
+        $seen["$n"] = $true
+        [void]$order.Add("$n")
+    }
+    $requested = @{}
+    $lastError = @{}
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $pending = 0
+        foreach ($name in $order) {
+            $svc = @(Get-Service -Name $name -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+            if ($svc.Count -eq 0) { continue }
+            $status = "$($svc[0].Status)"
+            if ($status -eq 'Stopped') { continue }
+            $pending++
+            if ($status -eq 'StopPending') { continue }
+            if (-not $requested.ContainsKey($name)) { Write-Log -Message "  stopping $name" -Level 'INFO' }
+            $requested[$name] = $true
+            try {
+                Stop-Service -Name $name -NoWait -ErrorAction Stop
+                $lastError.Remove($name)
+            } catch {
+                $lastError[$name] = "$($_.Exception.Message)"
+            }
+        }
+        if ($pending -eq 0) { break }
+        $remaining = $TimeoutSec - $timer.Elapsed.TotalSeconds
+        if ($remaining -le 0) { break }
+        Start-Sleep -Milliseconds ([int][math]::Min(2000, [math]::Ceiling($remaining * 1000)))
+    }
+    $stopped = @()
+    $notStopped = @()
+    $problems = @()
+    foreach ($name in $order) {
+        $svc = @(Get-Service -Name $name -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+        if ($svc.Count -eq 0) {
+            $notStopped += $name
+            $problems += "$name=missing"
+            continue
+        }
+        $status = "$($svc[0].Status)"
+        if ($status -eq 'Stopped') { $stopped += $name; continue }
+        $notStopped += $name
+        $why = "$name=$status"
+        if ($lastError.ContainsKey($name)) { $why += " ($(Format-ShortText -Text $lastError[$name] -MaxLength 200))" }
+        $problems += $why
+    }
+    if ($notStopped.Count -eq 0) {
+        Write-Log -Message "Stopped $($stopped.Count) service(s) within ${TimeoutSec}s" -Level 'OK'
+    } else {
+        Write-Log -Message "Not stopped within ${TimeoutSec}s: $($problems -join '; ')" -Level 'WARN'
+    }
+    return [pscustomobject]@{
+        Ok         = ($notStopped.Count -eq 0)
+        Stopped    = [string[]]$stopped
+        NotStopped = [string[]]$notStopped
+    }
+}
+
+# Start the named services in the given order (use Get-StartOrder), bounded by
+# TimeoutSec in total (spec 7.12): ServiceController.Start(), then WaitForStatus with
+# the time that is left. Start() can throw while a slow service is in fact coming up
+# (VBR 13 Backup Service), so the state read at the end decides. Each service gets
+# its Start() request even when the time is used up, so nothing is left unasked.
+function Start-ServicesBounded {
+    param(
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][string[]] $Names,
+        [Parameter(Mandatory)][ValidateRange(0, 86400)][int] $TimeoutSec
+    )
+    $order = New-Object System.Collections.ArrayList
+    $seen = @{}
+    foreach ($n in @($Names | Where-Object { $_ })) {
+        if ($seen.ContainsKey("$n")) { continue }
+        $seen["$n"] = $true
+        [void]$order.Add("$n")
+    }
+    $started = @()
+    $notStarted = @()
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    foreach ($name in $order) {
+        $found = @(Get-Service -Name $name -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+        if ($found.Count -eq 0) {
+            Write-Log -Message "  cannot start ${name}: the service does not exist" -Level 'WARN'
+            $notStarted += $name
+            continue
+        }
+        $sc = $found[0]
+        try { $sc.Refresh() } catch {}
+        if ("$($sc.Status)" -eq 'Running') { $started += $name; continue }
+        if ("$($sc.Status)" -eq 'StopPending') {
+            $left = [math]::Max(0, $TimeoutSec - $timer.Elapsed.TotalSeconds)
+            try { $sc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds($left)) } catch {}
+            try { $sc.Refresh() } catch {}
+        }
+        if ("$($sc.Status)" -eq 'Stopped') {
+            Write-Log -Message "  starting $name" -Level 'INFO'
+            try { $sc.Start() }
+            catch { Write-Log -Message "  start request for $name reported: $(Format-ShortText -Text $_.Exception.Message -MaxLength 300)" -Level 'WARN' }
+        }
+        $left = [math]::Max(0, $TimeoutSec - $timer.Elapsed.TotalSeconds)
+        try { $sc.WaitForStatus('Running', [TimeSpan]::FromSeconds($left)) } catch {}
+        try { $sc.Refresh() } catch {}
+        if ("$($sc.Status)" -eq 'Running') { $started += $name }
+        else {
+            Write-Log -Message "  $name is $($sc.Status), not Running" -Level 'WARN'
+            $notStarted += $name
+        }
+    }
+    if ($notStarted.Count -eq 0) {
+        Write-Log -Message "Started $($started.Count) service(s) within ${TimeoutSec}s" -Level 'OK'
+    } else {
+        Write-Log -Message "Not running within ${TimeoutSec}s: $($notStarted -join ', ')" -Level 'WARN'
+    }
+    return [pscustomobject]@{
+        Ok         = ($notStarted.Count -eq 0)
+        Started    = [string[]]$started
+        NotStarted = [string[]]$notStarted
+    }
+}
+
+# True when the service is Running at every poll (every 5 s) for Seconds, including
+# one last read at the end (Path B rollback settle, spec 7.6 rollback step 5).
+function Test-ServiceStaysRunning {
+    param(
+        [Parameter(Mandatory)][string] $Name,
+        [Parameter(Mandatory)][ValidateRange(0, 86400)][int] $Seconds
+    )
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $svc = @(Get-Service -Name $Name -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+        if ($svc.Count -eq 0) {
+            Write-Log -Message "  $Name does not exist" -Level 'WARN'
+            return $false
+        }
+        if ("$($svc[0].Status)" -ne 'Running') {
+            Write-Log -Message "  $Name is $($svc[0].Status) after $([int]$timer.Elapsed.TotalSeconds)s" -Level 'WARN'
+            return $false
+        }
+        $remaining = $Seconds - $timer.Elapsed.TotalSeconds
+        if ($remaining -le 0) { return $true }
+        Start-Sleep -Milliseconds ([int][math]::Min(5000, [math]::Ceiling($remaining * 1000)))
+    }
+}
 #endregion Services
 
 #region Registry
