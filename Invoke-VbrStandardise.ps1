@@ -1634,6 +1634,129 @@ function Get-ListeningLoopback {
 #endregion PgDiscovery
 
 #region Names
+# SID -> the exact LSA name, split at the backslash. PostgreSQL builds the SSPI
+# name from the same LookupAccountSid call, so the result matches what it sees.
+function Get-NtAccountParts {
+    param([Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier] $Sid)
+
+    $nt = $Sid.Translate([System.Security.Principal.NTAccount]).Value
+    $i = $nt.IndexOf('\')
+    if ($i -lt 0) { return [pscustomobject]@{ Domain = ''; Name = $nt } }
+    return [pscustomobject]@{ Domain = $nt.Substring(0, $i); Name = $nt.Substring($i + 1) }
+}
+
+# pg_ident.conf compares SSPI users as name@domain (include_realm=1, compat_realm=1).
+function ConvertTo-SspiMapName {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string] $Domain,
+        [Parameter(Mandatory)][string] $Name
+    )
+    return '{0}@{1}' -f $Name, $Domain
+}
+
+function Get-SspiMapNameFromSid {
+    param([Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier] $Sid)
+
+    $parts = Get-NtAccountParts -Sid $Sid
+    return ConvertTo-SspiMapName -Domain $parts.Domain -Name $parts.Name
+}
+# True when every character is printable ASCII (0x20-0x7E). New pg_ident lines must be ASCII.
+function Test-AsciiText {
+    param([Parameter(Mandatory)][AllowEmptyString()][string] $Text)
+    return [regex]::IsMatch($Text, '\A[\x20-\x7E]*\z')
+}
+
+# The English SYSTEM name that Veeam writes, and the name this Windows really uses.
+function Get-SystemMapNames {
+    $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+    $translated = Get-SspiMapNameFromSid -Sid $systemSid
+    return [pscustomobject]@{
+        English    = 'SYSTEM@NT AUTHORITY'
+        Translated = $translated
+        IsAscii    = (Test-AsciiText -Text $translated)
+    }
+}
+# Turns a Win32_Service StartName into a pg_ident name. The translator takes
+# DOMAIN\x or a UPN and returns name@domain; tests pass a fake one.
+function Resolve-ServiceStartName {
+    param(
+        [AllowNull()][AllowEmptyString()][string] $StartName,
+        [Parameter(Mandatory)][string] $ComputerName,
+        [scriptblock] $Translator
+    )
+
+    $name = "$StartName".Trim()
+    if (-not $name -or (@('LocalSystem', 'NT AUTHORITY\SYSTEM', '.\LocalSystem') -contains $name)) {
+        return [pscustomobject]@{ Kind = 'LOCALSYSTEM'; MapName = $null; Detail = "'$name' is LocalSystem" }
+    }
+    $builtIn = @('NT AUTHORITY\NetworkService', 'NT AUTHORITY\Network Service', 'NT AUTHORITY\LocalService', 'NT AUTHORITY\Local Service')
+    if (($builtIn -contains $name) -or $name.EndsWith('$')) {
+        return [pscustomobject]@{ Kind = 'UNSUPPORTED'; MapName = $null; Detail = "Service account '$name' is not supported. NetworkService, LocalService and gMSA accounts cannot be mapped." }
+    }
+    $target = $name
+    if ($target.StartsWith('.\')) { $target = $ComputerName + '\' + $target.Substring(2) }
+    if (-not $Translator) {
+        $Translator = {
+            param([string] $AccountName)
+            $account = New-Object System.Security.Principal.NTAccount($AccountName)
+            $accountSid = $account.Translate([System.Security.Principal.SecurityIdentifier])
+            Get-SspiMapNameFromSid -Sid $accountSid
+        }
+    }
+    try {
+        $mapName = "$(& $Translator $target)".Trim()
+    } catch {
+        return [pscustomobject]@{ Kind = 'UNRESOLVED'; MapName = $null; Detail = "Service account '$name' could not be resolved: $($_.Exception.Message)" }
+    }
+    if (-not $mapName) {
+        return [pscustomobject]@{ Kind = 'UNRESOLVED'; MapName = $null; Detail = "Service account '$name' resolved to an empty name." }
+    }
+    return [pscustomobject]@{ Kind = 'ACCOUNT'; MapName = $mapName; Detail = "'$name' maps to '$mapName'" }
+}
+
+# pg_ident names of every Veeam* service that does not run as LocalSystem.
+# Unresolved holds each StartName that cannot be mapped (spec 7.3: SERVICE_ACCOUNT_UNRESOLVED).
+function Get-VeeamServiceAccountNames {
+    param(
+        [AllowNull()][AllowEmptyCollection()][object[]] $Services,
+        [string] $ComputerName = $env:COMPUTERNAME,
+        [scriptblock] $Translator
+    )
+
+    $mapNames = New-Object System.Collections.ArrayList
+    $unresolved = New-Object System.Collections.ArrayList
+    if (-not $PSBoundParameters.ContainsKey('Services')) {
+        try {
+            $Services = @(Get-CimInstance -ClassName Win32_Service -Filter "Name LIKE 'Veeam%'" -ErrorAction Stop)
+        } catch {
+            Write-Log "Could not list the Veeam services: $($_.Exception.Message)" WARN
+            [void]$unresolved.Add("(Veeam service list unavailable: $($_.Exception.Message))")
+            return [pscustomobject]@{ MapNames = [string[]]@(); Unresolved = [string[]]@($unresolved) }
+        }
+    }
+    $resolveArgs = @{ ComputerName = $ComputerName }
+    if ($Translator) { $resolveArgs['Translator'] = $Translator }
+
+    $rows = @()
+    foreach ($s in @($Services)) {
+        if ($null -eq $s) { continue }
+        $serviceName = "$(Get-CfgValue -Object $s -Name 'Name')"
+        if ($serviceName -notlike 'Veeam*') { continue }
+        $rows += [pscustomobject]@{ Name = $serviceName; StartName = "$(Get-CfgValue -Object $s -Name 'StartName')" }
+    }
+    foreach ($row in @($rows | Sort-Object Name)) {
+        $res = Resolve-ServiceStartName -StartName $row.StartName @resolveArgs
+        if ($res.Kind -eq 'LOCALSYSTEM') { continue }
+        if ($res.Kind -eq 'ACCOUNT') {
+            Write-Log "Service $($row.Name) runs as '$($row.StartName)' (pg_ident name '$($res.MapName)')."
+            if (-not (@($mapNames) -contains $res.MapName)) { [void]$mapNames.Add($res.MapName) }
+            continue
+        }
+        Write-Log "Service $($row.Name): $($res.Detail)" WARN
+        if (-not (@($unresolved) -contains $row.StartName)) { [void]$unresolved.Add($row.StartName) }
+    }
+    return [pscustomobject]@{ MapNames = [string[]]@($mapNames); Unresolved = [string[]]@($unresolved) }
+}
 #endregion Names
 
 #region Account

@@ -1322,6 +1322,128 @@ if (-not (Test-Path -LiteralPath 'HKLM:\SOFTWARE\PostgreSQL\Installations')) {
 } else {
     Skip 'T5 default key on a machine without PostgreSQL gives NO_PG_FOUND' 'PostgreSQL is installed on this machine'
 }
+# --- Task 6: Windows account names for SSPI ---
+Check 'T6 map name is name@domain' (ConvertTo-SspiMapName -Domain 'NT AUTHORITY' -Name 'SYSTEM') 'SYSTEM@NT AUTHORITY'
+Check 'T6 map name keeps the case it is given' (ConvertTo-SspiMapName -Domain 'Ws-Example' -Name 'svc_veeam') 'svc_veeam@Ws-Example'
+
+# Real SIDs: SYSTEM (S-1-5-18) and the account running the tests.
+$t6SystemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+$t6SystemNt = $t6SystemSid.Translate([System.Security.Principal.NTAccount]).Value
+if ($t6SystemNt -eq 'NT AUTHORITY\SYSTEM') {
+    $t6Parts = Get-NtAccountParts -Sid $t6SystemSid
+    Check 'T6 S-1-5-18 domain part' $t6Parts.Domain 'NT AUTHORITY'
+    Check 'T6 S-1-5-18 name part' $t6Parts.Name 'SYSTEM'
+    Check 'T6 S-1-5-18 map name' (Get-SspiMapNameFromSid -Sid $t6SystemSid) 'SYSTEM@NT AUTHORITY'
+} else {
+    Skip 'T6 S-1-5-18 domain part' "non-English Windows ($t6SystemNt)"
+    Skip 'T6 S-1-5-18 name part' "non-English Windows ($t6SystemNt)"
+    Skip 'T6 S-1-5-18 map name' "non-English Windows ($t6SystemNt)"
+}
+$t6EveryoneSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')
+Check 'T6 SID without a domain gives an empty domain part' (Get-NtAccountParts -Sid $t6EveryoneSid).Domain ''
+$t6Me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$t6MeDomain = $t6Me.Name.Substring(0, $t6Me.Name.IndexOf('\'))
+$t6MeUser = $t6Me.Name.Substring($t6Me.Name.IndexOf('\') + 1)
+$t6MeMap = '{0}@{1}' -f $t6MeUser, $t6MeDomain
+$t6MeParts = Get-NtAccountParts -Sid $t6Me.User
+Check 'T6 current user domain part' $t6MeParts.Domain $t6MeDomain
+Check 'T6 current user name part' $t6MeParts.Name $t6MeUser
+Check 'T6 current user map name from SID' (Get-SspiMapNameFromSid -Sid $t6Me.User) $t6MeMap
+
+# ASCII test.
+Check 'T6 English SYSTEM name is ASCII' (Test-AsciiText -Text 'SYSTEM@NT AUTHORITY') 'True'
+Check 'T6 German SYSTEM name is not ASCII' (Test-AsciiText -Text "SYSTEM@NT-AUTORIT$([char]0x00C4)T") 'False'
+Check 'T6 tab is not printable ASCII' (Test-AsciiText -Text "SYSTEM`t@NT AUTHORITY") 'False'
+Check 'T6 trailing line feed is not printable ASCII' (Test-AsciiText -Text "SYSTEM@NT AUTHORITY`n") 'False'
+Check 'T6 empty text is ASCII' (Test-AsciiText -Text '') 'True'
+
+# SYSTEM names: the real translation, then a mocked localised one.
+$t6Sys = Get-SystemMapNames
+Check 'T6 English SYSTEM name is fixed' $t6Sys.English 'SYSTEM@NT AUTHORITY'
+Check 'T6 translated SYSTEM name comes from S-1-5-18' $t6Sys.Translated (Get-SspiMapNameFromSid -Sid $t6SystemSid)
+Check 'T6 IsAscii matches the translated name' $t6Sys.IsAscii (Test-AsciiText -Text $t6Sys.Translated)
+& {
+    function Get-SspiMapNameFromSid { param($Sid) "SYSTEM@NT-AUTORIT$([char]0x00C4)T" }
+    $n = Get-SystemMapNames
+    Check 'T6 localised SYSTEM name is flagged non-ASCII' $n.IsAscii 'False'
+    Check 'T6 localised SYSTEM name is returned' $n.Translated "SYSTEM@NT-AUTORIT$([char]0x00C4)T"
+    Check 'T6 English name stays fixed on localised Windows' $n.English 'SYSTEM@NT AUTHORITY'
+}
+
+# Resolve-ServiceStartName with a fake translator that records what it was asked.
+$t6Seen = New-Object System.Collections.ArrayList
+$t6Fake = {
+    param([string] $AccountName)
+    [void]$t6Seen.Add($AccountName)
+    switch -CaseSensitive ($AccountName) {
+        'CORP\svc_backup'             { return 'svc_backup@CORP' }
+        'CORP\SVC_BACKUP'             { return 'SVC_BACKUP@corp' }
+        'svc_backup@corp.example.com' { return 'svc_backup@CORP' }
+        'HOST1\localsvc'              { return 'localsvc@HOST1' }
+        'CORP\blank'                  { return '' }
+        default { throw "Some or all identity references could not be translated: $AccountName" }
+    }
+}
+foreach ($t6Name in @('LocalSystem', 'NT AUTHORITY\SYSTEM', 'nt authority\system', '.\LocalSystem', '')) {
+    Check "T6 '$t6Name' is LOCALSYSTEM" (Resolve-ServiceStartName -StartName $t6Name -ComputerName 'HOST1' -Translator $t6Fake).Kind 'LOCALSYSTEM'
+}
+Check 'T6 null StartName is LOCALSYSTEM' (Resolve-ServiceStartName -StartName $null -ComputerName 'HOST1' -Translator $t6Fake).Kind 'LOCALSYSTEM'
+foreach ($t6Name in @('NT AUTHORITY\NetworkService', 'NT AUTHORITY\Network Service', 'NT AUTHORITY\LocalService', 'CORP\gmsa_veeam$')) {
+    Check "T6 '$t6Name' is UNSUPPORTED" (Resolve-ServiceStartName -StartName $t6Name -ComputerName 'HOST1' -Translator $t6Fake).Kind 'UNSUPPORTED'
+}
+Check 'T6 translator not called for LocalSystem or unsupported names' $t6Seen.Count '0'
+$t6R = Resolve-ServiceStartName -StartName 'CORP\gmsa_veeam$' -ComputerName 'HOST1' -Translator $t6Fake
+Check 'T6 unsupported detail names the account' ($t6R.Detail -like '*CORP\gmsa_veeam$*') 'True'
+$t6R = Resolve-ServiceStartName -StartName 'CORP\svc_backup' -ComputerName 'HOST1' -Translator $t6Fake
+Check 'T6 DOMAIN\x is ACCOUNT' $t6R.Kind 'ACCOUNT'
+Check 'T6 DOMAIN\x map name' $t6R.MapName 'svc_backup@CORP'
+$t6R = Resolve-ServiceStartName -StartName 'svc_backup@corp.example.com' -ComputerName 'HOST1' -Translator $t6Fake
+Check 'T6 UPN is ACCOUNT' $t6R.Kind 'ACCOUNT'
+Check 'T6 UPN map name' $t6R.MapName 'svc_backup@CORP'
+$t6Seen.Clear()
+$t6R = Resolve-ServiceStartName -StartName '.\localsvc' -ComputerName 'HOST1' -Translator $t6Fake
+Check 'T6 .\x is translated as COMPUTERNAME\x' ($t6Seen -join ',') 'HOST1\localsvc'
+Check 'T6 .\x map name' $t6R.MapName 'localsvc@HOST1'
+$t6R = Resolve-ServiceStartName -StartName 'CORP\gone' -ComputerName 'HOST1' -Translator $t6Fake
+Check 'T6 translator error gives UNRESOLVED' $t6R.Kind 'UNRESOLVED'
+Check 'T6 UNRESOLVED detail names the account' ($t6R.Detail -like '*CORP\gone*') 'True'
+Check 'T6 UNRESOLVED has no map name' ($null -eq $t6R.MapName) 'True'
+Check 'T6 empty translation gives UNRESOLVED' (Resolve-ServiceStartName -StartName 'CORP\blank' -ComputerName 'HOST1' -Translator $t6Fake).Kind 'UNRESOLVED'
+
+# Default translator (real LSA lookups).
+$t6R = Resolve-ServiceStartName -StartName $t6Me.Name -ComputerName $env:COMPUTERNAME
+Check 'T6 default translator resolves the current user' $t6R.Kind 'ACCOUNT'
+Check 'T6 default translator map name equals the SID map name' $t6R.MapName $t6MeMap
+if ($t6MeDomain -ieq $env:COMPUTERNAME) {
+    Check 'T6 default translator resolves .\ for a local account' (Resolve-ServiceStartName -StartName ".\$t6MeUser" -ComputerName $env:COMPUTERNAME).MapName $t6MeMap
+} else {
+    Skip 'T6 default translator resolves .\ for a local account' 'the test account is not a local account'
+}
+Check 'T6 default translator: unknown account is UNRESOLVED' (Resolve-ServiceStartName -StartName "NoSuchDomain$PID\nobody$PID" -ComputerName $env:COMPUTERNAME).Kind 'UNRESOLVED'
+
+# Get-VeeamServiceAccountNames over fake services.
+$t6Svcs = @(
+    [pscustomobject]@{ Name = 'VeeamBackupSvc'; StartName = 'LocalSystem' },
+    [pscustomobject]@{ Name = 'VeeamBackupRESTSvc'; StartName = '.\localsvc' },
+    [pscustomobject]@{ Name = 'VeeamBrokerSvc'; StartName = 'CORP\svc_backup' },
+    [pscustomobject]@{ Name = 'VeeamCatalogSvc'; StartName = 'svc_backup@corp.example.com' },
+    [pscustomobject]@{ Name = 'VeeamWebSvc'; StartName = 'CORP\SVC_BACKUP' },
+    [pscustomobject]@{ Name = 'VeeamNFSSvc'; StartName = 'NT AUTHORITY\NetworkService' },
+    [pscustomobject]@{ Name = 'VeeamCloudSvc'; StartName = 'CORP\gmsa_veeam$' },
+    [pscustomobject]@{ Name = 'VeeamMountSvc'; StartName = 'CORP\gone' },
+    [pscustomobject]@{ Name = 'VeeamDeploySvc' },
+    [pscustomobject]@{ Name = 'Spooler'; StartName = 'CORP\other' }
+)
+$t6Res = Get-VeeamServiceAccountNames -Services $t6Svcs -ComputerName 'HOST1' -Translator $t6Fake
+Check 'T6 service map names: resolved, case-insensitive duplicates removed' (@($t6Res.MapNames) -join ',') 'localsvc@HOST1,svc_backup@CORP'
+Check 'T6 unresolved StartNames listed' (@($t6Res.Unresolved) -join ',') 'CORP\gmsa_veeam$,CORP\gone,NT AUTHORITY\NetworkService'
+Check 'T6 non-Veeam services ignored' ($t6Seen -contains 'CORP\other') 'False'
+Check 'T6 unsupported account logged as WARN with the service name' (@($script:LogLines | Where-Object { $_ -like '`[WARN`]*VeeamCloudSvc*' }).Count -gt 0) 'True'
+$t6None = Get-VeeamServiceAccountNames -Services @() -ComputerName 'HOST1' -Translator $t6Fake
+Check 'T6 no services: no map names' (@($t6None.MapNames).Count) '0'
+Check 'T6 no services: nothing unresolved' (@($t6None.Unresolved).Count) '0'
+$t6Default = Get-VeeamServiceAccountNames
+Check 'T6 default service list returns both lists' ($null -ne $t6Default.PSObject.Properties['MapNames'] -and $null -ne $t6Default.PSObject.Properties['Unresolved']) 'True'
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue
