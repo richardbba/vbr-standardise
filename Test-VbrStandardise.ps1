@@ -910,6 +910,14 @@ try {
     Check 'Get-VbrDbConfig: out-of-range port is null' ($null -eq (Get-VbrDbConfig -RootKey $t4Vbr).Port) 'True'
     Remove-ItemProperty -LiteralPath $t4Pg -Name 'SqlHostPort'
     Check 'Get-VbrDbConfig: absent port is null' ($null -eq (Get-VbrDbConfig -RootKey $t4Vbr).Port) 'True'
+    & $t4SetValue $t4Vbr 'EntraIdSqlHostPort' '5433'
+    Check 'Get-VbrDbConfig: string EntraIdPort is parsed' (Get-VbrDbConfig -RootKey $t4Vbr).EntraIdPort 5433
+    & $t4SetValue $t4Vbr 'EntraIdSqlHostPort' 'abc'
+    Check 'Get-VbrDbConfig: text EntraIdPort is null' ($null -eq (Get-VbrDbConfig -RootKey $t4Vbr).EntraIdPort) 'True'
+    & $t4SetValue $t4Vbr 'EntraIdSqlHostPort' 70000 'DWord'
+    Check 'Get-VbrDbConfig: out-of-range EntraIdPort is null' ($null -eq (Get-VbrDbConfig -RootKey $t4Vbr).EntraIdPort) 'True'
+    Remove-ItemProperty -LiteralPath $t4Vbr -Name 'EntraIdSqlHostPort'
+    Check 'Get-VbrDbConfig: absent EntraIdPort is null' ($null -eq (Get-VbrDbConfig -RootKey $t4Vbr).EntraIdPort) 'True'
     Remove-ItemProperty -LiteralPath $t4Pg -Name 'PostgresUserForWindowsAuth'
     Check 'Get-VbrDbConfig: absent PostgresUserForWindowsAuth is empty' (Get-VbrDbConfig -RootKey $t4Vbr).WindowsAuthRole ''
     $t4C = Get-VbrDbConfig -RootKey "$t4Key\NoSuchProduct"
@@ -930,6 +938,34 @@ try {
     Check 'Get-EnterpriseManagerDbConfig: Port' $t4E.Port 5432
     Check 'Get-EnterpriseManagerDbConfig: PasswordSet' $t4E.PasswordSet 'True'
     Check 'Get-EnterpriseManagerDbConfig: never returns password data' (@($t4E.PSObject.Properties | Where-Object { "$($_.Value)" -like '*fake-secret*' }).Count) 0
+
+    # Get-EnterpriseManagerDbConfig: ports (same rule as the VBR ports)
+    $t4EmPg = "$t4Em\DatabaseConfigurations\PostgreSql"
+    & $t4SetValue $t4EmPg 'SqlHostPort' '5433'
+    Check 'Get-EnterpriseManagerDbConfig: string port is parsed' (Get-EnterpriseManagerDbConfig -RootKey $t4Em).Port 5433
+    & $t4SetValue $t4EmPg 'SqlHostPort' 'abc'
+    Check 'Get-EnterpriseManagerDbConfig: text port is null' ($null -eq (Get-EnterpriseManagerDbConfig -RootKey $t4Em).Port) 'True'
+    & $t4SetValue $t4EmPg 'SqlHostPort' 70000 'DWord'
+    Check 'Get-EnterpriseManagerDbConfig: out-of-range port is null' ($null -eq (Get-EnterpriseManagerDbConfig -RootKey $t4Em).Port) 'True'
+    Remove-ItemProperty -LiteralPath $t4EmPg -Name 'SqlHostPort'
+    Check 'Get-EnterpriseManagerDbConfig: absent port is null' ($null -eq (Get-EnterpriseManagerDbConfig -RootKey $t4Em).Port) 'True'
+
+    # Get-RegPort: the one port parser behind Port, EntraIdPort and the EM port
+    $t4PortKey = "$t4Key\Ports"
+    & $t4SetValue $t4PortKey 'P' 5432 'DWord'
+    Check 'Get-RegPort: DWord value' (Get-RegPort -Path $t4PortKey -Name 'P') 5432
+    Check 'Get-RegPort: result is an int' ((Get-RegPort -Path $t4PortKey -Name 'P') -is [int]) 'True'
+    $t4PortCases = @(
+        @{ Value = '1'; Expected = '1' }, @{ Value = '65535'; Expected = '65535' }, @{ Value = '5433'; Expected = '5433' },
+        @{ Value = '0'; Expected = '' }, @{ Value = '65536'; Expected = '' }, @{ Value = '-1'; Expected = '' },
+        @{ Value = ''; Expected = '' }, @{ Value = 'abc'; Expected = '' }, @{ Value = '54x'; Expected = '' }
+    )
+    foreach ($t4Case in $t4PortCases) {
+        & $t4SetValue $t4PortKey 'P' $t4Case.Value
+        Check "Get-RegPort: text '$($t4Case.Value)'" "$(Get-RegPort -Path $t4PortKey -Name 'P')" $t4Case.Expected
+    }
+    Check 'Get-RegPort: absent value is null' ($null -eq (Get-RegPort -Path $t4PortKey -Name 'NoSuchValue')) 'True'
+    Check 'Get-RegPort: absent key is null' ($null -eq (Get-RegPort -Path "$t4Key\NoSuchPorts" -Name 'P')) 'True'
 } finally {
     if (Test-Path -LiteralPath $t4Key) { Remove-Item -LiteralPath $t4Key -Recurse -Force }
 }
@@ -943,6 +979,16 @@ foreach ($t4Node in $ScriptAst.FindAll({ param($n) $n -is [System.Management.Aut
 Check 'Get-VbrInstall: default root key' $t4Defaults['Get-VbrInstall'] "'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication'"
 Check 'Get-VbrDbConfig: default root key' $t4Defaults['Get-VbrDbConfig'] "'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication'"
 Check 'Get-EnterpriseManagerDbConfig: default root key' $t4Defaults['Get-EnterpriseManagerDbConfig'] "'HKLM:\SOFTWARE\Veeam\Veeam Backup Reporting'"
+
+# The port rule lives in Get-RegPort only: the readers call it and parse nothing themselves.
+$t4Fn = @{}
+foreach ($t4Node in $ScriptAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) { $t4Fn[$t4Node.Name] = $t4Node }
+$t4FindRegPortCalls = { param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-RegPort' }
+$t4FindTryParse = { param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and "$($n.Member.Value)" -eq 'TryParse' }
+Check 'Get-VbrDbConfig: Port and EntraIdPort call Get-RegPort' (@($t4Fn['Get-VbrDbConfig'].FindAll($t4FindRegPortCalls, $true)).Count) 2
+Check 'Get-EnterpriseManagerDbConfig: Port calls Get-RegPort' (@($t4Fn['Get-EnterpriseManagerDbConfig'].FindAll($t4FindRegPortCalls, $true)).Count) 1
+Check 'Get-VbrDbConfig: no inline port parser' (@($t4Fn['Get-VbrDbConfig'].FindAll($t4FindTryParse, $true)).Count) 0
+Check 'Get-EnterpriseManagerDbConfig: no inline port parser' (@($t4Fn['Get-EnterpriseManagerDbConfig'].FindAll($t4FindTryParse, $true)).Count) 0
 
 # Test-Vb365Installed (service and file lookups mocked)
 Check 'Test-Vb365Installed: no service and no file' (& {
@@ -964,6 +1010,47 @@ Check 'Get-LocalHostNames: includes the computer name' (@($t4Names | Where-Objec
 Check 'Get-LocalHostNames: includes 127.0.0.1' ($t4Names -contains '127.0.0.1') 'True'
 Check 'Get-LocalHostNames: no empty entries' (@($t4Names | Where-Object { -not $_ }).Count) 0
 Check 'Get-LocalHostNames: no duplicates' (@($t4Names | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique).Count) $t4Names.Count
+
+# Get-LocalHostNames: fake adapters. One adapter that fails is skipped and logged;
+# the addresses of the adapters before and after it are still listed.
+$t4NewNic = {
+    param([string] $Name, [string[]] $Addresses, [bool] $Broken = $false)
+    $nic = [pscustomobject]@{ Name = $Name; Addresses = $Addresses; Broken = $Broken }
+    Add-Member -InputObject $nic -MemberType ScriptMethod -Name GetIPProperties -Value {
+        if ($this.Broken) { throw 'adapter went away' }
+        [pscustomobject]@{ UnicastAddresses = @($this.Addresses | ForEach-Object { [pscustomobject]@{ Address = [System.Net.IPAddress]::Parse($_) } }) }
+    }
+    return $nic
+}
+[void]$script:LogLines.Clear()
+$t4NicNames = @(& {
+    function Get-LocalNetworkInterfaces {
+        (& $t4NewNic 'Ethernet' @('10.77.88.1') $false)
+        (& $t4NewNic 'Broken NIC' @() $true)
+        (& $t4NewNic 'Ethernet 2' @('10.77.88.99', 'fe80::77%5') $false)
+    }
+    Get-LocalHostNames
+})
+Check 'Get-LocalHostNames: address of the adapter before a failing one is listed' ($t4NicNames -contains '10.77.88.1') 'True'
+Check 'Get-LocalHostNames: address of the adapter after a failing one is listed' ($t4NicNames -contains '10.77.88.99') 'True'
+Check 'Get-LocalHostNames: link-local address of a later adapter is listed without its scope id' ($t4NicNames -contains 'fe80::77') 'True'
+Check 'Get-LocalHostNames: failing adapter is logged as WARN with its name and the reason' (@($script:LogLines | Where-Object { $_ -match "^\[WARN\] .*'Broken NIC'.*adapter went away" }).Count) 1
+Check 'Get-LocalHostNames: only the failing adapter is logged' (@($script:LogLines | Where-Object { $_ -match "^\[WARN\] .*network adapter" }).Count) 1
+[void]$script:LogLines.Clear()
+$t4NoNicNames = @(& {
+    function Get-LocalNetworkInterfaces { throw 'no network stack' }
+    Get-LocalHostNames
+})
+Check 'Get-LocalHostNames: failed adapter listing still returns the computer name' (@($t4NoNicNames | Where-Object { $_ -ieq $env:COMPUTERNAME }).Count -ge 1) 'True'
+Check 'Get-LocalHostNames: failed adapter listing is logged as WARN' (@($script:LogLines | Where-Object { $_ -match "^\[WARN\] .*network adapters.*no network stack" }).Count) 1
+# The IPGlobalProperties call cannot be faked, so the catch clauses are checked in the syntax tree:
+# only the DNS catch is quiet (a missing DNS record is normal), the other three log a WARN.
+$t4Catches = @($t4Fn['Get-LocalHostNames'].FindAll({ param($n) $n -is [System.Management.Automation.Language.CatchClauseAst] }, $true))
+Check 'Get-LocalHostNames: catch clause count' $t4Catches.Count 4
+$t4Quiet = @($t4Catches | Where-Object { $_.Body.Statements.Count -eq 0 })
+Check 'Get-LocalHostNames: exactly one catch is quiet' $t4Quiet.Count 1
+Check 'Get-LocalHostNames: the quiet catch is the DNS one' ($t4Quiet.Count -eq 1 -and $t4Quiet[0].Parent.Body.Extent.Text -match 'GetHostEntry') 'True'
+Check 'Get-LocalHostNames: every other catch logs a WARN' (@($t4Catches | Where-Object { $_.Body.Statements.Count -gt 0 -and $_.Body.Extent.Text -match "Write-Log\s.*-Level 'WARN'" }).Count) 3
 
 # Get-DbHostClass
 $t4Local = @('VBR01', 'vbr01.corp.example', '10.1.2.3', 'fe80::1%12')

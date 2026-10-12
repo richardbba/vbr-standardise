@@ -1102,18 +1102,24 @@ function Test-Vb365Installed {
     return [bool](Test-Path -LiteralPath 'C:\Program Files\Veeam\Backup365\Veeam.Archiver.Service.exe' -PathType Leaf)
 }
 
+# Reads a registry value as a TCP port: [int] in 1-65535, otherwise $null (value
+# absent, text or out of range). The one place that decides what a valid port is.
+function Get-RegPort {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Name
+    )
+    $raw = Get-RegValue -Path $Path -Name $Name
+    $number = 0
+    if ($null -ne $raw -and [int]::TryParse("$raw", [ref]$number) -and $number -ge 1 -and $number -le 65535) { return $number }
+    return $null
+}
+
 # Reads the VBR database settings. Password values are reduced to "set or not"
 # at once and never returned. Missing text values come back as ''. Port and
 # EntraIdPort are [int] in 1-65535, otherwise $null.
 function Get-VbrDbConfig {
     param([string] $RootKey = 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication')
-    $readPort = {
-        param([string] $Key, [string] $Name)
-        $raw = Get-RegValue -Path $Key -Name $Name
-        $number = 0
-        if ($null -ne $raw -and [int]::TryParse("$raw", [ref]$number) -and $number -ge 1 -and $number -le 65535) { return $number }
-        return $null
-    }
     $root = $RootKey.TrimEnd('\')
     $configKey = "$root\DatabaseConfigurations"
     $keyPath = "$configKey\PostgreSql"
@@ -1122,13 +1128,13 @@ function Get-VbrDbConfig {
         KeyPath             = $keyPath
         ActiveConfiguration = "$(Get-RegValue -Path $configKey -Name 'SqlActiveConfiguration')"
         HostName            = "$(Get-RegValue -Path $keyPath -Name 'SqlHostName')"
-        Port                = (& $readPort $keyPath 'SqlHostPort')
+        Port                = (Get-RegPort -Path $keyPath -Name 'SqlHostPort')
         DatabaseName        = "$(Get-RegValue -Path $keyPath -Name 'SqlDatabaseName')"
         UserName            = "$(Get-RegValue -Path $keyPath -Name 'SqlUserName')"
         PasswordSet         = ("$(Get-RegValue -Path $keyPath -Name 'SqlSecuredPassword')".Length -gt 0)
         WindowsAuthRole     = "$(Get-RegValue -Path $keyPath -Name 'PostgresUserForWindowsAuth')"
         EntraIdHost         = "$(Get-RegValue -Path $root -Name 'EntraIdSqlHostName')"
-        EntraIdPort         = (& $readPort $root 'EntraIdSqlHostPort')
+        EntraIdPort         = (Get-RegPort -Path $root -Name 'EntraIdSqlHostPort')
         EntraIdPasswordSet  = ("$(Get-RegValue -Path $root -Name 'EntraIdSqlPassword')".Length -gt 0)
     }
 }
@@ -1140,16 +1146,17 @@ function Get-EnterpriseManagerDbConfig {
     $configKey = "$root\DatabaseConfigurations"
     if (-not (Test-Path -LiteralPath $configKey)) { return $null }
     $keyPath = "$configKey\PostgreSql"
-    $rawPort = Get-RegValue -Path $keyPath -Name 'SqlHostPort'
-    $number = 0
-    $port = $null
-    if ($null -ne $rawPort -and [int]::TryParse("$rawPort", [ref]$number) -and $number -ge 1 -and $number -le 65535) { $port = $number }
     return [pscustomobject]@{
         ActiveConfiguration = "$(Get-RegValue -Path $configKey -Name 'SqlActiveConfiguration')"
         HostName            = "$(Get-RegValue -Path $keyPath -Name 'SqlHostName')"
-        Port                = $port
+        Port                = (Get-RegPort -Path $keyPath -Name 'SqlHostPort')
         PasswordSet         = ("$(Get-RegValue -Path $keyPath -Name 'SqlSecuredPassword')".Length -gt 0)
     }
+}
+
+# The local network adapters. A function of its own so a test can supply fakes.
+function Get-LocalNetworkInterfaces {
+    return @([System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces())
 }
 
 # Computer name, FQDN and every address on a local network interface (loopback
@@ -1162,21 +1169,34 @@ function Get-LocalHostNames {
         $ipProps = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()
         [void]$candidates.Add($ipProps.HostName)
         if ($ipProps.DomainName) { [void]$candidates.Add("$($ipProps.HostName).$($ipProps.DomainName)") }
-    } catch { }
+    } catch {
+        Write-Log -Message "Could not read the host and domain name from the network stack: $($_.Exception.Message)" -Level 'WARN'
+    }
+    # A missing DNS record is normal, so this catch stays quiet.
     try {
         $entry = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME)
         [void]$candidates.Add($entry.HostName)
         foreach ($alias in @($entry.Aliases)) { [void]$candidates.Add($alias) }
     } catch { }
+    # The interfaces are the only source of local IP addresses. One adapter that
+    # fails is skipped and logged; it must not drop the addresses of the others.
+    $nics = @()
     try {
-        foreach ($nic in @([System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces())) {
+        $nics = @(Get-LocalNetworkInterfaces)
+    } catch {
+        Write-Log -Message "Could not list the network adapters, so local IP addresses are unknown: $($_.Exception.Message)" -Level 'WARN'
+    }
+    foreach ($nic in $nics) {
+        try {
             foreach ($unicast in @($nic.GetIPProperties().UnicastAddresses)) {
                 $text = $unicast.Address.ToString()
                 [void]$candidates.Add($text)
                 if ($text.Contains('%')) { [void]$candidates.Add($text.Split('%')[0]) }
             }
+        } catch {
+            Write-Log -Message "Skipped network adapter '$($nic.Name)', its IP addresses are not listed: $($_.Exception.Message)" -Level 'WARN'
         }
-    } catch { }
+    }
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $names = New-Object System.Collections.ArrayList
     foreach ($candidate in $candidates) {
