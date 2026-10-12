@@ -2977,7 +2977,9 @@ function Invoke-PgQuery {
         [switch] $ViaStdin
     )
     $clearNames = @('PGUSER', 'PGHOST', 'PGPASSWORD', 'PGSERVICE', 'PGSSLMODE')
-    $setValues  = [ordered]@{ PGPASSFILE = 'nul'; PGCONNECT_TIMEOUT = '10' }
+    # PGAPPNAME marks the script's own sessions, so pg_stat_activity reads can leave
+    # out one that is still closing (Get-PgLiveState).
+    $setValues  = [ordered]@{ PGPASSFILE = 'nul'; PGCONNECT_TIMEOUT = '10'; PGAPPNAME = 'VbrStandardise' }
     $allNames   = @($clearNames) + @($setValues.Keys)
     $saved = @{}
     foreach ($name in $allNames) {
@@ -3124,6 +3126,10 @@ function Test-PgConfigHealth {
 # Spec 7.4: what SYSTEM can see over SSPI. PasswordSet comes from
 # "rolpassword IS NULL" only; the hash is never read. Backends are the other client
 # sessions; start times come back as epoch milliseconds and become UTC DateTimes.
+# The script's own sessions (application_name VbrStandardise, set by Invoke-PgQuery)
+# are left out: the password query's session can still be closing when the backend
+# query runs, and it would otherwise look like a new VBR session as postgres from
+# loopback (spec 7.13).
 function Get-PgLiveState {
     param(
         [Parameter(Mandatory)][string] $Psql,
@@ -3139,7 +3145,7 @@ function Get-PgLiveState {
         Write-Log -Message (Format-ShortText -Text "Could not read whether the postgres role has a password (exit $($pw.ExitCode)): $($pw.StdErr)" -MaxLength 400) -Level WARN
         return $failed
     }
-    $backendSql = "SELECT COALESCE(json_agg(json_build_object('pid', pid, 'usename', usename, 'datname', datname, 'client_addr', host(client_addr), 'start_ms', (extract(epoch FROM backend_start) * 1000)::bigint) ORDER BY pid)::text, '[]') FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid();"
+    $backendSql = "SELECT COALESCE(json_agg(json_build_object('pid', pid, 'usename', usename, 'datname', datname, 'client_addr', host(client_addr), 'start_ms', (extract(epoch FROM backend_start) * 1000)::bigint) ORDER BY pid)::text, '[]') FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid() AND application_name IS DISTINCT FROM 'VbrStandardise';"
     $be = Invoke-PgQuery -Psql $Psql -Port $Port -HostAddress $Address -Database $Database -Sql $backendSql
     if ($be.ExitCode -ne 0) {
         Write-Log -Message (Format-ShortText -Text "Could not read pg_stat_activity (exit $($be.ExitCode)): $($be.StdErr)" -MaxLength 400) -Level WARN
@@ -3980,6 +3986,22 @@ function Restore-RegistrySnapshot {
 #endregion Registry
 
 #region ConnectCheck
+# The VBR Backup Service log (spec 7.13). Admins can move the VBR logs with the
+# LogDirectory string value under the VBR key, often because drive C: is small; the
+# default folder is C:\ProgramData\Veeam\Backup. A LogDirectory that is empty or
+# names a folder that does not exist falls back to the default. Never throws.
+function Get-VbrLogPath {
+    param([string] $RootKey = 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication')
+    $folder = 'C:\ProgramData\Veeam\Backup'
+    try {
+        $custom = "$(Get-RegValue -Path $RootKey -Name 'LogDirectory')".Trim()
+        if ($custom -ne '' -and (Test-Path -LiteralPath $custom -PathType Container)) { $folder = $custom }
+    } catch {
+        $folder = 'C:\ProgramData\Veeam\Backup'
+    }
+    return (Join-Path $folder 'Svc.VeeamBackup.log')
+}
+
 # Length of a file as the open stream sees it (0 when it is missing or cannot be
 # opened). Full sharing, so Veeam can keep writing and rolling its log.
 function Get-FileLength {
@@ -4087,7 +4109,10 @@ function Wait-VbrDbConnected {
         [int]    $PollSec = 10,
         [string] $ServiceName = 'VeeamBackupSvc'
     )
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    # A Stopwatch, like every other bound in this script: the wall clock jumps an hour
+    # at a daylight-saving change, which would stretch the wait past the RMM timeout
+    # (fall back) or end it at once (spring forward).
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $polls = 0
     while ($true) {
         $polls++
@@ -4113,13 +4138,14 @@ function Wait-VbrDbConnected {
             Write-Log -Message $detail -Level OK
             return [pscustomobject]@{ Ok = $true; Detail = $detail }
         }
-        if ((Get-Date) -ge $deadline) {
+        if ($timer.Elapsed.TotalSeconds -ge $TimeoutSec) {
             $detail = "VBR did not connect to PostgreSQL within $TimeoutSec s: $($missing -join '; ')"
             Write-Log -Message $detail -Level ERROR
             return [pscustomobject]@{ Ok = $false; Detail = $detail }
         }
         Write-Log -Message "Waiting for VBR to connect (check $polls): $($missing -join '; ')" -Level INFO
-        Start-Sleep -Seconds $PollSec
+        # Never sleep past the limit; the last poll comes right at it.
+        Start-Sleep -Milliseconds ([int][math]::Min($PollSec * 1000, [math]::Max(0, ($TimeoutSec - $timer.Elapsed.TotalSeconds) * 1000)))
     }
 }
 #endregion ConnectCheck
@@ -4355,7 +4381,8 @@ function Invoke-PathA {
 # { ExitCode; Code; Detail; Action }:
 #   40 with that code (UNHANDLED_ERROR when Reason has no code) when the files and
 #      registry are back, the services run, VeeamBackupSvc stays running for
-#      RollbackSettleSec and Svc.VeeamBackup.log shows no new authentication error;
+#      RollbackSettleSec and Svc.VeeamBackup.log shows no new authentication error
+#      (when that log cannot be found, Detail says the check did not run);
 #   50 ROLLBACK_FAILED otherwise. The marker stays on 50.
 # last-failure.json is written in both cases, so a scheduled -Apply does not cause
 # the same outage again.
@@ -4365,7 +4392,7 @@ function Invoke-PathBRollback {
         [Parameter(Mandatory)][string] $Reason
     )
     $cfg = $Ctx.Config
-    $vbrLog = 'C:\ProgramData\Veeam\Backup\Svc.VeeamBackup.log'
+    $vbrLog = Get-VbrLogPath
     $timeoutSec = [int]$cfg.ServiceStopTimeoutSec
     $problems = New-Object System.Collections.ArrayList
     $stopSet = @($Ctx['StopSet'] | Where-Object { $_ })
@@ -4418,6 +4445,9 @@ function Invoke-PathBRollback {
     Write-Log 'Rollback step 4 - start the services that were running before' -Level STEP
     $logOffset = [long]0
     try { $logOffset = [long](Get-FileLength -Path $vbrLog) } catch { $logOffset = [long]0 }
+    $logFound = $false
+    try { $logFound = [bool](Test-Path -LiteralPath $vbrLog -PathType Leaf) } catch { $logFound = $false }
+    if (-not $logFound) { Write-Log "Svc.VeeamBackup.log was not found at $vbrLog before the services started." -Level WARN }
     if ($stopSet.Count -gt 0) {
         try {
             $order = @(Get-StartOrder -Snapshot @($Ctx['Snapshot']) -Names $stopSet)
@@ -4429,6 +4459,7 @@ function Invoke-PathBRollback {
     }
 
     Write-Log 'Rollback step 5 - check that VBR works again' -Level STEP
+    $logNote = ''
     if ($problems.Count -eq 0) {
         try {
             $settleSec = [int]$cfg.RollbackSettleSec
@@ -4442,6 +4473,13 @@ function Invoke-PathBRollback {
                     [void]$problems.Add('new authentication errors in Svc.VeeamBackup.log: ' + (Format-ShortText -Text ($authErrors -join ' | ') -MaxLength 300))
                 }
             }
+            # A missing log is no evidence: say so instead of claiming no new error.
+            $logFound = $false
+            try { $logFound = [bool](Test-Path -LiteralPath $vbrLog -PathType Leaf) } catch { $logFound = $false }
+            if (-not $logFound) {
+                $logNote = "Svc.VeeamBackup.log was not found at $vbrLog; the authentication-error check did not run."
+                Write-Log $logNote -Level WARN
+            }
         } catch {
             [void]$problems.Add("the check after the rollback failed: $($_.Exception.Message)")
         }
@@ -4453,6 +4491,7 @@ function Invoke-PathBRollback {
     $exitCode = 40
     if ($problems.Count -gt 0) { $exitCode = 50 }
     $summary = 'rollback complete: pg_ident.conf, pg_hba.conf and the registry were restored, the Veeam services run and VeeamBackupSvc stayed up with no new authentication error.'
+    if ($logNote) { $summary = "rollback complete: pg_ident.conf, pg_hba.conf and the registry were restored, the Veeam services run and VeeamBackupSvc stayed up. $logNote" }
     if ($exitCode -eq 50) { $summary = 'ROLLBACK FAILED: ' + ($problems -join '; ') + '.' }
     $notes = ''
     try {
@@ -4495,7 +4534,7 @@ function Invoke-PathB {
     $port = [int]$Ctx.Pg.Port
     $addresses = @($Ctx.Addresses)
     $database = "$($Ctx.Db.DatabaseName)"
-    $vbrLog = 'C:\ProgramData\Veeam\Backup\Svc.VeeamBackup.log'
+    $vbrLog = Get-VbrLogPath
     $notes = New-Object System.Collections.ArrayList
 
     # Spec 7.11 idle gate. Returns a result object when the server is busy, else $null.
@@ -4696,6 +4735,9 @@ function Invoke-PathB {
             Write-Log 'Path B step 9 - start the services that were running' -Level STEP
             $Ctx['StartUtc'] = [DateTime]::UtcNow
             $Ctx['LogOffset'] = [long](Get-FileLength -Path $vbrLog)
+            if (-not (Test-Path -LiteralPath $vbrLog -PathType Leaf)) {
+                Write-Log "Svc.VeeamBackup.log was not found at $vbrLog before the services started." -Level WARN
+            }
             if ($Ctx['StopSet'].Count -gt 0) {
                 $start = Start-ServicesBounded -Names @(Get-StartOrder -Snapshot $Ctx['Snapshot'] -Names $Ctx['StopSet']) -TimeoutSec $timeoutSec
                 if (-not $start.Ok) {
@@ -4730,6 +4772,13 @@ function Invoke-PathB {
     }
     Clear-PathFixedIssues -Ctx $Ctx
     [void]$notes.Add("VBR now uses Windows authentication. Backups: $($Ctx['RunDir']).")
+    # The connect check had no log to read: say so, so the result does not overstate it.
+    $logFound = $false
+    try { $logFound = [bool](Test-Path -LiteralPath $vbrLog -PathType Leaf) } catch { $logFound = $false }
+    if (-not $logFound) {
+        Write-Log "Svc.VeeamBackup.log was not found at $vbrLog; the authentication-error check did not run." -Level WARN
+        [void]$notes.Add("Svc.VeeamBackup.log was not found at $vbrLog; the authentication-error check did not run.")
+    }
 
     $passwordFailure = ''
     try {

@@ -277,7 +277,7 @@ If every item is compliant, the script changes nothing and stops no service.
 2. Restore `pg_ident.conf` and `pg_hba.conf` from the run folder with the section 7.8 routine.
 3. Restore the registry from `registry-before.json`: write each old value, and delete each value that was absent. Read every value back and compare. If any value is wrong, import the `reg.exe` export, delete values that were absent, and compare again. If it is still wrong, the result is 50.
 4. Start the services that were running before, bounded.
-5. The result is 40 only if `VeeamBackupSvc` stays running for `RollbackSettleSec` and no new authentication error (section 7.13 list) appears in `Svc.VeeamBackup.log`. Otherwise 50 `ROLLBACK_FAILED`.
+5. The result is 40 only if `VeeamBackupSvc` stays running for `RollbackSettleSec` and no new authentication error (section 7.13 list) appears in `Svc.VeeamBackup.log`. Otherwise 50 `ROLLBACK_FAILED`. If the log cannot be found (section 7.13), the 40 result says that the authentication-error check did not run, instead of claiming no new error.
 6. Write `<WorkRoot>\last-failure.json` with the run folder and the reason. Remove the marker only on a result of 40.
 
 There is no password to restore in a rollback, because the script clears the password only after `VERIFIED`. The script never saves the password hash.
@@ -342,7 +342,9 @@ One routine does every write and every restore (Path A, Path B, rollback, trap).
 All three must be true before `VbrConnectTimeoutSec` ends:
 - `VeeamBackupSvc` is running.
 - `pg_stat_activity` has a backend with `backend_start > T`, `pid <> pg_backend_pid()`, `datname` equal to `SqlDatabaseName` (case-insensitive), `usename = 'postgres'` and `client_addr` `127.0.0.1` or `::1`.
-- No line written to `C:\ProgramData\Veeam\Backup\Svc.VeeamBackup.log` after T matches `SSPI authentication failed`, `no match in usermap`, `password authentication failed`, `no pg_hba.conf entry`, `28000:` or `28P01:`.
+- No line written to `Svc.VeeamBackup.log` after T matches `SSPI authentication failed`, `no match in usermap`, `password authentication failed`, `no pg_hba.conf entry`, `28000:` or `28P01:`. The log is in VBR's log folder: the `LogDirectory` string value under `HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication` when it names a folder that exists, else `C:\ProgramData\Veeam\Backup`. If the log does not exist, the run logs a warning and `Detail` says that the authentication-error check did not run (Path B success and rollback result 40).
+- Every `psql` session of the script sets `application_name` to `VbrStandardise` (`PGAPPNAME`), and the `pg_stat_activity` read leaves those sessions out, so a session of the script that is still closing never counts as a VBR backend.
+- The wait is bounded with a monotonic timer, not the wall clock, so a daylight-saving change cannot stretch or end it, and it never sleeps past `VbrConnectTimeoutSec`.
 
 ### 7.14 Known limits
 

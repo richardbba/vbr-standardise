@@ -2754,6 +2754,7 @@ set "HOSTARG=%~4"
 >>"%OUT%env.txt" echo PGHOST=[%PGHOST%]
 >>"%OUT%env.txt" echo PGSERVICE=[%PGSERVICE%]
 >>"%OUT%env.txt" echo PGSSLMODE=[%PGSSLMODE%]
+>>"%OUT%env.txt" echo PGAPPNAME=[%PGAPPNAME%]
 type nul >"%OUT%args.txt"
 if exist "%OUT%stdin.txt" del "%OUT%stdin.txt"
 set "READSTDIN="
@@ -2778,14 +2779,15 @@ exit /b 2
         $envFile   = Join-Path $dir 'env.txt'
         $stdinFile = Join-Path $dir 'stdin.txt'
 
-        $pgNames = @('PGPASSFILE', 'PGCONNECT_TIMEOUT', 'PGPASSWORD', 'PGUSER', 'PGHOST', 'PGSERVICE', 'PGSSLMODE')
+        $pgNames = @('PGPASSFILE', 'PGCONNECT_TIMEOUT', 'PGPASSWORD', 'PGUSER', 'PGHOST', 'PGSERVICE', 'PGSSLMODE', 'PGAPPNAME')
         $before = @{}
         foreach ($n in $pgNames) { $before[$n] = [Environment]::GetEnvironmentVariable($n, 'Process') }
         try {
-            $old = @{ PGPASSFILE = 'C:\old\pgpass.conf'; PGCONNECT_TIMEOUT = $null; PGPASSWORD = 'old-secret-sentinel'; PGUSER = 'olduser'; PGHOST = 'oldhost'; PGSERVICE = 'oldservice'; PGSSLMODE = 'require' }
+            $old = @{ PGPASSFILE = 'C:\old\pgpass.conf'; PGCONNECT_TIMEOUT = $null; PGPASSWORD = 'old-secret-sentinel'; PGUSER = 'olduser'; PGHOST = 'oldhost'; PGSERVICE = 'oldservice'; PGSSLMODE = 'require'; PGAPPNAME = 'oldapp' }
             foreach ($n in $pgNames) { [Environment]::SetEnvironmentVariable($n, $old[$n], 'Process') }
-            $expectedDuring   = 'PGPASSFILE=[nul];PGCONNECT_TIMEOUT=[10];PGPASSWORD=[];PGUSER=[];PGHOST=[];PGSERVICE=[];PGSSLMODE=[]'
-            $expectedRestored = 'PGPASSFILE=[C:\old\pgpass.conf];PGCONNECT_TIMEOUT=[];PGPASSWORD=[old-secret-sentinel];PGUSER=[olduser];PGHOST=[oldhost];PGSERVICE=[oldservice];PGSSLMODE=[require]'
+            # PGAPPNAME marks the script's own sessions, so Get-PgLiveState can leave them out.
+            $expectedDuring   = 'PGPASSFILE=[nul];PGCONNECT_TIMEOUT=[10];PGPASSWORD=[];PGUSER=[];PGHOST=[];PGSERVICE=[];PGSSLMODE=[];PGAPPNAME=[VbrStandardise]'
+            $expectedRestored = 'PGPASSFILE=[C:\old\pgpass.conf];PGCONNECT_TIMEOUT=[];PGPASSWORD=[old-secret-sentinel];PGUSER=[olduser];PGHOST=[oldhost];PGSERVICE=[oldservice];PGSSLMODE=[require];PGAPPNAME=[oldapp]'
             $currentEnv = { (@($pgNames | ForEach-Object { "$_=[$([Environment]::GetEnvironmentVariable($_, 'Process'))]" })) -join ';' }
 
             $r = Invoke-PgQuery -Psql $fakePsql -Port 5432 -HostAddress '127.0.0.1' -Database 'VeeamBackup' -Sql 'SELECT 1;'
@@ -2997,6 +2999,7 @@ try {
         Check 'live state: null client address becomes empty'   $s.Backends[1].ClientAddr ''
         Check 'live state: password query reads only IS NULL'   (($calls[0] -match 'rolpassword IS NULL') -and ($calls[0] -notmatch 'SELECT\s+rolpassword')) 'True'
         Check 'live state: backends exclude the own session'    ($calls[1] -match "backend_type = 'client backend' AND pid <> pg_backend_pid\(\)") 'True'
+        Check 'live state: backends exclude every session of the script by application_name' ($calls[1] -match "AND application_name IS DISTINCT FROM 'VbrStandardise'") 'True'
         Check 'live state: no double quote in any SQL'          (@($calls | Where-Object { $_.Contains('"') }).Count) 0
 
         $answer.Password = [pscustomobject]@{ ExitCode = 0; StdOut = 'NONE'; StdErr = '' }
@@ -3791,8 +3794,8 @@ try {
             [pscustomobject]@{ Name = $Name; Status = $plan.Service }
         }
         function Start-Sleep {
-            [CmdletBinding()] param([int] $Seconds)
-            [void]$calls.Add("sleep:$Seconds")
+            [CmdletBinding()] param([int] $Seconds, [int] $Milliseconds)
+            [void]$calls.Add("sleep:$($Seconds * 1000 + $Milliseconds)")
         }
         function Get-PgLiveState {
             param([string] $Psql, [int] $Port, [string] $Address, [string] $Database)
@@ -3815,7 +3818,7 @@ try {
         Check 'connect wait: succeeds once a new session appears'  $r.Ok 'True'
         Check 'connect wait: polled pg_stat_activity twice'        (@($calls | Where-Object { "$_" -like 'live:*' }).Count) 2
         Check 'connect wait: queried the given address and database' ($calls -contains 'live:127.0.0.1|5432|VeeamBackup') 'True'
-        Check 'connect wait: slept once with the poll interval'    (@($calls | Where-Object { "$_" -like 'sleep:*' }) -join ',') 'sleep:7'
+        Check 'connect wait: slept once with the poll interval'    (@($calls | Where-Object { "$_" -like 'sleep:*' }) -join ',') 'sleep:7000'
         Check 'connect wait: checked VeeamBackupSvc'               ($calls -contains 'svc:VeeamBackupSvc') 'True'
 
         $calls.Clear()
@@ -3864,9 +3867,59 @@ try {
         }
         Check 'connect wait: a log held with no sharing does not abort'    $lockError ''
         Check 'connect wait: a log held with no sharing still connects'    "$(if ($null -ne $r) { $r.Ok })" 'True'
+
+        # The limit is a monotonic timer: a wall clock that stands still or jumps back
+        # an hour (daylight saving ends) must not stretch the wait, and no sleep may go
+        # past the limit. Get-Date stands still here, each sleep really sleeps (at most
+        # one second), and the tenth sleep stops a wait that would never end.
+        & {
+            $sleeps = New-Object System.Collections.ArrayList
+            function Get-Date { [CmdletBinding()] param() return (New-Object DateTime 2026, 4, 5, 2, 30, 0) }
+            function Start-Sleep {
+                [CmdletBinding()] param([int] $Seconds, [int] $Milliseconds)
+                $ms = $Seconds * 1000 + $Milliseconds
+                [void]$sleeps.Add($ms)
+                if ($sleeps.Count -ge 10) { throw 'the wait did not end' }
+                Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds ([int][math]::Min($ms, 1000))
+            }
+            $calls.Clear()
+            $plan.Service = 'Stopped'
+            $plan.GoodFromPoll = 99
+            $plan.LiveOk = $true
+            $clockError = ''
+            $r = $null
+            try { $r = & $wait 1 $offset } catch { $clockError = $_.Exception.Message }
+            Check 'connect wait: the limit does not follow the wall clock'     "$clockError|$(if ($null -ne $r) { $r.Ok })" '|False'
+            Check 'connect wait: no sleep goes past the limit'                 "$(@($sleeps).Count -gt 0)|$(@($sleeps | Where-Object { $_ -gt 1000 }).Count)" 'True|0'
+        }
     }
 } catch {
     Check 'Task 15: Wait-VbrDbConnected tests ran to the end' $_.Exception.Message ''
+}
+
+# Get-VbrLogPath: VBR's LogDirectory value moves the log; an empty value or a folder
+# that does not exist falls back to C:\ProgramData\Veeam\Backup.
+$t15Key = "HKCU:\Software\VbrStdTest-T15-$PID"
+try {
+    $t15Default = 'C:\ProgramData\Veeam\Backup\Svc.VeeamBackup.log'
+    Check 'vbr log path: missing key gives the default' (Get-VbrLogPath -RootKey $t15Key) $t15Default
+    [void](New-Item -Path $t15Key -Force)
+    Check 'vbr log path: no LogDirectory gives the default' (Get-VbrLogPath -RootKey $t15Key) $t15Default
+    $t15Dir = New-TestFolder 'vbrlogs'
+    [void](New-ItemProperty -Path $t15Key -Name 'LogDirectory' -Value $t15Dir -PropertyType String -Force)
+    Check 'vbr log path: LogDirectory that exists is used' (Get-VbrLogPath -RootKey $t15Key) (Join-Path $t15Dir 'Svc.VeeamBackup.log')
+    [void](New-ItemProperty -Path $t15Key -Name 'LogDirectory' -Value ($t15Dir + '\') -PropertyType String -Force)
+    Check 'vbr log path: a trailing backslash is fine' (Get-VbrLogPath -RootKey $t15Key) (Join-Path $t15Dir 'Svc.VeeamBackup.log')
+    [void](New-ItemProperty -Path $t15Key -Name 'LogDirectory' -Value (Join-Path $t15Dir 'no-such-folder') -PropertyType String -Force)
+    Check 'vbr log path: a LogDirectory that does not exist gives the default' (Get-VbrLogPath -RootKey $t15Key) $t15Default
+    [void](New-ItemProperty -Path $t15Key -Name 'LogDirectory' -Value '  ' -PropertyType String -Force)
+    Check 'vbr log path: an empty LogDirectory gives the default' (Get-VbrLogPath -RootKey $t15Key) $t15Default
+    Check 'vbr log path: the default root key is the VBR key' (@($ScriptAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-VbrLogPath' }, $true) | ForEach-Object { "$($_.Body.ParamBlock.Parameters[0].DefaultValue.Value)" }) -join ',') 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication'
+    Check 'vbr log path: Path B and its rollback use it, no literal log path' "$(([regex]::Matches($ScriptText, '\$vbrLog = Get-VbrLogPath')).Count)|$($ScriptText.Contains('''C:\ProgramData\Veeam\Backup\Svc.VeeamBackup.log'''))" '2|False'
+} catch {
+    Check 'Task 15: Get-VbrLogPath tests ran to the end' $_.Exception.Message ''
+} finally {
+    Remove-Item -LiteralPath $t15Key -Recurse -Force -ErrorAction SilentlyContinue
 }
 # --- Task 16: Path A flow ---
 $t16Root = New-TestFolder 't16'
@@ -4171,7 +4224,10 @@ function New-T17Ctx {
 }
 
 # Mocks for every function Path B and its rollback call, plus Get-Process and
-# Get-Service so nothing real is read. Dot-source inside '& { }'.
+# Get-Service so nothing real is read. Dot-source inside '& { }'. Get-VbrLogPath
+# names a test log that exists, unless a test points it at a missing file.
+$t17VbrLog = Join-Path $t16Root 'Svc.VeeamBackup.log'
+[System.IO.File]::WriteAllText($t17VbrLog, "[12.10.2026 10:00:00] <01> Info  test log`r`n", [System.Text.Encoding]::ASCII)
 $t17Mocks = {
     $calls = New-Object System.Collections.ArrayList
     $sspiQueue = New-Object System.Collections.Queue
@@ -4181,8 +4237,9 @@ $t17Mocks = {
         LastFailure = $false; External = @(); NotStopped = @(); HealthOk = $true; ConnectOk = $true
         ClearOk = $true; OtherRoles = @('pg_native_admin'); RegRestoreOk = $true; SettleOk = $true
         LogLines = @(); AuthErrors = @(); WriteThrows = ''; LastFailureReason = ''; RemoveMarkerOk = $true
-        Snapshot = $null; NotStarted = @()
+        Snapshot = $null; NotStarted = @(); VbrLogPath = $t17VbrLog; WaitLogPath = ''
     }
+    function Get-VbrLogPath { param($RootKey) return "$($fake.VbrLogPath)" }
     function Get-Process { [CmdletBinding()] param([string[]] $Name) }
     function Get-Service { [CmdletBinding()] param([string[]] $Name) }
     function Test-LastFailure { param($WorkRoot) [void]$calls.Add('Test-LastFailure'); return [bool]$fake.LastFailure }
@@ -4269,6 +4326,7 @@ $t17Mocks = {
     function Wait-VbrDbConnected {
         param($Psql, $Port, $Address, $Database, $SinceUtc, $TimeoutSec, $LogPath, $LogOffset, $PollSec, $ServiceName)
         [void]$calls.Add("Wait-VbrDbConnected:${LogOffset}:$TimeoutSec")
+        $fake.WaitLogPath = "$LogPath"
         return [pscustomobject]@{ Ok = [bool]$fake.ConnectOk; Detail = 'no new VBR backend within 600 seconds' }
     }
     function Clear-PostgresPassword { param($Psql, $Port, $Address, $Database) [void]$calls.Add("Clear-PostgresPassword:$script:Stage"); return [pscustomobject]@{ Ok = [bool]$fake.ClearOk; Detail = 'ALTER ROLE failed' } }
@@ -4316,6 +4374,30 @@ $t17Mocks = {
     Check 'T17 happy: report PgPassword NONE' $script:Report['PgPassword'] 'NONE'
     Check 'T17 happy: other password roles in Detail' ($result.Detail -like '*pg_native_admin*') 'True'
     Check 'T17 happy: no last-failure written' (@($calls | Where-Object { $_ -eq 'Write-LastFailure' }).Count) 0
+    Check 'T17 happy: the connect check reads the log Get-VbrLogPath names' $fake.WaitLogPath $t17VbrLog
+    Check 'T17 happy: no log note while the log exists' ($result.Detail.Contains('was not found')) 'False'
+}
+
+# Svc.VeeamBackup.log cannot be found (logs moved, a stale default path): the result
+# says the authentication-error check did not run, instead of claiming no error.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'APPLY'
+    $missingLog = Join-Path $t16Root 'no-such-folder\Svc.VeeamBackup.log'
+    $note = "Svc.VeeamBackup.log was not found at $missingLog; the authentication-error check did not run."
+    $fake.VbrLogPath = $missingLog
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 log missing: Path B still ends 0' $result.ExitCode 0
+    Check 'T17 log missing: the connect check gets that path' $fake.WaitLogPath $missingLog
+    Check 'T17 log missing: Detail says the check did not run' ($result.Detail.Contains($note)) 'True'
+    $calls.Clear()
+    $fake.ConnectOk = $false
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 log missing, rollback: still 40' "$($result.ExitCode) $($result.Code)" '40 VBR_DB_CONNECT_FAILED'
+    Check 'T17 log missing, rollback: no claim of no new authentication error' ($result.Detail.Contains('no new authentication error')) 'False'
+    Check 'T17 log missing, rollback: Detail says the check did not run' ($result.Detail.Contains($note)) 'True'
 }
 
 # Step 1: last-failure.json blocks Path B before anything else.

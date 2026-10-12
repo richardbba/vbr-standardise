@@ -157,12 +157,12 @@ Used when `DbAuth=NATIVE`, or for `DB_HOST_NOT_LOCAL` or `DB_WINDOWS_ROLE_NOT_PO
 7. Test as in Path A. A failure runs the rollback.
 8. Switch the registry under `HKLM\SOFTWARE\Veeam\Veeam Backup and Replication\DatabaseConfigurations\PostgreSql`: `SqlUserName` and `SqlSecuredPassword` become empty strings, `PostgresUserForWindowsAuth` becomes `postgres` if needed, and `SqlHostName` becomes `127.0.0.1` (or `::1` if only `::1` listens) if it is not a loopback name. `SqlLockInfo` is never changed.
 9. Start the services that were running, in dependency order (at most 5 minutes).
-10. Wait up to 10 minutes until `VeeamBackupSvc` runs, a new VBR backend appears in `pg_stat_activity` as `postgres` from loopback, and `Svc.VeeamBackup.log` shows no new authentication error. A failure runs the rollback.
+10. Wait up to 10 minutes until `VeeamBackupSvc` runs, a new VBR backend appears in `pg_stat_activity` as `postgres` from loopback, and `Svc.VeeamBackup.log` shows no new authentication error. A failure runs the rollback. The log is read from VBR's log folder: the `LogDirectory` registry value under `HKLM\SOFTWARE\Veeam\Veeam Backup and Replication` if it names a folder that exists, else `C:\ProgramData\Veeam\Backup`. If the log does not exist, `Detail` says that the authentication-error check did not run.
 11. Stage `VERIFIED`. Remove the marker. From here on the script never rolls back.
 12. Clear the `postgres` password (`PG_PASSWORD_NOT_CLEARED`, exit 5, if that fails).
 13. List the other roles that have LOGIN and a password in `Detail`. They cannot log in any more.
 
-**Path B rollback:** stop the stop set, restore `pg_ident.conf` and `pg_hba.conf` from the run folder, restore the registry from `registry-before.json` (and, if a value is still wrong, import `vbr-key.reg` and delete values that were absent), start the services that were running. The result is exit 40 only if `VeeamBackupSvc` stays running for 5 minutes and `Svc.VeeamBackup.log` shows no new authentication error; otherwise exit 50 `ROLLBACK_FAILED`. Either way the script writes `last-failure.json`. It removes the marker only on exit 40.
+**Path B rollback:** stop the stop set, restore `pg_ident.conf` and `pg_hba.conf` from the run folder, restore the registry from `registry-before.json` (and, if a value is still wrong, import `vbr-key.reg` and delete values that were absent), start the services that were running. The result is exit 40 only if `VeeamBackupSvc` stays running for 5 minutes and `Svc.VeeamBackup.log` shows no new authentication error (if the log cannot be found, `Detail` says that this check did not run); otherwise exit 50 `ROLLBACK_FAILED`. Either way the script writes `last-failure.json`. It removes the marker only on exit 40.
 
 **Unsupported method:** Veeam supports switching the authentication mode only through the DBConfig utility. This script edits the registry directly (decision D4). The pilot (below) proves the switch on a real server.
 
@@ -325,7 +325,7 @@ A marker means a run stopped between its first change and its safe end: RMM kill
 
 4. **Path B only: compare the registry.** Compare `Get-ItemProperty 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication\DatabaseConfigurations\PostgreSql'` with `registry-before.json` for `SqlUserName`, `SqlSecuredPassword`, `PostgresUserForWindowsAuth` and `SqlHostName`. Do not paste the `SqlSecuredPassword` data into tickets.
 5. **Decide: keep or restore.**
-   - **Keep** (Path B only) if the registry is already switched, both files are standard, `VeeamBackupSvc` runs, the VBR console connects, and `C:\ProgramData\Veeam\Backup\Svc.VeeamBackup.log` shows no new `SSPI authentication failed`, `no match in usermap`, `password authentication failed`, `no pg_hba.conf entry`, `28000` or `28P01`. Then go to step 7. A later `-Apply` takes Path A and clears the `postgres` password.
+   - **Keep** (Path B only) if the registry is already switched, both files are standard, `VeeamBackupSvc` runs, the VBR console connects, and `Svc.VeeamBackup.log` (in `C:\ProgramData\Veeam\Backup`, or the folder in the `LogDirectory` registry value) shows no new `SSPI authentication failed`, `no match in usermap`, `password authentication failed`, `no pg_hba.conf entry`, `28000` or `28P01`. Then go to step 7. A later `-Apply` takes Path A and clears the `postgres` password.
    - **Restore** in every other case, and always for Path A.
 6. **Restore.**
    - Stop the Veeam services in `StopSet` of `services-before.json` (Path B) if they run.
@@ -352,7 +352,7 @@ After every Path B rollback, the script writes `<WorkRoot>\last-failure.json` wi
 
 To clear it:
 
-1. Read the reason and open the run folder it names. Read that run's transcript in `logs\` and `C:\ProgramData\Veeam\Backup\Svc.VeeamBackup.log` from the time of the run.
+1. Read the reason and open the run folder it names. Read that run's transcript in `logs\` and `Svc.VeeamBackup.log` (in `C:\ProgramData\Veeam\Backup`, or the folder in the `LogDirectory` registry value) from the time of the run.
 2. Fix the cause (for example a Veeam service that runs as an unmapped account, or a client that still needs a password).
 3. Delete `last-failure.json`.
 4. Re-run `-Apply` in a maintenance window.
