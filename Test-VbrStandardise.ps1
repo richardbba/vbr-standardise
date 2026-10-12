@@ -4761,11 +4761,23 @@ try { throw 'disk is full' } catch { $t18Error = $_ }
 $t18TrapMocks = {
     $calls = New-Object System.Collections.ArrayList
     $completed = New-Object System.Collections.ArrayList
-    $fake = @{ Restored = $true; Rollback = $null }
+    $secondErrors = New-Object System.Collections.ArrayList
+    $fake = @{ Restored = $true; Rollback = $null; CompleteError = '' }
     function Complete-Run {
         param([int] $ExitCode = 0, [string] $Code = '', [string] $Detail = '', [string] $Action = '')
         [void]$completed.Add([pscustomobject]@{ ExitCode = $ExitCode; Code = $Code; Detail = $Detail; Action = $Action })
+        if ($fake.CompleteError) { throw $fake.CompleteError }
         throw 'T18-COMPLETE-RUN'
+    }
+    # The real function calls exit, which a test cannot catch, so this one throws the
+    # second error again. The Complete-Run mock above ends the handler by throwing too,
+    # so its sentinel also arrives here: it is passed on without a record.
+    function Exit-TrapSecondError {
+        param([string] $Stage = 'UNTOUCHED', [string] $FirstMessage = '', [System.Management.Automation.ErrorRecord] $SecondError)
+        if ("$($SecondError.Exception.Message)" -ne 'T18-COMPLETE-RUN') {
+            [void]$secondErrors.Add("$Stage|$FirstMessage|$($SecondError.Exception.Message)")
+        }
+        throw $SecondError
     }
     function Restore-PathAFiles { param($Ctx) [void]$calls.Add('Restore-PathAFiles'); return [bool]$fake.Restored }
     function Invoke-PathBRollback { param($Ctx, $Reason) [void]$calls.Add("Invoke-PathBRollback:$Reason"); return $fake.Rollback }
@@ -4777,6 +4789,7 @@ $t18TrapMocks = {
         $script:Issues = New-Object System.Collections.ArrayList
         $calls.Clear()
         $completed.Clear()
+        $secondErrors.Clear()
         $sentinel = ''
         try { Invoke-TrapHandler -ErrorRecord $t18Error } catch { $sentinel = "$($_.Exception.Message)" }
         $handled = [bool]$script:TrapHandled
@@ -4818,6 +4831,39 @@ $t18TrapMocks = {
         Check "T18 trap ${stage}: marker removed, nothing rolled back" ($calls -join ' > ') 'Remove-ChangeMarker'
         Check "T18 trap ${stage}: 5 POST_CONVERSION_STEP_FAILED" "$($completed[0].ExitCode) $($completed[0].Code)" '5 POST_CONVERSION_STEP_FAILED'
     }
+
+    # A normal run through the handler is not a second error.
+    $null = Invoke-T18Trap -Stage 'UNTOUCHED'
+    Check 'T18 trap: a normal run records no second error' $secondErrors.Count 0
+
+    # Windows PowerShell 5.1 does not send an error thrown inside a trap block back to
+    # the trap, so the handler must catch an error from Complete-Run (or a restore
+    # step) itself and end in Exit-TrapSecondError, without a second restore.
+    $fake.CompleteError = 'Complete-Run broke'
+    $fake.Restored = $true
+    $result = Invoke-T18Trap -Stage 'PATH_A_WRITING'
+    Check 'T18 trap second error: caught by the handler, guard set' $result 'Complete-Run broke/True'
+    Check 'T18 trap second error: Exit-TrapSecondError gets the stage, the first and the second message' (@($secondErrors | Where-Object { $_ -like 'PATH_A_WRITING|disk is full (line *)|Complete-Run broke' }).Count) 1
+    Check 'T18 trap second error: nothing restored a second time' ($calls -join ' > ') 'Restore-PathAFiles > Remove-ChangeMarker'
+    Check 'T18 trap second error: Complete-Run was called once' $completed.Count 1
+
+    $fake.Rollback = [pscustomobject]@{ ExitCode = 40; Code = 'UNHANDLED_ERROR'; Detail = 'rolled back'; Action = '' }
+    $null = Invoke-T18Trap -Stage 'PATH_B_CHANGING'
+    Check 'T18 trap second error in Path B: no second rollback' @($calls | Where-Object { $_ -like 'Invoke-PathBRollback:*' }).Count 1
+    Check 'T18 trap second error in Path B: one second-error record' $secondErrors.Count 1
+    $fake.CompleteError = ''
+
+    # If the trap ever runs again, the guard goes straight to Exit-TrapSecondError.
+    $script:Stage = 'PATH_B_CHANGING'
+    $calls.Clear()
+    $completed.Clear()
+    $secondErrors.Clear()
+    $script:TrapHandled = $true
+    $sentinel = ''
+    try { Invoke-TrapHandler -ErrorRecord $t18Error } catch { $sentinel = "$($_.Exception.Message)" }
+    $script:TrapHandled = $false
+    Check 'T18 trap entered again: ends in Exit-TrapSecondError with the new error' (@($secondErrors | Where-Object { $_ -ceq 'PATH_B_CHANGING||disk is full' }).Count) 1
+    Check 'T18 trap entered again: no restore, rollback or Complete-Run' "$($calls.Count)/$($completed.Count)" '0/0'
     $script:Ctx = $null
 }
 $script:Stage = 'UNTOUCHED'
@@ -4896,6 +4942,63 @@ Check 'T18 child in Constrained Language Mode: one summary line with every repor
 Check 'T18 child in Constrained Language Mode: Mode=APPLY, Stage=UNTOUCHED' (@($t18ClmLine | Where-Object { $_ -clike '*; Mode=APPLY; *; Stage=UNTOUCHED; Outcome=CONSTRAINED_LANGUAGE; ExitCode=20; *' }).Count) 1
 Check 'T18 child in Constrained Language Mode: no error record' ($t18ClmChild.Output -match 'Cannot create type|Cannot invoke method|UNHANDLED') 'False'
 Check 'T18 child in Constrained Language Mode: nothing written' (Test-Path -LiteralPath $t18ClmRoot) 'False'
+
+# An error inside the trap handler (spec 7.6). Windows PowerShell 5.1 does not send an
+# error thrown inside a trap block back to that trap, so Invoke-TrapHandler catches it
+# itself. A scratch copy of the real script gets a first error injected right after
+# the exit code table and Format-RmmSummary redefined to throw, so Complete-Run fails
+# halfway. The run must end with the minimal summary and exit 50, not a raw PowerShell
+# error and exit 1. Needs no elevation, VBR or PostgreSQL, so it never skips.
+$t18ScriptText = [System.IO.File]::ReadAllText($t18ScriptPath)
+$t18InjectAnchor = '$exitCodes = Get-ExitCodeTable'
+Check 'T18 second-error runs: the injection point is in the script once' (([regex]::Matches($t18ScriptText, [regex]::Escape($t18InjectAnchor))).Count) 1
+function Invoke-T18InjectedRun {
+    param([string] $Tag, [string] $Injection)
+    $folder = New-TestFolder $Tag
+    $copy = Join-Path $folder 'Invoke-VbrStandardise.ps1'
+    $root = Join-Path $env:ProgramData "vbrstd-$Tag-$PID"
+    [void]$script:TestFolders.Add($root)
+    $injected = $t18ScriptText.Replace($t18InjectAnchor, $t18InjectAnchor + "`r`n" + $Injection)
+    [System.IO.File]::WriteAllText($copy, $injected, (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+    $run = & {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $t18ClmPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $copy -WorkRoot $root 2>&1 | Out-String)
+        [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
+    }
+    $lines = @($run.Output -split "`r?`n")
+    return [pscustomobject]@{
+        ExitCode    = $run.ExitCode
+        Output      = $run.Output
+        Lines       = $lines
+        Summary     = @($lines | Where-Object { $_ -clike 'Computer=*' })
+        BlockStarts = @($lines | Where-Object { $_ -ceq '=== RMM SUMMARY ===' }).Count
+        RootExists  = (Test-Path -LiteralPath $root)
+    }
+}
+$t18Second = Invoke-T18InjectedRun -Tag 't18sec1' -Injection ((
+    'function Format-RmmSummary { throw ''T18 second error'' }',
+    'throw ''T18 first error'''
+) -join "`r`n")
+Check 'T18 child second error in Complete-Run: exit 50' $t18Second.ExitCode 50
+Check 'T18 child second error in Complete-Run: one minimal summary block' $t18Second.BlockStarts 1
+Check 'T18 child second error in Complete-Run: Stage, Outcome, ExitCode and IssueCode' (@($t18Second.Summary | Where-Object { $_ -clike 'Computer=*; Stage=UNTOUCHED; Outcome=UNHANDLED_ERROR; ExitCode=50; IssueCode=UNHANDLED_ERROR; ActionRequired=PAGE AN OPERATOR NOW.*' }).Count) 1
+Check 'T18 child second error in Complete-Run: Detail names the first and the second error' (@($t18Second.Summary | Where-Object { $_ -clike '*; Detail=A second unexpected error happened while handling the first. First: T18 first error (line *). Second: T18 second error (line *)' }).Count) 1
+Check 'T18 child second error in Complete-Run: no raw PowerShell error' ($t18Second.Output -match 'CategoryInfo|FullyQualifiedErrorId|NativeCommandError') 'False'
+Check 'T18 child second error in Complete-Run: nothing written' $t18Second.RootExists $false
+
+$t18SecondRestore = Invoke-T18InjectedRun -Tag 't18sec2' -Injection ((
+    'function Format-RmmSummary { throw ''T18 second error'' }',
+    'function Restore-PathAFiles { param($Ctx) Write-Host ''T18-RESTORE-CALLED''; return $true }',
+    'function Remove-ChangeMarker { param($WorkRoot) Write-Host ''T18-MARKER-REMOVED''; return $true }',
+    '$script:Stage = ''PATH_A_WRITING''',
+    '$Ctx = @{ WorkRoot = ''C:\vbrstd-t18-never-created'' }',
+    'throw ''T18 first error'''
+) -join "`r`n")
+Check 'T18 child second error after a restore: exit 50' $t18SecondRestore.ExitCode 50
+Check 'T18 child second error after a restore: restored once, not again' (@($t18SecondRestore.Lines | Where-Object { $_ -ceq 'T18-RESTORE-CALLED' }).Count) 1
+Check 'T18 child second error after a restore: marker removed once' (@($t18SecondRestore.Lines | Where-Object { $_ -ceq 'T18-MARKER-REMOVED' }).Count) 1
+Check 'T18 child second error after a restore: minimal summary at the stage' (@($t18SecondRestore.Summary | Where-Object { $_ -clike 'Computer=*; Stage=PATH_A_WRITING; Outcome=UNHANDLED_ERROR; ExitCode=50; IssueCode=UNHANDLED_ERROR; *' }).Count) 1
+Check 'T18 child second error after a restore: no raw PowerShell error' ($t18SecondRestore.Output -match 'CategoryInfo|FullyQualifiedErrorId|NativeCommandError') 'False'
 
 # Complete-Run (Task 2) with -Detail and no -Code adds a note to Detail. The main body
 # passes the notes of a successful path that way (spec 7.5: commented-out pg_hba.conf

@@ -4863,10 +4863,41 @@ function Select-ApplyPath {
     return 'A'
 }
 
+# Last resort for an error inside the trap handler itself, for example inside
+# Complete-Run. Windows PowerShell 5.1 does not send an error thrown inside a trap
+# block back to that trap, so Invoke-TrapHandler catches it and calls this. It prints
+# a minimal summary from plain strings only (Format-RmmSummary and Format-ShortText
+# may be what failed), repeats no restore or rollback, leaves any marker where it
+# is, and exits 50.
+function Exit-TrapSecondError {
+    param(
+        [string] $Stage = 'UNTOUCHED',
+        [string] $FirstMessage = '',
+        [System.Management.Automation.ErrorRecord] $SecondError
+    )
+    $second = ''
+    if ($null -ne $SecondError) {
+        $second = "$($SecondError.Exception.Message)"
+        if ($null -ne $SecondError.InvocationInfo -and $SecondError.InvocationInfo.ScriptLineNumber -gt 0) {
+            $second += " (line $($SecondError.InvocationInfo.ScriptLineNumber))"
+        }
+    }
+    $detail = 'A second unexpected error happened while handling the first.'
+    if ($FirstMessage) { $detail += " First: $FirstMessage." }
+    $detail += " Second: $second"
+    $detail = ($detail -replace '\s+', ' ').Trim()
+    if ($detail.Length -gt 900) { $detail = $detail.Substring(0, 897) + '...' }
+    Write-Host '=== RMM SUMMARY ==='
+    Write-Host ("Computer=$env:COMPUTERNAME; Stage=$Stage; Outcome=UNHANDLED_ERROR; ExitCode=50; IssueCode=UNHANDLED_ERROR; " +
+                "ActionRequired=PAGE AN OPERATOR NOW. Check the transcript and the marker.; Detail=$detail")
+    Write-Host '==================='
+    exit 50
+}
+
 # Called by the script's trap. Decides by stage (spec 7.6 table, through
 # Get-TrapAction) and always ends in Complete-Run, which exits. A second error
-# while this handler runs (for example inside Complete-Run) prints a minimal
-# summary and exits 50 without repeating any restore or rollback.
+# while this handler runs (for example inside Complete-Run) is caught here and ends
+# in Exit-TrapSecondError: minimal summary, exit 50, no repeated restore or rollback.
 function Invoke-TrapHandler {
     param([Parameter(Mandatory)][System.Management.Automation.ErrorRecord] $ErrorRecord)
     $message = "$($ErrorRecord.Exception.Message)"
@@ -4876,16 +4907,23 @@ function Invoke-TrapHandler {
     $stage = "$(Get-Variable -Name Stage -Scope Script -ValueOnly -ErrorAction SilentlyContinue)"
     if (-not $stage) { $stage = 'UNTOUCHED' }
 
+    # Only reachable if the trap runs again, which Windows PowerShell 5.1 does not do
+    # for an error inside the trap block; the try/catch below is what catches those.
     if ([bool](Get-Variable -Name TrapHandled -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) {
-        Write-Host '=== RMM SUMMARY ==='
-        Write-Host ("Computer=$env:COMPUTERNAME; Stage=$stage; Outcome=UNHANDLED_ERROR; ExitCode=50; IssueCode=UNHANDLED_ERROR; " +
-                    'ActionRequired=PAGE AN OPERATOR NOW. Check the transcript and the marker.; Detail=' +
-                    (Format-ShortText -Text "A second unexpected error happened while handling the first: $message"))
-        Write-Host '==================='
-        exit 50
+        Exit-TrapSecondError -Stage $stage -SecondError $ErrorRecord
     }
     $script:TrapHandled = $true
-    Write-Log "UNHANDLED ERROR at stage ${stage}: $message" -Level ERROR
+    try {
+        Invoke-TrapAction -Stage $stage -Message $message
+    } catch {
+        Exit-TrapSecondError -Stage $stage -FirstMessage $message -SecondError $_
+    }
+}
+
+# What the trap does for the first error, by stage. Every path ends in Complete-Run.
+function Invoke-TrapAction {
+    param([string] $Stage, [string] $Message)
+    Write-Log "UNHANDLED ERROR at stage ${Stage}: $Message" -Level ERROR
 
     $ctxVar = Get-Variable -Name Ctx -Scope Script -ErrorAction SilentlyContinue
     $ctx = $null
