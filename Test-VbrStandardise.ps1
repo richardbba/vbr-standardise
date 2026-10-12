@@ -3652,6 +3652,24 @@ try {
         } finally {
             $writer.Dispose()
         }
+
+        # A log that cannot be opened (held with no sharing, renamed after the
+        # Test-Path, access denied) must not abort the caller's poll loop.
+        $locked = Join-Path $dir 'locked.log'
+        [IO.File]::WriteAllText($locked, "line before lock`r`n", [Text.Encoding]::ASCII)
+        $lockStream = New-Object -TypeName System.IO.FileStream -ArgumentList @($locked, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try {
+            $lockLogStart = $script:LogLines.Count
+            $lockedError = ''
+            $lockedTail = @('unset')
+            try { $lockedTail = @(Read-LogTail -Path $locked -FromOffset 0) } catch { $lockedError = $_.Exception.Message }
+            Check 'log tail: a file held with no sharing does not throw'      $lockedError ''
+            Check 'log tail: a file held with no sharing gives no lines'      $lockedTail.Count 0
+            Check 'log tail: a file held with no sharing is logged as WARN'   (@($script:LogLines | Select-Object -Skip $lockLogStart | Where-Object { $_ -like '`[WARN`] *locked.log*' }).Count) 1
+        } finally {
+            $lockStream.Dispose()
+        }
+        Check 'log tail: readable again once the lock is released'            ((@(Read-LogTail -Path $locked -FromOffset 0)) -join ',') 'line before lock'
     }
 } catch {
     Check 'Task 15: log tail tests ran to the end' $_.Exception.Message ''
@@ -3774,6 +3792,22 @@ try {
         $r = & $wait 0 $offset 'VeeamFakeSvc'
         Check 'connect wait: other service name is used'           ($calls -contains 'svc:VeeamFakeSvc') 'True'
         Check 'connect wait: success on the first poll'            $r.Ok 'True'
+
+        # One unreadable log poll must not abort the connect check: the session
+        # evidence still decides, and the next poll would retry the log.
+        $calls.Clear()
+        $lockStream = New-Object -TypeName System.IO.FileStream -ArgumentList @($log, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $lockError = ''
+        $r = $null
+        try {
+            $r = & $wait 0 $offset
+        } catch {
+            $lockError = $_.Exception.Message
+        } finally {
+            $lockStream.Dispose()
+        }
+        Check 'connect wait: a log held with no sharing does not abort'    $lockError ''
+        Check 'connect wait: a log held with no sharing still connects'    "$(if ($null -ne $r) { $r.Ok })" 'True'
     }
 } catch {
     Check 'Task 15: Wait-VbrDbConnected tests ran to the end' $_.Exception.Message ''

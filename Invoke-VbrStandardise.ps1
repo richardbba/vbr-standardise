@@ -3978,7 +3978,9 @@ function Get-FileLength {
 
 # Lines written after FromOffset. If the file is now shorter than the offset (the
 # log rolled over), the whole file is new. Decoded as UTF-8; the signatures we look
-# for are ASCII. Empty lines are dropped.
+# for are ASCII. Empty lines are dropped. A file that cannot be opened or read (it
+# was renamed after the Test-Path, it is held with no sharing, access is denied) is
+# logged as a WARN and gives no lines, so the caller's next poll simply retries.
 function Read-LogTail {
     param(
         [Parameter(Mandatory)][string] $Path,
@@ -4003,6 +4005,9 @@ function Read-LogTail {
             if ($n -le 0) { break }
             $read += $n
         }
+    } catch {
+        Write-Log -Message "Could not read the log tail of ${Path}: $(Format-ShortText -Text $_.Exception.Message -MaxLength 300)" -Level 'WARN'
+        return [string[]]@()
     } finally {
         if ($null -ne $stream) { $stream.Dispose() }
     }
