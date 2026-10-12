@@ -1074,6 +1074,154 @@ function Remove-OldRunData {
 #endregion Preflight
 
 #region Vbr
+# --- VBR install, products and registry (spec 7.1 steps 7-10, 7.5, 9) ---
+
+# VBR is installed when the CorePath folder exists (same test as the updater).
+function Get-VbrInstall {
+    param([string] $RootKey = 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication')
+    $corePath = "$(Get-RegValue -Path $RootKey -Name 'CorePath')"
+    if (-not $corePath -or -not (Test-Path -LiteralPath $corePath -PathType Container)) {
+        return [pscustomobject]@{ Installed = $false; CorePath = $corePath; Version = '' }
+    }
+    $version = ''
+    foreach ($relative in @('Veeam.Backup.Service.exe', 'Packages\VeeamDeploymentDll.dll')) {
+        $file = Join-Path $corePath $relative
+        if (Test-Path -LiteralPath $file -PathType Leaf) {
+            try { $version = "$((Get-Item -LiteralPath $file -Force).VersionInfo.ProductVersion)".Trim() } catch { $version = '' }
+        }
+        if ($version) { break }
+    }
+    if (-not $version) { $version = 'Unknown' }
+    return [pscustomobject]@{ Installed = $true; CorePath = $corePath; Version = $version }
+}
+
+# The service OR the executable proves VB365. A leftover empty folder does not.
+function Test-Vb365Installed {
+    $service = Get-Service -Name 'Veeam.Archiver.Service' -ErrorAction SilentlyContinue
+    if ($null -ne $service) { return $true }
+    return [bool](Test-Path -LiteralPath 'C:\Program Files\Veeam\Backup365\Veeam.Archiver.Service.exe' -PathType Leaf)
+}
+
+# Reads the VBR database settings. Password values are reduced to "set or not"
+# at once and never returned. Missing text values come back as ''. Port and
+# EntraIdPort are [int] in 1-65535, otherwise $null.
+function Get-VbrDbConfig {
+    param([string] $RootKey = 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication')
+    $readPort = {
+        param([string] $Key, [string] $Name)
+        $raw = Get-RegValue -Path $Key -Name $Name
+        $number = 0
+        if ($null -ne $raw -and [int]::TryParse("$raw", [ref]$number) -and $number -ge 1 -and $number -le 65535) { return $number }
+        return $null
+    }
+    $root = $RootKey.TrimEnd('\')
+    $configKey = "$root\DatabaseConfigurations"
+    $keyPath = "$configKey\PostgreSql"
+    return [pscustomobject]@{
+        RootKey             = $RootKey
+        KeyPath             = $keyPath
+        ActiveConfiguration = "$(Get-RegValue -Path $configKey -Name 'SqlActiveConfiguration')"
+        HostName            = "$(Get-RegValue -Path $keyPath -Name 'SqlHostName')"
+        Port                = (& $readPort $keyPath 'SqlHostPort')
+        DatabaseName        = "$(Get-RegValue -Path $keyPath -Name 'SqlDatabaseName')"
+        UserName            = "$(Get-RegValue -Path $keyPath -Name 'SqlUserName')"
+        PasswordSet         = ("$(Get-RegValue -Path $keyPath -Name 'SqlSecuredPassword')".Length -gt 0)
+        WindowsAuthRole     = "$(Get-RegValue -Path $keyPath -Name 'PostgresUserForWindowsAuth')"
+        EntraIdHost         = "$(Get-RegValue -Path $root -Name 'EntraIdSqlHostName')"
+        EntraIdPort         = (& $readPort $root 'EntraIdSqlHostPort')
+        EntraIdPasswordSet  = ("$(Get-RegValue -Path $root -Name 'EntraIdSqlPassword')".Length -gt 0)
+    }
+}
+
+# Enterprise Manager uses the same layout under its own root key.
+function Get-EnterpriseManagerDbConfig {
+    param([string] $RootKey = 'HKLM:\SOFTWARE\Veeam\Veeam Backup Reporting')
+    $root = $RootKey.TrimEnd('\')
+    $configKey = "$root\DatabaseConfigurations"
+    if (-not (Test-Path -LiteralPath $configKey)) { return $null }
+    $keyPath = "$configKey\PostgreSql"
+    $rawPort = Get-RegValue -Path $keyPath -Name 'SqlHostPort'
+    $number = 0
+    $port = $null
+    if ($null -ne $rawPort -and [int]::TryParse("$rawPort", [ref]$number) -and $number -ge 1 -and $number -le 65535) { $port = $number }
+    return [pscustomobject]@{
+        ActiveConfiguration = "$(Get-RegValue -Path $configKey -Name 'SqlActiveConfiguration')"
+        HostName            = "$(Get-RegValue -Path $keyPath -Name 'SqlHostName')"
+        Port                = $port
+        PasswordSet         = ("$(Get-RegValue -Path $keyPath -Name 'SqlSecuredPassword')".Length -gt 0)
+    }
+}
+
+# Computer name, FQDN and every address on a local network interface (loopback
+# included). DNS answers are used for names only, never for addresses, because a
+# stale DNS record can name another server.
+function Get-LocalHostNames {
+    $candidates = New-Object System.Collections.ArrayList
+    [void]$candidates.Add($env:COMPUTERNAME)
+    try {
+        $ipProps = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()
+        [void]$candidates.Add($ipProps.HostName)
+        if ($ipProps.DomainName) { [void]$candidates.Add("$($ipProps.HostName).$($ipProps.DomainName)") }
+    } catch { }
+    try {
+        $entry = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME)
+        [void]$candidates.Add($entry.HostName)
+        foreach ($alias in @($entry.Aliases)) { [void]$candidates.Add($alias) }
+    } catch { }
+    try {
+        foreach ($nic in @([System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces())) {
+            foreach ($unicast in @($nic.GetIPProperties().UnicastAddresses)) {
+                $text = $unicast.Address.ToString()
+                [void]$candidates.Add($text)
+                if ($text.Contains('%')) { [void]$candidates.Add($text.Split('%')[0]) }
+            }
+        }
+    } catch { }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $names = New-Object System.Collections.ArrayList
+    foreach ($candidate in $candidates) {
+        $value = "$candidate".Trim()
+        if ($value.Length -gt 1) { $value = $value.TrimEnd('.') }
+        if ($value -and $seen.Add($value)) { [void]$names.Add($value) }
+    }
+    return [string[]]$names.ToArray()
+}
+
+# LOOPBACK, LOCAL (one of LocalNames) or REMOTE. An empty host is not proven
+# local, so it is REMOTE (fail closed). IPv6 text is compared in canonical form.
+function Get-DbHostClass {
+    param(
+        [string] $HostName,
+        [string[]] $LocalNames
+    )
+    $normalise = {
+        param([string] $Text)
+        $value = "$Text".Trim().Trim([char[]]@('[', ']'))
+        if ($value.Length -gt 1) { $value = $value.TrimEnd('.') }
+        $address = $null
+        if ($value.Contains(':') -and [System.Net.IPAddress]::TryParse($value, [ref]$address)) { $value = $address.ToString() }
+        return $value
+    }
+    $candidate = & $normalise $HostName
+    if (-not $candidate) { return 'REMOTE' }
+    if (@('localhost', '127.0.0.1', '::1') -contains $candidate) { return 'LOOPBACK' }
+    foreach ($name in @($LocalNames)) {
+        $local = & $normalise $name
+        if ($local -and $local -ieq $candidate) { return 'LOCAL' }
+    }
+    return 'REMOTE'
+}
+
+# Spec 9: Windows authentication when SqlUserName and SqlSecuredPassword are
+# both empty or absent; native when either one has data.
+function Get-RegistryAuthMode {
+    param(
+        [string] $UserName,
+        [bool] $PasswordSet
+    )
+    if ([string]::IsNullOrEmpty($UserName) -and -not $PasswordSet) { return 'WINDOWS' }
+    return 'NATIVE'
+}
 #endregion Vbr
 
 #region PgDiscovery

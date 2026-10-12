@@ -825,6 +825,169 @@ if ($t3IsAdmin) {
 } else {
     Skip 'Initialize-WorkRoot ACL and trusted legacy marker tests' 'not elevated'
 }
+# --- Task 4: VBR registry, products and host class ---
+$t4Key = "HKCU:\Software\VbrStdTest-$PID"
+$t4SetValue = {
+    param([string] $Key, [string] $Name, $Value, [string] $Kind = 'String')
+    if (-not (Test-Path -LiteralPath $Key)) { [void](New-Item -Path $Key -Force) }
+    [void](New-ItemProperty -LiteralPath $Key -Name $Name -Value $Value -PropertyType $Kind -Force)
+}
+try {
+    # Get-VbrInstall
+    $t4Vbr = "$t4Key\VBR"
+    $t4R = Get-VbrInstall -RootKey $t4Vbr
+    Check 'Get-VbrInstall: missing key is not installed' $t4R.Installed 'False'
+    Check 'Get-VbrInstall: missing key has no version' $t4R.Version ''
+    Check 'Get-VbrInstall: result shape' (@($t4R.PSObject.Properties | ForEach-Object { $_.Name }) -join ',') 'Installed,CorePath,Version'
+    $t4Core = New-TestFolder 'core'
+    & $t4SetValue $t4Vbr 'CorePath' (Join-Path $t4Core 'missing')
+    Check 'Get-VbrInstall: CorePath folder missing is not installed' (Get-VbrInstall -RootKey $t4Vbr).Installed 'False'
+    & $t4SetValue $t4Vbr 'CorePath' $t4Core
+    $t4R = Get-VbrInstall -RootKey $t4Vbr
+    Check 'Get-VbrInstall: CorePath folder present is installed' $t4R.Installed 'True'
+    Check 'Get-VbrInstall: CorePath returned' $t4R.CorePath $t4Core
+    Check 'Get-VbrInstall: no binaries gives Unknown' $t4R.Version 'Unknown'
+    # Two real binaries with different versions stand in for the Veeam files.
+    # Expected values are read from the copies: a System32 file reports the
+    # version of its .mui resource, which the copy does not have.
+    $t4Dll = Join-Path $t4Core 'Packages\VeeamDeploymentDll.dll'
+    $t4Exe = Join-Path $t4Core 'Veeam.Backup.Service.exe'
+    [void][IO.Directory]::CreateDirectory((Join-Path $t4Core 'Packages'))
+    Copy-Item -LiteralPath ([object].Assembly.Location) -Destination $t4Dll
+    $t4DllVersion = "$((Get-Item -LiteralPath $t4Dll).VersionInfo.ProductVersion)".Trim()
+    Check 'Get-VbrInstall: falls back to VeeamDeploymentDll.dll' (Get-VbrInstall -RootKey $t4Vbr).Version $t4DllVersion
+    Copy-Item -LiteralPath ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -Destination $t4Exe
+    $t4ExeVersion = "$((Get-Item -LiteralPath $t4Exe).VersionInfo.ProductVersion)".Trim()
+    Check 'Get-VbrInstall fixture: the two binaries have different versions' ($t4ExeVersion -ne $t4DllVersion) 'True'
+    Check 'Get-VbrInstall: prefers Veeam.Backup.Service.exe' (Get-VbrInstall -RootKey $t4Vbr).Version $t4ExeVersion
+
+    # Get-VbrDbConfig: native authentication shape (VBR-PILOT02)
+    $t4Pg = "$t4Vbr\DatabaseConfigurations\PostgreSql"
+    & $t4SetValue "$t4Vbr\DatabaseConfigurations" 'SqlActiveConfiguration' 'PostgreSql'
+    & $t4SetValue $t4Pg 'SqlHostName' '127.0.0.1'
+    & $t4SetValue $t4Pg 'SqlHostPort' 5432 'DWord'
+    & $t4SetValue $t4Pg 'SqlDatabaseName' 'VeeamBackup'
+    & $t4SetValue $t4Pg 'SqlUserName' 'postgres'
+    & $t4SetValue $t4Pg 'SqlSecuredPassword' 'AQAAANCMnd8-fake-secret-1'
+    & $t4SetValue $t4Pg 'PostgresUserForWindowsAuth' 'postgres'
+    & $t4SetValue $t4Vbr 'EntraIdSqlHostName' 'localhost'
+    & $t4SetValue $t4Vbr 'EntraIdSqlHostPort' 5432 'DWord'
+    & $t4SetValue $t4Vbr 'EntraIdSqlPassword' 'entra-fake-secret-2'
+    $t4C = Get-VbrDbConfig -RootKey $t4Vbr
+    Check 'Get-VbrDbConfig: result shape' (@($t4C.PSObject.Properties | ForEach-Object { $_.Name }) -join ',') 'RootKey,KeyPath,ActiveConfiguration,HostName,Port,DatabaseName,UserName,PasswordSet,WindowsAuthRole,EntraIdHost,EntraIdPort,EntraIdPasswordSet'
+    Check 'Get-VbrDbConfig: RootKey' $t4C.RootKey $t4Vbr
+    Check 'Get-VbrDbConfig: KeyPath' $t4C.KeyPath $t4Pg
+    Check 'Get-VbrDbConfig: ActiveConfiguration' $t4C.ActiveConfiguration 'PostgreSql'
+    Check 'Get-VbrDbConfig: HostName' $t4C.HostName '127.0.0.1'
+    Check 'Get-VbrDbConfig: Port value' $t4C.Port 5432
+    Check 'Get-VbrDbConfig: Port is an int' ($t4C.Port -is [int]) 'True'
+    Check 'Get-VbrDbConfig: DatabaseName' $t4C.DatabaseName 'VeeamBackup'
+    Check 'Get-VbrDbConfig: UserName' $t4C.UserName 'postgres'
+    Check 'Get-VbrDbConfig: PasswordSet' $t4C.PasswordSet 'True'
+    Check 'Get-VbrDbConfig: WindowsAuthRole' $t4C.WindowsAuthRole 'postgres'
+    Check 'Get-VbrDbConfig: EntraIdHost' $t4C.EntraIdHost 'localhost'
+    Check 'Get-VbrDbConfig: EntraIdPort' $t4C.EntraIdPort 5432
+    Check 'Get-VbrDbConfig: EntraIdPasswordSet' $t4C.EntraIdPasswordSet 'True'
+    Check 'Get-VbrDbConfig: never returns password data' (@($t4C.PSObject.Properties | Where-Object { "$($_.Value)" -like '*fake-secret*' }).Count) 0
+    Check 'Get-RegistryAuthMode: native registry shape' (Get-RegistryAuthMode -UserName $t4C.UserName -PasswordSet $t4C.PasswordSet) 'NATIVE'
+
+    # Get-VbrDbConfig: Windows authentication shape (VBR-PILOT01)
+    & $t4SetValue $t4Pg 'SqlUserName' ''
+    & $t4SetValue $t4Pg 'SqlSecuredPassword' ''
+    Remove-ItemProperty -LiteralPath $t4Vbr -Name 'EntraIdSqlPassword'
+    $t4C = Get-VbrDbConfig -RootKey $t4Vbr
+    Check 'Get-VbrDbConfig: empty SqlUserName' $t4C.UserName ''
+    Check 'Get-VbrDbConfig: empty SqlSecuredPassword is not set' $t4C.PasswordSet 'False'
+    Check 'Get-VbrDbConfig: absent EntraIdSqlPassword is not set' $t4C.EntraIdPasswordSet 'False'
+    Check 'Get-RegistryAuthMode: Windows registry shape' (Get-RegistryAuthMode -UserName $t4C.UserName -PasswordSet $t4C.PasswordSet) 'WINDOWS'
+
+    # Get-VbrDbConfig: ports
+    & $t4SetValue $t4Pg 'SqlHostPort' '5433'
+    Check 'Get-VbrDbConfig: string port is parsed' (Get-VbrDbConfig -RootKey $t4Vbr).Port 5433
+    & $t4SetValue $t4Pg 'SqlHostPort' 'abc'
+    Check 'Get-VbrDbConfig: text port is null' ($null -eq (Get-VbrDbConfig -RootKey $t4Vbr).Port) 'True'
+    & $t4SetValue $t4Pg 'SqlHostPort' 70000 'DWord'
+    Check 'Get-VbrDbConfig: out-of-range port is null' ($null -eq (Get-VbrDbConfig -RootKey $t4Vbr).Port) 'True'
+    Remove-ItemProperty -LiteralPath $t4Pg -Name 'SqlHostPort'
+    Check 'Get-VbrDbConfig: absent port is null' ($null -eq (Get-VbrDbConfig -RootKey $t4Vbr).Port) 'True'
+    Remove-ItemProperty -LiteralPath $t4Pg -Name 'PostgresUserForWindowsAuth'
+    Check 'Get-VbrDbConfig: absent PostgresUserForWindowsAuth is empty' (Get-VbrDbConfig -RootKey $t4Vbr).WindowsAuthRole ''
+    $t4C = Get-VbrDbConfig -RootKey "$t4Key\NoSuchProduct"
+    Check 'Get-VbrDbConfig: missing key gives empty ActiveConfiguration' $t4C.ActiveConfiguration ''
+    Check 'Get-VbrDbConfig: missing key gives no password' $t4C.PasswordSet 'False'
+
+    # Get-EnterpriseManagerDbConfig
+    $t4Em = "$t4Key\EM"
+    Check 'Get-EnterpriseManagerDbConfig: absent key gives null' ($null -eq (Get-EnterpriseManagerDbConfig -RootKey $t4Em)) 'True'
+    & $t4SetValue "$t4Em\DatabaseConfigurations" 'SqlActiveConfiguration' 'PostgreSql'
+    & $t4SetValue "$t4Em\DatabaseConfigurations\PostgreSql" 'SqlHostName' 'localhost'
+    & $t4SetValue "$t4Em\DatabaseConfigurations\PostgreSql" 'SqlHostPort' 5432 'DWord'
+    & $t4SetValue "$t4Em\DatabaseConfigurations\PostgreSql" 'SqlSecuredPassword' 'em-fake-secret-3'
+    $t4E = Get-EnterpriseManagerDbConfig -RootKey $t4Em
+    Check 'Get-EnterpriseManagerDbConfig: result shape' (@($t4E.PSObject.Properties | ForEach-Object { $_.Name }) -join ',') 'ActiveConfiguration,HostName,Port,PasswordSet'
+    Check 'Get-EnterpriseManagerDbConfig: ActiveConfiguration' $t4E.ActiveConfiguration 'PostgreSql'
+    Check 'Get-EnterpriseManagerDbConfig: HostName' $t4E.HostName 'localhost'
+    Check 'Get-EnterpriseManagerDbConfig: Port' $t4E.Port 5432
+    Check 'Get-EnterpriseManagerDbConfig: PasswordSet' $t4E.PasswordSet 'True'
+    Check 'Get-EnterpriseManagerDbConfig: never returns password data' (@($t4E.PSObject.Properties | Where-Object { "$($_.Value)" -like '*fake-secret*' }).Count) 0
+} finally {
+    if (Test-Path -LiteralPath $t4Key) { Remove-Item -LiteralPath $t4Key -Recurse -Force }
+}
+Check 'Task 4 registry fixture removed' (Test-Path -LiteralPath $t4Key) 'False'
+$t4Defaults = @{}
+foreach ($t4Node in $ScriptAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+    if (@('Get-VbrInstall', 'Get-VbrDbConfig', 'Get-EnterpriseManagerDbConfig') -notcontains $t4Node.Name) { continue }
+    $t4P = @($t4Node.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'RootKey' })
+    if ($t4P.Count -eq 1 -and $null -ne $t4P[0].DefaultValue) { $t4Defaults[$t4Node.Name] = $t4P[0].DefaultValue.Extent.Text }
+}
+Check 'Get-VbrInstall: default root key' $t4Defaults['Get-VbrInstall'] "'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication'"
+Check 'Get-VbrDbConfig: default root key' $t4Defaults['Get-VbrDbConfig'] "'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication'"
+Check 'Get-EnterpriseManagerDbConfig: default root key' $t4Defaults['Get-EnterpriseManagerDbConfig'] "'HKLM:\SOFTWARE\Veeam\Veeam Backup Reporting'"
+
+# Test-Vb365Installed (service and file lookups mocked)
+Check 'Test-Vb365Installed: no service and no file' (& {
+    function Get-Service { [CmdletBinding()] param([string[]] $Name) }
+    function Test-Path { [CmdletBinding()] param([string[]] $LiteralPath, [string] $PathType) $false }
+    Test-Vb365Installed }) 'False'
+Check 'Test-Vb365Installed: service present' (& {
+    function Get-Service { [CmdletBinding()] param([string[]] $Name) if ($Name -contains 'Veeam.Archiver.Service') { [pscustomobject]@{ Name = 'Veeam.Archiver.Service' } } }
+    function Test-Path { [CmdletBinding()] param([string[]] $LiteralPath, [string] $PathType) $false }
+    Test-Vb365Installed }) 'True'
+Check 'Test-Vb365Installed: executable present' (& {
+    function Get-Service { [CmdletBinding()] param([string[]] $Name) }
+    function Test-Path { [CmdletBinding()] param([string[]] $LiteralPath, [string] $PathType) ($LiteralPath -contains 'C:\Program Files\Veeam\Backup365\Veeam.Archiver.Service.exe') }
+    Test-Vb365Installed }) 'True'
+
+# Get-LocalHostNames
+$t4Names = @(Get-LocalHostNames)
+Check 'Get-LocalHostNames: includes the computer name' (@($t4Names | Where-Object { $_ -ieq $env:COMPUTERNAME }).Count -ge 1) 'True'
+Check 'Get-LocalHostNames: includes 127.0.0.1' ($t4Names -contains '127.0.0.1') 'True'
+Check 'Get-LocalHostNames: no empty entries' (@($t4Names | Where-Object { -not $_ }).Count) 0
+Check 'Get-LocalHostNames: no duplicates' (@($t4Names | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique).Count) $t4Names.Count
+
+# Get-DbHostClass
+$t4Local = @('VBR01', 'vbr01.corp.example', '10.1.2.3', 'fe80::1%12')
+Check 'Get-DbHostClass: localhost' (Get-DbHostClass -HostName 'localhost' -LocalNames $t4Local) 'LOOPBACK'
+Check 'Get-DbHostClass: LOCALHOST any case' (Get-DbHostClass -HostName 'LOCALHOST' -LocalNames $t4Local) 'LOOPBACK'
+Check 'Get-DbHostClass: 127.0.0.1' (Get-DbHostClass -HostName '127.0.0.1' -LocalNames $t4Local) 'LOOPBACK'
+Check 'Get-DbHostClass: ::1' (Get-DbHostClass -HostName '::1' -LocalNames $t4Local) 'LOOPBACK'
+Check 'Get-DbHostClass: [::1] with brackets' (Get-DbHostClass -HostName '[::1]' -LocalNames $t4Local) 'LOOPBACK'
+Check 'Get-DbHostClass: long form of ::1' (Get-DbHostClass -HostName '0:0:0:0:0:0:0:1' -LocalNames $t4Local) 'LOOPBACK'
+Check 'Get-DbHostClass: spaces trimmed' (Get-DbHostClass -HostName ' localhost ' -LocalNames $t4Local) 'LOOPBACK'
+Check 'Get-DbHostClass: computer name any case' (Get-DbHostClass -HostName 'vbr01' -LocalNames $t4Local) 'LOCAL'
+Check 'Get-DbHostClass: FQDN with trailing dot' (Get-DbHostClass -HostName 'VBR01.corp.example.' -LocalNames $t4Local) 'LOCAL'
+Check 'Get-DbHostClass: own IP address' (Get-DbHostClass -HostName '10.1.2.3' -LocalNames $t4Local) 'LOCAL'
+Check 'Get-DbHostClass: other server' (Get-DbHostClass -HostName 'sql02.corp.example' -LocalNames $t4Local) 'REMOTE'
+Check 'Get-DbHostClass: other IP address' (Get-DbHostClass -HostName '10.1.2.4' -LocalNames $t4Local) 'REMOTE'
+Check 'Get-DbHostClass: empty host is not proven local' (Get-DbHostClass -HostName '' -LocalNames $t4Local) 'REMOTE'
+Check 'Get-DbHostClass: no local names' (Get-DbHostClass -HostName 'vbr01' -LocalNames @()) 'REMOTE'
+
+# Get-RegistryAuthMode
+Check 'Get-RegistryAuthMode: empty user, no password' (Get-RegistryAuthMode -UserName '' -PasswordSet $false) 'WINDOWS'
+Check 'Get-RegistryAuthMode: null user, no password' (Get-RegistryAuthMode -UserName $null -PasswordSet $false) 'WINDOWS'
+Check 'Get-RegistryAuthMode: user and password' (Get-RegistryAuthMode -UserName 'postgres' -PasswordSet $true) 'NATIVE'
+Check 'Get-RegistryAuthMode: user only' (Get-RegistryAuthMode -UserName 'postgres' -PasswordSet $false) 'NATIVE'
+Check 'Get-RegistryAuthMode: password only' (Get-RegistryAuthMode -UserName '' -PasswordSet $true) 'NATIVE'
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue
