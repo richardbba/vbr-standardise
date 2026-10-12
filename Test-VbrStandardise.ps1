@@ -1444,6 +1444,466 @@ Check 'T6 no services: no map names' (@($t6None.MapNames).Count) '0'
 Check 'T6 no services: nothing unresolved' (@($t6None.Unresolved).Count) '0'
 $t6Default = Get-VeeamServiceAccountNames
 Check 'T6 default service list returns both lists' ($null -ne $t6Default.PSObject.Properties['MapNames'] -and $null -ne $t6Default.PSObject.Properties['Unresolved']) 'True'
+# --- Task 7: svc_veeam account check and fix ---
+Write-Host '--- Task 7: svc_veeam account check and fix ---'
+
+# Exception classes with the LocalAccounts type NAMES. The script maps errors by type name only.
+if (-not ('VbrStdT7.InvalidPasswordException' -as [type])) {
+    Add-Type -WarningAction SilentlyContinue -TypeDefinition @'
+namespace VbrStdT7 {
+    public class InvalidPasswordException : System.Exception { public InvalidPasswordException(string m) : base(m) { } }
+    public class NameInUseException : System.Exception { public NameInUseException(string m) : base(m) { } }
+    public class UserExistsException : System.Exception { public UserExistsException(string m) : base(m) { } }
+    public class MemberExistsException : System.Exception { public MemberExistsException(string m) : base(m) { } }
+}
+'@
+}
+
+# A fake Get-ServiceAccountInfo result. The defaults describe a compliant account.
+function New-T7Info {
+    param(
+        [bool] $Exists = $true,
+        [bool] $IsUser = $true,
+        [int] $UserFlags = 0x10241,
+        [bool] $HasExpirationDate = $false,
+        [bool] $IsLocked = $false,
+        [bool] $PasswordExpired = $false,
+        [bool] $IsAdmin = $true
+    )
+    $sid = $null
+    $map = ''
+    if ($Exists -and $IsUser) {
+        $sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-21-1111111111-2222222222-3333333333-1001')
+        $map = 'svc_veeam@VBR01'
+    }
+    return [pscustomobject]@{
+        Exists = $Exists; IsUser = $IsUser; Sid = $sid; UserFlags = $UserFlags
+        HasExpirationDate = $HasExpirationDate; IsLocked = $IsLocked; PasswordExpired = $PasswordExpired
+        IsAdmin = $IsAdmin; MapName = $map
+    }
+}
+
+function New-T7Secure {
+    param([string] $Text)
+    $secure = New-Object System.Security.SecureString
+    foreach ($ch in $Text.ToCharArray()) { $secure.AppendChar($ch) }
+    return $secure
+}
+
+function New-T7ErrorRecord {
+    param([System.Exception] $Exception)
+    return (New-Object -TypeName System.Management.Automation.ErrorRecord -ArgumentList @($Exception, 'T7Test', [System.Management.Automation.ErrorCategory]::NotSpecified, $null))
+}
+
+# Every issue as CODE:EXIT; and every issue field as one text (to prove the password never reaches the summary).
+function Get-T7Codes { return (@($script:Issues | ForEach-Object { '{0}:{1}' -f $_.Code, $_.ExitCode }) -join ',') }
+function Get-T7IssueText { return (@($script:Issues | ForEach-Object { '{0}|{1}|{2}' -f $_.Code, $_.Detail, $_.Action }) -join "`n") }
+
+$t7Secret = "T7-Pw!$PID-q9Z"
+$t7EnvName = "VBRSTD_T7_PW_$PID"
+$t7SvcSid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+$t7Desc = 'Veeam maintenance account (PostgreSQL SSPI map)'
+$t7FakeSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-21-1111111111-2222222222-3333333333-4242')
+
+# --- Get-ServiceAccountStatus (pure) ---
+$t7s = Get-ServiceAccountStatus -Info (New-T7Info -Exists $false -IsUser $false)
+Check 'T7 status: missing account' $t7s.Status 'MISSING'
+Check 'T7 status: missing code' ($t7s.Codes -join ',') 'SVC_ACCOUNT_MISSING'
+$t7s = Get-ServiceAccountStatus -Info (New-T7Info -IsUser $false)
+Check 'T7 status: name is a group' $t7s.Status 'NAME_IN_USE'
+Check 'T7 status: group code' ($t7s.Codes -join ',') 'SVC_NAME_IN_USE'
+$t7s = Get-ServiceAccountStatus -Info (New-T7Info)
+Check 'T7 status: compliant account' $t7s.Status 'OK'
+Check 'T7 status: compliant has no codes' @($t7s.Codes).Count 0
+Check 'T7 status: compliant needs no admin fix' $t7s.NeedsAdmin 'False'
+Check 'T7 status: compliant needs no flag fix' $t7s.NeedsFlags 'False'
+$t7s = Get-ServiceAccountStatus -Info (New-T7Info -IsAdmin $false)
+Check 'T7 status: not admin' $t7s.Status 'NOT_ADMIN'
+Check 'T7 status: not admin needs admin fix' $t7s.NeedsAdmin 'True'
+Check 'T7 status: not admin code' ($t7s.Codes -join ',') 'SVC_NOT_ADMIN'
+$t7s = Get-ServiceAccountStatus -Info (New-T7Info -UserFlags 0x241)
+Check 'T7 status: password expires is drift' $t7s.Status 'FLAGS_DRIFT'
+Check 'T7 status: drift needs flag fix' $t7s.NeedsFlags 'True'
+$t7s = Get-ServiceAccountStatus -Info (New-T7Info -UserFlags 0x10201)
+Check 'T7 status: user can change password is drift' $t7s.Status 'FLAGS_DRIFT'
+$t7s = Get-ServiceAccountStatus -Info (New-T7Info -HasExpirationDate $true)
+Check 'T7 status: expiry date present is drift' $t7s.Status 'FLAGS_DRIFT'
+Check 'T7 status: expiry date code' ($t7s.Codes -join ',') 'SVC_FLAGS_DRIFT'
+$t7s = Get-ServiceAccountStatus -Info (New-T7Info -HasExpirationDate $false)
+Check 'T7 status: expiry date absent is compliant' $t7s.Status 'OK'
+$t7s = Get-ServiceAccountStatus -Info (New-T7Info -UserFlags 0x10243)
+Check 'T7 status: disabled' $t7s.Status 'DISABLED'
+Check 'T7 status: disabled is not flag drift' $t7s.NeedsFlags 'False'
+Check 'T7 status: disabled code' ($t7s.Codes -join ',') 'SVC_DISABLED'
+$t7s = Get-ServiceAccountStatus -Info (New-T7Info -UserFlags 0x10251)
+Check 'T7 status: lockout flag 0x10' $t7s.Status 'LOCKED_OUT'
+$t7s = Get-ServiceAccountStatus -Info (New-T7Info -IsLocked $true)
+Check 'T7 status: IsLocked' $t7s.Status 'LOCKED_OUT'
+Check 'T7 status: locked code' ($t7s.Codes -join ',') 'SVC_LOCKED_OUT'
+$t7s = Get-ServiceAccountStatus -Info (New-T7Info -PasswordExpired $true)
+Check 'T7 status: password expired' $t7s.Status 'EXPIRED'
+Check 'T7 status: expired code' ($t7s.Codes -join ',') 'SVC_PASSWORD_EXPIRED'
+$t7s = Get-ServiceAccountStatus -Info (New-T7Info -IsAdmin $false -UserFlags 0x13 -HasExpirationDate $true -PasswordExpired $true)
+Check 'T7 status: precedence starts with NOT_ADMIN' $t7s.Status 'NOT_ADMIN'
+Check 'T7 status: every code in order' ($t7s.Codes -join ',') 'SVC_NOT_ADMIN,SVC_FLAGS_DRIFT,SVC_DISABLED,SVC_LOCKED_OUT,SVC_PASSWORD_EXPIRED'
+$t7s = Get-ServiceAccountStatus -Info (New-T7Info -UserFlags 0x10253 -PasswordExpired $true)
+Check 'T7 status: DISABLED before LOCKED_OUT and EXPIRED' $t7s.Status 'DISABLED'
+$t7s = Get-ServiceAccountStatus -Info ([pscustomobject]@{ Exists = $true; IsUser = $true })
+Check 'T7 status: partial object is StrictMode-safe' $t7s.Status 'NOT_ADMIN'
+
+# --- ConvertTo-AccountIssueCode (matched by exception type name) ---
+Check 'T7 map: InvalidPasswordException' (ConvertTo-AccountIssueCode -ErrorRecord (New-T7ErrorRecord (New-Object VbrStdT7.InvalidPasswordException('policy')))) 'SVC_PASSWORD_POLICY'
+Check 'T7 map: NameInUseException' (ConvertTo-AccountIssueCode -ErrorRecord (New-T7ErrorRecord (New-Object VbrStdT7.NameInUseException('in use')))) 'SVC_NAME_IN_USE'
+Check 'T7 map: UserExistsException' (ConvertTo-AccountIssueCode -ErrorRecord (New-T7ErrorRecord (New-Object VbrStdT7.UserExistsException('exists')))) 'SVC_NAME_IN_USE'
+$t7Wrapped = New-Object System.Management.Automation.RuntimeException('outer', (New-Object VbrStdT7.InvalidPasswordException('policy')))
+Check 'T7 map: wrapped InvalidPasswordException' (ConvertTo-AccountIssueCode -ErrorRecord (New-T7ErrorRecord $t7Wrapped)) 'SVC_PASSWORD_POLICY'
+Check 'T7 map: MemberExistsException is not a create code' ($null -eq (ConvertTo-AccountIssueCode -ErrorRecord (New-T7ErrorRecord (New-Object VbrStdT7.MemberExistsException('member'))))) 'True'
+Check 'T7 map: other exception gives null' ($null -eq (ConvertTo-AccountIssueCode -ErrorRecord (New-T7ErrorRecord (New-Object System.InvalidOperationException('other'))))) 'True'
+
+# --- Read-ServiceAccountPassword (process environment variable) ---
+[System.Environment]::SetEnvironmentVariable($t7EnvName, $t7Secret, 'Process')
+$t7Out = @(Read-ServiceAccountPassword -EnvVarName $t7EnvName)
+Check 'T7 password: one output object' $t7Out.Count 1
+Check 'T7 password: is a SecureString' ($t7Out[0] -is [System.Security.SecureString]) 'True'
+Check 'T7 password: right length' $t7Out[0].Length $t7Secret.Length
+$t7Bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($t7Out[0])
+try { $t7Back = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($t7Bstr) } finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($t7Bstr) }
+Check 'T7 password: same text' ($t7Back -ceq $t7Secret) 'True'
+$t7Back = $null
+$t7Out[0].Dispose()
+Check 'T7 password: variable removed from the process' ($null -eq [System.Environment]::GetEnvironmentVariable($t7EnvName, 'Process')) 'True'
+Check 'T7 password: env drive no longer has it' (Test-Path -LiteralPath "env:$t7EnvName") 'False'
+Check 'T7 password: missing variable gives null' ($null -eq (Read-ServiceAccountPassword -EnvVarName $t7EnvName)) 'True'
+Check 'T7 password: never logged' (($script:LogLines -join "`n").Contains($t7Secret)) 'False'
+
+# --- Get-ServiceAccountInfo and Test-AdministratorsMember (real ADSI reads, no changes) ---
+$t7Nope = Get-ServiceAccountInfo -Name ('vbrstd-nope-{0}' -f $PID)
+Check 'T7 info: unknown name does not exist' $t7Nope.Exists 'False'
+Check 'T7 info: unknown name is not a user' $t7Nope.IsUser 'False'
+Check 'T7 info: unknown name is not admin' $t7Nope.IsAdmin 'False'
+Check 'T7 info: unknown name has no SID' ($null -eq $t7Nope.Sid) 'True'
+Check 'T7 status: unknown name is MISSING' (Get-ServiceAccountStatus -Info $t7Nope).Status 'MISSING'
+$t7AdminsName = (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')).Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
+$t7Group = Get-ServiceAccountInfo -Name $t7AdminsName
+Check 'T7 info: group name exists' $t7Group.Exists 'True'
+Check 'T7 info: group name is not a user' $t7Group.IsUser 'False'
+Check 'T7 status: group name is NAME_IN_USE' (Get-ServiceAccountStatus -Info $t7Group).Status 'NAME_IN_USE'
+Check 'T7 admins: unknown SID is not a member' (Test-AdministratorsMember -MemberSid $t7FakeSid) 'False'
+$t7Rid500 = @(Get-CimInstance -ClassName Win32_UserAccount -Filter "LocalAccount=True AND SID LIKE 'S-1-5-21-%-500'" -ErrorAction SilentlyContinue)
+$t7RidChecks = @('T7 admins: built-in Administrator is a member', 'T7 info: built-in Administrator exists',
+    'T7 info: built-in Administrator is a user', 'T7 info: SID read from objectSid', 'T7 info: IsAdmin by SID',
+    'T7 info: UserFlags has NORMAL_ACCOUNT', 'T7 info: MapName is name@domain', 'T7 info: HasExpirationDate is a bool')
+if ($t7Rid500.Count -eq 1) {
+    $t7RidSid = New-Object System.Security.Principal.SecurityIdentifier($t7Rid500[0].SID)
+    Check $t7RidChecks[0] (Test-AdministratorsMember -MemberSid $t7RidSid) 'True'
+    $t7Real = Get-ServiceAccountInfo -Name $t7Rid500[0].Name
+    Check $t7RidChecks[1] $t7Real.Exists 'True'
+    Check $t7RidChecks[2] $t7Real.IsUser 'True'
+    Check $t7RidChecks[3] $t7Real.Sid.Value $t7RidSid.Value
+    Check $t7RidChecks[4] $t7Real.IsAdmin 'True'
+    Check $t7RidChecks[5] (($t7Real.UserFlags -band 0x200) -ne 0) 'True'
+    Check $t7RidChecks[6] ($t7Real.MapName -like ('{0}@*' -f $t7Rid500[0].Name)) 'True'
+    Check $t7RidChecks[7] ($t7Real.HasExpirationDate -is [bool]) 'True'
+} else {
+    foreach ($t7Name in $t7RidChecks) { Skip $t7Name 'built-in Administrator (RID 500) not found' }
+}
+
+# --- Add-AdministratorsMember (Add-LocalGroupMember mocked; the fake SID does not exist) ---
+& {
+    $t7Seen = New-Object System.Collections.ArrayList
+    function Add-LocalGroupMember { [CmdletBinding()] param($SID, $Member) [void]$t7Seen.Add(('{0}>{1}' -f $SID, $Member)) }
+    Add-AdministratorsMember -UserSid $t7FakeSid -UserName 'vbrstd-t7'
+    Check 'T7 add admin: Administrators by SID, member by SID' ($t7Seen -join ';') ('S-1-5-32-544>' + $t7FakeSid.Value)
+}
+& {
+    function Add-LocalGroupMember { [CmdletBinding()] param($SID, $Member) throw (New-Object VbrStdT7.MemberExistsException('exists')) }
+    $t7Threw = $false
+    try { Add-AdministratorsMember -UserSid $t7FakeSid -UserName 'vbrstd-t7' } catch { $t7Threw = $true }
+    Check 'T7 add admin: MemberExistsException counts as success' $t7Threw 'False'
+}
+& {
+    function Add-LocalGroupMember { [CmdletBinding()] param($SID, $Member) throw (New-Object System.UnauthorizedAccessException('Access is denied.')) }
+    Throws 'T7 add admin: other errors are thrown' { Add-AdministratorsMember -UserSid $t7FakeSid -UserName 'vbrstd-t7' }
+}
+
+# --- New-ServiceAccount (New-LocalUser mocked) ---
+& {
+    $t7Seen = @{}
+    function New-LocalUser {
+        [CmdletBinding()]
+        param($Name, $Password, $Description, [switch] $PasswordNeverExpires, [switch] $UserMayNotChangePassword, [switch] $AccountNeverExpires)
+        $t7Seen['Name'] = $Name
+        $t7Seen['Description'] = $Description
+        $t7Seen['PasswordIsSecure'] = ($Password -is [System.Security.SecureString])
+        $t7Seen['Switches'] = ('{0},{1},{2}' -f $PasswordNeverExpires.IsPresent, $UserMayNotChangePassword.IsPresent, $AccountNeverExpires.IsPresent)
+        return [pscustomobject]@{ Name = $Name }
+    }
+    $t7Pw = New-T7Secure 'Unused-T7-pw-1'
+    $t7R = New-ServiceAccount -Name 'vbrstd-t7' -Password $t7Pw -Description $t7Desc
+    Check 'T7 create: Created' $t7R.Created 'True'
+    Check 'T7 create: no issue code' $t7R.IssueCode ''
+    Check 'T7 create: name passed' $t7Seen['Name'] 'vbrstd-t7'
+    Check 'T7 create: description passed' $t7Seen['Description'] $t7Desc
+    Check 'T7 create: password passed as SecureString' $t7Seen['PasswordIsSecure'] 'True'
+    Check 'T7 create: three flag switches' $t7Seen['Switches'] 'True,True,True'
+    $t7R = New-ServiceAccount -Name 'vbrstd-t7' -Password $t7Pw -Description ('x' * 60)
+    Check 'T7 create: description cut to 48 characters' $t7Seen['Description'].Length 48
+    $t7Pw.Dispose()
+}
+& {
+    function New-LocalUser {
+        [CmdletBinding()]
+        param($Name, $Password, $Description, [switch] $PasswordNeverExpires, [switch] $UserMayNotChangePassword, [switch] $AccountNeverExpires)
+        throw (New-Object VbrStdT7.InvalidPasswordException('The password does not meet the password policy requirements.'))
+    }
+    $t7Pw = New-T7Secure 'Unused-T7-pw-2'
+    $t7R = New-ServiceAccount -Name 'vbrstd-t7' -Password $t7Pw -Description 'd'
+    Check 'T7 create: policy failure is not Created' $t7R.Created 'False'
+    Check 'T7 create: policy failure code' $t7R.IssueCode 'SVC_PASSWORD_POLICY'
+    $t7Pw.Dispose()
+}
+& {
+    function New-LocalUser {
+        [CmdletBinding()]
+        param($Name, $Password, $Description, [switch] $PasswordNeverExpires, [switch] $UserMayNotChangePassword, [switch] $AccountNeverExpires)
+        throw (New-Object VbrStdT7.NameInUseException('The name is already in use.'))
+    }
+    $t7Pw = New-T7Secure 'Unused-T7-pw-3'
+    $t7R = New-ServiceAccount -Name 'vbrstd-t7' -Password $t7Pw -Description 'd'
+    Check 'T7 create: name clash is not Created' $t7R.Created 'False'
+    Check 'T7 create: name clash code' $t7R.IssueCode 'SVC_NAME_IN_USE'
+    $t7Pw.Dispose()
+}
+& {
+    function New-LocalUser {
+        [CmdletBinding()]
+        param($Name, $Password, $Description, [switch] $PasswordNeverExpires, [switch] $UserMayNotChangePassword, [switch] $AccountNeverExpires)
+        throw (New-Object System.UnauthorizedAccessException('Access is denied.'))
+    }
+    $t7Pw = New-T7Secure 'Unused-T7-pw-4'
+    Throws 'T7 create: other errors are thrown' { New-ServiceAccount -Name 'vbrstd-t7' -Password $t7Pw -Description 'd' }
+    $t7Pw.Dispose()
+}
+
+# --- Set-ServiceAccountFlags (Set-LocalUser mocked) ---
+& {
+    $t7Seen = @{}
+    function Set-LocalUser {
+        [CmdletBinding()]
+        param($Name, $PasswordNeverExpires, $UserMayChangePassword, [switch] $AccountNeverExpires)
+        $t7Seen['Call'] = ('{0}|{1}|{2}|{3}' -f $Name, $PasswordNeverExpires, $UserMayChangePassword, $AccountNeverExpires.IsPresent)
+    }
+    Set-ServiceAccountFlags -Name 'vbrstd-t7'
+    Check 'T7 flags: Set-LocalUser with the three flags' $t7Seen['Call'] 'vbrstd-t7|True|False|True'
+}
+
+# --- Invoke-ServiceAccountStep (every system call mocked) ---
+# Default state for one scenario. Dot-source it in a child scope, change what the scenario
+# needs, then dot-source $t7StepMocks. All names start with t7 so they never collide with
+# the local variables of Invoke-ServiceAccountStep (the mocks find them by dynamic scope).
+$t7NewScene = {
+    $script:Issues = New-Object System.Collections.ArrayList
+    $t7Calls = New-Object System.Collections.ArrayList
+    $t7Infos = New-Object System.Collections.ArrayList
+    $t7Pw = $null
+    $t7Create = [pscustomobject]@{ Created = $true; IssueCode = '' }
+    $t7AdminError = ''
+    $t7FlagsError = ''
+}
+$t7StepMocks = {
+    function Read-ServiceAccountPassword { param([string] $EnvVarName) [void]$t7Calls.Add("read:$EnvVarName"); return $t7Pw }
+    function Get-ServiceAccountInfo {
+        param([string] $Name)
+        [void]$t7Calls.Add("info:$Name")
+        $next = $t7Infos[0]
+        if ($t7Infos.Count -gt 1) { $t7Infos.RemoveAt(0) }
+        return $next
+    }
+    function New-ServiceAccount { param([string] $Name, $Password, [string] $Description) [void]$t7Calls.Add("create:$Name|$Description"); return $t7Create }
+    function Add-AdministratorsMember { param($UserSid, [string] $UserName) [void]$t7Calls.Add("admin:$UserSid|$UserName"); if ($t7AdminError) { throw $t7AdminError } }
+    function Set-ServiceAccountFlags { param([string] $Name) [void]$t7Calls.Add("flags:$Name"); if ($t7FlagsError) { throw $t7FlagsError } }
+}
+
+& {
+    . $t7NewScene
+    [void]$t7Infos.Add((New-T7Info -Exists $false -IsUser $false))
+    . $t7StepMocks
+    $t7R = Invoke-ServiceAccountStep -Config (Get-DefaultConfig) -Apply $false -CreateRequested $false
+    Check 'T7 step audit missing: status MISSING' $t7R.Status 'MISSING'
+    Check 'T7 step audit missing: blocks the database change' $t7R.BlocksDb 'True'
+    Check 'T7 step audit missing: issue' (Get-T7Codes) 'SVC_ACCOUNT_MISSING:5'
+    Check 'T7 step audit missing: action' $script:Issues[0].Action 'Set RMM secure variable VEEAM_SVC_PASSWORD and re-run with -CreateServiceAccount'
+    Check 'T7 step audit missing: password variable read once' (@($t7Calls | Where-Object { $_ -eq 'read:VEEAM_SVC_PASSWORD' }).Count) 1
+    Check 'T7 step audit missing: no change' (@($t7Calls | Where-Object { $_ -match '^(create|admin|flags):' }) -join ';') ''
+}
+& {
+    . $t7NewScene
+    [void]$t7Infos.Add((New-T7Info -Exists $false -IsUser $false))
+    $t7Pw = New-T7Secure $t7Secret
+    . $t7StepMocks
+    $t7R = Invoke-ServiceAccountStep -Config (Get-DefaultConfig) -Apply $true -CreateRequested $false
+    Check 'T7 step apply missing: issue' (Get-T7Codes) 'SVC_ACCOUNT_MISSING:5'
+    Check 'T7 step apply missing: not created without -CreateServiceAccount' (@($t7Calls | Where-Object { $_ -match '^(create|admin|flags):' }) -join ';') ''
+    Check 'T7 step apply missing: blocks the database change' $t7R.BlocksDb 'True'
+    Throws 'T7 step apply missing: unused password disposed' { $null = $t7Pw.Copy() }
+}
+& {
+    . $t7NewScene
+    [void]$t7Infos.Add((New-T7Info -Exists $false -IsUser $false))
+    . $t7StepMocks
+    $t7R = Invoke-ServiceAccountStep -Config (Get-DefaultConfig) -Apply $false -CreateRequested $true
+    Check 'T7 step create no password: issue' (Get-T7Codes) 'SVC_PASSWORD_REQUIRED:5'
+    Check 'T7 step create no password: action' $script:Issues[0].Action 'Set RMM secure variable VEEAM_SVC_PASSWORD and re-run with -CreateServiceAccount'
+    Check 'T7 step create no password: nothing created' (@($t7Calls | Where-Object { $_ -match '^(create|admin|flags):' }) -join ';') ''
+    Check 'T7 step create no password: status MISSING' $t7R.Status 'MISSING'
+    Check 'T7 step create no password: blocks the database change' $t7R.BlocksDb 'True'
+}
+& {
+    . $t7NewScene
+    [void]$t7Infos.Add((New-T7Info -Exists $false -IsUser $false))
+    $t7Pw = New-T7Secure $t7Secret
+    $t7Create = [pscustomobject]@{ Created = $false; IssueCode = 'SVC_PASSWORD_POLICY' }
+    . $t7StepMocks
+    $t7R = Invoke-ServiceAccountStep -Config (Get-DefaultConfig) -Apply $true -CreateRequested $true
+    Check 'T7 step policy: issue' (Get-T7Codes) 'SVC_PASSWORD_POLICY:5'
+    Check 'T7 step policy: create called once with name and description' (@($t7Calls | Where-Object { $_ -match '^(create|admin|flags):' }) -join ';') ("create:svc_veeam|$t7Desc")
+    Check 'T7 step policy: status MISSING' $t7R.Status 'MISSING'
+    Check 'T7 step policy: blocks the database change' $t7R.BlocksDb 'True'
+    Throws 'T7 step policy: password disposed after the step' { $null = $t7Pw.Copy() }
+    Check 'T7 step policy: password not in the log' (($script:LogLines -join "`n").Contains($t7Secret)) 'False'
+    Check 'T7 step policy: password not in the issues' ((Get-T7IssueText).Contains($t7Secret)) 'False'
+}
+& {
+    . $t7NewScene
+    [void]$t7Infos.Add((New-T7Info -Exists $false -IsUser $false))
+    $t7Pw = New-T7Secure $t7Secret
+    $t7Create = [pscustomobject]@{ Created = $false; IssueCode = 'SVC_NAME_IN_USE' }
+    . $t7StepMocks
+    $t7R = Invoke-ServiceAccountStep -Config (Get-DefaultConfig) -Apply $false -CreateRequested $true
+    Check 'T7 step create name clash: issue' (Get-T7Codes) 'SVC_NAME_IN_USE:5'
+    Check 'T7 step create name clash: status NAME_IN_USE' $t7R.Status 'NAME_IN_USE'
+    Check 'T7 step create name clash: blocks the database change' $t7R.BlocksDb 'True'
+}
+& {
+    . $t7NewScene
+    [void]$t7Infos.Add((New-T7Info -Exists $false -IsUser $false))
+    [void]$t7Infos.Add((New-T7Info -IsAdmin $false))
+    [void]$t7Infos.Add((New-T7Info))
+    $t7Pw = New-T7Secure $t7Secret
+    . $t7StepMocks
+    $t7R = Invoke-ServiceAccountStep -Config (Get-DefaultConfig) -Apply $false -CreateRequested $true
+    Check 'T7 step create: created, then added to Administrators by SID' (@($t7Calls | Where-Object { $_ -match '^(create|admin|flags):' }) -join ';') ("create:svc_veeam|$t7Desc;admin:$t7SvcSid|svc_veeam")
+    Check 'T7 step create: read back after each change' (@($t7Calls | Where-Object { $_ -eq 'info:svc_veeam' }).Count) 3
+    Check 'T7 step create: no issues' (Get-T7Codes) ''
+    Check 'T7 step create: status OK' $t7R.Status 'OK'
+    Check 'T7 step create: does not block' $t7R.BlocksDb 'False'
+    Check 'T7 step create: Info is the last read' $t7R.Info.IsAdmin 'True'
+    Throws 'T7 step create: password disposed after the step' { $null = $t7Pw.Copy() }
+}
+& {
+    . $t7NewScene
+    [void]$t7Infos.Add((New-T7Info -IsAdmin $false -UserFlags 0x203))
+    . $t7StepMocks
+    $t7R = Invoke-ServiceAccountStep -Config (Get-DefaultConfig) -Apply $false -CreateRequested $false
+    Check 'T7 step audit drift: every issue in order' (Get-T7Codes) 'SVC_NOT_ADMIN:5,SVC_FLAGS_DRIFT:5,SVC_DISABLED:5'
+    Check 'T7 step audit drift: status NOT_ADMIN' $t7R.Status 'NOT_ADMIN'
+    Check 'T7 step audit drift: blocks the database change' $t7R.BlocksDb 'True'
+    Check 'T7 step audit drift: nothing changed' (@($t7Calls | Where-Object { $_ -match '^(create|admin|flags):' }) -join ';') ''
+    Check 'T7 step audit drift: read once' (@($t7Calls | Where-Object { $_ -eq 'info:svc_veeam' }).Count) 1
+    Check 'T7 step audit drift: detail names the flags' ($script:Issues[1].Detail -like '*the password expires*the user can change the password*') 'True'
+    Check 'T7 step audit drift: action asks for -Apply' ($script:Issues[0].Action -like '*-Apply*') 'True'
+}
+& {
+    . $t7NewScene
+    [void]$t7Infos.Add((New-T7Info -IsAdmin $false -UserFlags 0x211 -HasExpirationDate $true))
+    [void]$t7Infos.Add((New-T7Info -UserFlags 0x10251))
+    . $t7StepMocks
+    $t7R = Invoke-ServiceAccountStep -Config (Get-DefaultConfig) -Apply $true -CreateRequested $false
+    Check 'T7 step apply drift: admin and flags fixed' (@($t7Calls | Where-Object { $_ -match '^(create|admin|flags):' }) -join ';') ("admin:$t7SvcSid|svc_veeam;flags:svc_veeam")
+    Check 'T7 step apply drift: read again after the fix' (@($t7Calls | Where-Object { $_ -eq 'info:svc_veeam' }).Count) 2
+    Check 'T7 step apply drift: lockout is report-only' (Get-T7Codes) 'SVC_LOCKED_OUT:5'
+    Check 'T7 step apply drift: status LOCKED_OUT' $t7R.Status 'LOCKED_OUT'
+    Check 'T7 step apply drift: lockout does not block' $t7R.BlocksDb 'False'
+}
+& {
+    . $t7NewScene
+    [void]$t7Infos.Add((New-T7Info -IsAdmin $false))
+    $t7AdminError = 'Access is denied.'
+    . $t7StepMocks
+    $t7R = Invoke-ServiceAccountStep -Config (Get-DefaultConfig) -Apply $true -CreateRequested $false
+    Check 'T7 step admin add fails: issue' (Get-T7Codes) 'SVC_NOT_ADMIN:5'
+    Check 'T7 step admin add fails: detail has the error' ($script:Issues[0].Detail -like '*Access is denied.*') 'True'
+    Check 'T7 step admin add fails: blocks the database change' $t7R.BlocksDb 'True'
+}
+& {
+    . $t7NewScene
+    [void]$t7Infos.Add((New-T7Info -IsUser $false))
+    $t7Pw = New-T7Secure $t7Secret
+    . $t7StepMocks
+    $t7R = Invoke-ServiceAccountStep -Config (Get-DefaultConfig) -Apply $true -CreateRequested $true
+    Check 'T7 step group: issue' (Get-T7Codes) 'SVC_NAME_IN_USE:5'
+    Check 'T7 step group: status NAME_IN_USE' $t7R.Status 'NAME_IN_USE'
+    Check 'T7 step group: blocks the database change' $t7R.BlocksDb 'True'
+    Check 'T7 step group: nothing changed' (@($t7Calls | Where-Object { $_ -match '^(create|admin|flags):' }) -join ';') ''
+}
+& {
+    . $t7NewScene
+    [void]$t7Infos.Add((New-T7Info -IsAdmin $false))
+    [void]$t7Infos.Add((New-T7Info))
+    $t7Pw = New-T7Secure $t7Secret
+    . $t7StepMocks
+    $t7R = Invoke-ServiceAccountStep -Config (Get-DefaultConfig) -Apply $false -CreateRequested $true
+    Check 'T7 step create existing: only added to Administrators (password never reset)' (@($t7Calls | Where-Object { $_ -match '^(create|admin|flags):' }) -join ';') ("admin:$t7SvcSid|svc_veeam")
+    Check 'T7 step create existing: no issues' (Get-T7Codes) ''
+    Check 'T7 step create existing: does not block' $t7R.BlocksDb 'False'
+}
+& {
+    . $t7NewScene
+    [void]$t7Infos.Add((New-T7Info))
+    . $t7StepMocks
+    $t7R = Invoke-ServiceAccountStep -Config (Get-DefaultConfig) -Apply $false -CreateRequested $false
+    Check 'T7 step compliant: status OK' $t7R.Status 'OK'
+    Check 'T7 step compliant: no issues' (Get-T7Codes) ''
+    Check 'T7 step compliant: does not block' $t7R.BlocksDb 'False'
+    Check 'T7 step compliant: read once' (@($t7Calls | Where-Object { $_ -eq 'info:svc_veeam' }).Count) 1
+    Check 'T7 step compliant: logs the map name' (@($script:LogLines | Where-Object { $_ -like '*svc_veeam: OK*svc_veeam@VBR01*' }).Count -gt 0) 'True'
+}
+# Real Read-ServiceAccountPassword and New-ServiceAccount; only New-LocalUser and the account read are mocked.
+& {
+    $script:Issues = New-Object System.Collections.ArrayList
+    $t7Seen = @{ Length = -1 }
+    $t7Cfg = (Get-DefaultConfig).Clone()
+    $t7Cfg['PasswordEnvVar'] = $t7EnvName
+    [System.Environment]::SetEnvironmentVariable($t7EnvName, $t7Secret, 'Process')
+    function Get-ServiceAccountInfo { param([string] $Name) return (New-T7Info -Exists $false -IsUser $false) }
+    function New-LocalUser {
+        [CmdletBinding()]
+        param($Name, $Password, $Description, [switch] $PasswordNeverExpires, [switch] $UserMayNotChangePassword, [switch] $AccountNeverExpires)
+        $t7Seen['Length'] = $Password.Length
+        throw (New-Object VbrStdT7.InvalidPasswordException('The password does not meet the password policy requirements.'))
+    }
+    function Add-AdministratorsMember { param($UserSid, [string] $UserName) throw 'T7: Add-AdministratorsMember must not be called' }
+    function Set-ServiceAccountFlags { param([string] $Name) throw 'T7: Set-ServiceAccountFlags must not be called' }
+    $t7R = Invoke-ServiceAccountStep -Config $t7Cfg -Apply $false -CreateRequested $true
+    Check 'T7 step real password: policy failure mapped' (Get-T7Codes) 'SVC_PASSWORD_POLICY:5'
+    Check 'T7 step real password: New-LocalUser got the SecureString' $t7Seen['Length'] $t7Secret.Length
+    Check 'T7 step real password: variable cleared' ($null -eq [System.Environment]::GetEnvironmentVariable($t7EnvName, 'Process')) 'True'
+    Check 'T7 step real password: not in the log' (($script:LogLines -join "`n").Contains($t7Secret)) 'False'
+    Check 'T7 step real password: not in the issues' ((Get-T7IssueText).Contains($t7Secret)) 'False'
+    Check 'T7 step real password: status MISSING' $t7R.Status 'MISSING'
+}
+& {
+    $script:Issues = New-Object System.Collections.ArrayList
+    $t7Cfg = (Get-DefaultConfig).Clone()
+    $t7Cfg['PasswordEnvVar'] = $t7EnvName
+    [System.Environment]::SetEnvironmentVariable($t7EnvName, $t7Secret, 'Process')
+    function Get-ServiceAccountInfo { param([string] $Name) return (New-T7Info) }
+    $t7R = Invoke-ServiceAccountStep -Config $t7Cfg -Apply $false -CreateRequested $false
+    Check 'T7 step audit: password variable cleared in every mode' ($null -eq [System.Environment]::GetEnvironmentVariable($t7EnvName, 'Process')) 'True'
+    Check 'T7 step audit: compliant account gives no issue' (Get-T7Codes) ''
+}
+[System.Environment]::SetEnvironmentVariable($t7EnvName, $null, 'Process')
+$script:Issues = New-Object System.Collections.ArrayList
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue

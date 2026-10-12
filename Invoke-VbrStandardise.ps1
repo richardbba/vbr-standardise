@@ -1760,6 +1760,509 @@ function Get-VeeamServiceAccountNames {
 #endregion Names
 
 #region Account
+function Get-ServiceAccountInfo {
+    # Reads a local account through ADSI WinNT. The LocalAccounts read cmdlets are not used.
+    # Exists=$true with IsUser=$false means a local group has the name (SVC_NAME_IN_USE).
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string] $Name)
+
+    # True when the error, or any exception inside it, has one of the HRESULTs (8 hex digits).
+    # PowerShell wraps ADSI errors: the COMException sits inside an ExtendedTypeSystemException.
+    $hasHResult = {
+        param($ErrorRecord, [string[]] $Codes)
+        $ex = $ErrorRecord.Exception
+        $depth = 0
+        while ($null -ne $ex -and $depth -lt 10) {
+            if ($Codes -contains ('{0:X8}' -f $ex.HResult)) { return $true }
+            $ex = $ex.InnerException
+            $depth++
+        }
+        return $false
+    }
+
+    $info = [pscustomobject]@{
+        Exists            = $false
+        IsUser            = $false
+        Sid               = $null
+        UserFlags         = 0
+        HasExpirationDate = $false
+        IsLocked          = $false
+        PasswordExpired   = $false
+        IsAdmin           = $false
+        MapName           = ''
+    }
+    $computer = $env:COMPUTERNAME
+
+    $user = New-Object System.DirectoryServices.DirectoryEntry("WinNT://$computer/$Name,user")
+    try {
+        $bound = $false
+        try {
+            $user.RefreshCache()
+            $bound = $true
+        } catch {
+            # 0x800708AD NERR_UserNotFound: no user has this name (a group with the name gives the same code).
+            if (-not (& $hasHResult $_ @('800708AD'))) { throw }
+        }
+        if ($bound) {
+            $flags = 0
+            $rawFlags = $user.Properties['UserFlags'].Value
+            if ($null -ne $rawFlags) { $flags = [int]$rawFlags }
+            $sidBytes = [byte[]]$user.Properties['objectSid'].Value
+            $info.Exists = $true
+            $info.IsUser = $true
+            $info.UserFlags = $flags
+            $info.Sid = New-Object System.Security.Principal.SecurityIdentifier($sidBytes, 0)
+            # Never read AccountExpirationDate itself: it is absent (and throws under StrictMode)
+            # when the account never expires.
+            $info.HasExpirationDate = [bool]$user.Properties.Contains('AccountExpirationDate')
+            $rawExpired = $user.Properties['PasswordExpired'].Value
+            $info.PasswordExpired = (($null -ne $rawExpired) -and ([int]$rawExpired -ne 0))
+            $locked = (($flags -band 0x10) -ne 0)
+            if (-not $locked) {
+                try { $locked = [bool]$user.InvokeGet('IsAccountLocked') } catch { $locked = $false }
+            }
+            $info.IsLocked = $locked
+        }
+    } finally {
+        # On an entry that never bound, the ADSI adapter throws even from Dispose().
+        try { $user.Dispose() } catch { }
+    }
+
+    if ($info.Exists) {
+        $info.IsAdmin = [bool](Test-AdministratorsMember -MemberSid $info.Sid)
+        try {
+            $info.MapName = [string](Get-SspiMapNameFromSid -Sid $info.Sid)
+        } catch {
+            Write-Log -Message ('Cannot translate the SID of account {0}: {1}' -f $Name, (Format-ShortText -Text $_.Exception.Message)) -Level 'WARN'
+        }
+        return $info
+    }
+
+    $group = New-Object System.DirectoryServices.DirectoryEntry("WinNT://$computer/$Name,group")
+    try {
+        try {
+            $group.RefreshCache()
+            $info.Exists = $true
+            $info.IsUser = $false
+        } catch {
+            # 0x800708AC NERR_GroupNotFound: the name is free.
+            if (-not (& $hasHResult $_ @('800708AC'))) { throw }
+        }
+    } finally {
+        try { $group.Dispose() } catch { }
+    }
+    return $info
+}
+
+function Get-ServiceAccountStatus {
+    # Pure. Turns a Get-ServiceAccountInfo result into one status and every matching issue code.
+    # UserFlags: 0x2 disabled, 0x10 locked out, 0x40 user cannot change password,
+    # 0x10000 password never expires. An expiry date (HasExpirationDate) is flag drift.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][object] $Info)
+
+    $exists = [bool](Get-CfgValue -Object $Info -Name 'Exists' -Default $false)
+    $isUser = [bool](Get-CfgValue -Object $Info -Name 'IsUser' -Default $false)
+    if (-not $exists) {
+        return [pscustomobject]@{ Status = 'MISSING'; Codes = [string[]]@('SVC_ACCOUNT_MISSING'); NeedsAdmin = $false; NeedsFlags = $false }
+    }
+    if (-not $isUser) {
+        return [pscustomobject]@{ Status = 'NAME_IN_USE'; Codes = [string[]]@('SVC_NAME_IN_USE'); NeedsAdmin = $false; NeedsFlags = $false }
+    }
+
+    $flags = [int](Get-CfgValue -Object $Info -Name 'UserFlags' -Default 0)
+    $isAdmin = [bool](Get-CfgValue -Object $Info -Name 'IsAdmin' -Default $false)
+    $hasExpiry = [bool](Get-CfgValue -Object $Info -Name 'HasExpirationDate' -Default $false)
+    $isLocked = ([bool](Get-CfgValue -Object $Info -Name 'IsLocked' -Default $false)) -or (($flags -band 0x10) -ne 0)
+    $pwExpired = [bool](Get-CfgValue -Object $Info -Name 'PasswordExpired' -Default $false)
+    $needsFlags = ((($flags -band 0x10000) -eq 0) -or (($flags -band 0x40) -eq 0) -or $hasExpiry)
+
+    # In status precedence order.
+    $checks = @(
+        @{ Hit = (-not $isAdmin);            Status = 'NOT_ADMIN';   Code = 'SVC_NOT_ADMIN' },
+        @{ Hit = $needsFlags;                Status = 'FLAGS_DRIFT'; Code = 'SVC_FLAGS_DRIFT' },
+        @{ Hit = (($flags -band 0x2) -ne 0); Status = 'DISABLED';    Code = 'SVC_DISABLED' },
+        @{ Hit = $isLocked;                  Status = 'LOCKED_OUT';  Code = 'SVC_LOCKED_OUT' },
+        @{ Hit = $pwExpired;                 Status = 'EXPIRED';     Code = 'SVC_PASSWORD_EXPIRED' }
+    )
+    $status = 'OK'
+    $codes = New-Object System.Collections.Generic.List[string]
+    foreach ($check in $checks) {
+        if ($check.Hit) {
+            if ($status -eq 'OK') { $status = $check.Status }
+            $codes.Add($check.Code)
+        }
+    }
+    return [pscustomobject]@{
+        Status     = $status
+        Codes      = [string[]]$codes.ToArray()
+        NeedsAdmin = (-not $isAdmin)
+        NeedsFlags = $needsFlags
+    }
+}
+
+function Test-AdministratorsMember {
+    # Membership of local Administrators (S-1-5-32-544) by SID, through ADSI.
+    # The LocalAccounts member-list cmdlet is not used: it fails on orphaned SIDs. A member whose SID cannot be read is skipped.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][System.Security.Principal.SecurityIdentifier] $MemberSid)
+
+    $adminsSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+    $groupName = (Get-NtAccountParts -Sid $adminsSid).Name
+    $group = New-Object System.DirectoryServices.DirectoryEntry("WinNT://$($env:COMPUTERNAME)/$groupName,group")
+    try {
+        foreach ($member in @($group.Invoke('Members'))) {
+            try {
+                $bytes = [byte[]]$member.GetType().InvokeMember('objectSid', [System.Reflection.BindingFlags]::GetProperty, $null, $member, $null)
+                $sid = New-Object System.Security.Principal.SecurityIdentifier($bytes, 0)
+                if ($sid.Equals($MemberSid)) { return $true }
+            } catch {
+                # Skip a member whose SID cannot be read; never fail the whole check.
+            }
+        }
+    } finally {
+        try { $group.Dispose() } catch { }
+    }
+    return $false
+}
+
+function Add-AdministratorsMember {
+    # Adds the account to local Administrators by SID. "Already a member" counts as success.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][System.Security.Principal.SecurityIdentifier] $UserSid,
+        [Parameter(Mandatory = $true)][string] $UserName
+    )
+    $adminsSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+
+    if (Get-Command -Name 'Add-LocalGroupMember' -ErrorAction SilentlyContinue) {
+        try {
+            Add-LocalGroupMember -SID $adminsSid -Member $UserSid.Value -ErrorAction Stop
+        } catch {
+            $isMember = $false
+            $ex = $_.Exception
+            $depth = 0
+            while ($null -ne $ex -and $depth -lt 10) {
+                if ($ex.GetType().Name -eq 'MemberExistsException' -or $ex.Message -match 'already a member') { $isMember = $true }
+                $ex = $ex.InnerException
+                $depth++
+            }
+            if (-not $isMember) { throw }
+        }
+        return
+    }
+
+    # ADSI fallback when the LocalAccounts module is not present.
+    $groupName = (Get-NtAccountParts -Sid $adminsSid).Name
+    $group = New-Object System.DirectoryServices.DirectoryEntry("WinNT://$($env:COMPUTERNAME)/$groupName,group")
+    try {
+        $null = $group.Invoke('Add', [object[]]@("WinNT://$($env:COMPUTERNAME)/$UserName,user"))
+    } catch {
+        $ex = $_.Exception
+        $depth = 0
+        while ($null -ne $ex -and $depth -lt 10) {
+            # 0x80070562 ERROR_MEMBER_IN_ALIAS: already a member.
+            if (('{0:X8}' -f $ex.HResult) -eq '80070562') { return }
+            $ex = $ex.InnerException
+            $depth++
+        }
+        throw
+    } finally {
+        try { $group.Dispose() } catch { }
+    }
+}
+
+function Read-ServiceAccountPassword {
+    # Reads the password from the process environment once, removes the variable at once,
+    # and returns a read-only SecureString ($null when the variable is missing or empty).
+    # The plain text is never logged, written to a file or passed to a program.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string] $EnvVarName)
+
+    $raw = [System.Environment]::GetEnvironmentVariable($EnvVarName, 'Process')
+    [System.Environment]::SetEnvironmentVariable($EnvVarName, $null, 'Process')
+    if ([string]::IsNullOrEmpty($raw)) { return $null }
+    $chars = $raw.ToCharArray()
+    $raw = $null
+    $secure = New-Object System.Security.SecureString
+    try {
+        foreach ($ch in $chars) { $secure.AppendChar($ch) }
+    } finally {
+        [System.Array]::Clear($chars, 0, $chars.Length)
+    }
+    $secure.MakeReadOnly()
+    return $secure
+}
+
+function ConvertTo-AccountIssueCode {
+    # Maps a LocalAccounts error to an issue code by exception TYPE NAME (inner exceptions included).
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][System.Management.Automation.ErrorRecord] $ErrorRecord)
+
+    $ex = $ErrorRecord.Exception
+    $depth = 0
+    while ($null -ne $ex -and $depth -lt 10) {
+        switch ($ex.GetType().Name) {
+            'InvalidPasswordException' { return 'SVC_PASSWORD_POLICY' }
+            'NameInUseException'       { return 'SVC_NAME_IN_USE' }
+            'UserExistsException'      { return 'SVC_NAME_IN_USE' }
+        }
+        $ex = $ex.InnerException
+        $depth++
+    }
+    return $null
+}
+
+function New-ServiceAccount {
+    # Creates the local account with the three flags. A password-policy failure or a name clash
+    # comes back as IssueCode, and nothing is created. Any other error is thrown.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Name,
+        [Parameter(Mandatory = $true)][System.Security.SecureString] $Password,
+        [Parameter(Mandatory = $true)][string] $Description
+    )
+    if ($Description.Length -gt 48) { $Description = $Description.Substring(0, 48) }
+
+    if (Get-Command -Name 'New-LocalUser' -ErrorAction SilentlyContinue) {
+        try {
+            $null = New-LocalUser -Name $Name -Password $Password -Description $Description -PasswordNeverExpires -UserMayNotChangePassword -AccountNeverExpires -ErrorAction Stop
+        } catch {
+            # New-LocalUser deletes the half-made account itself when the policy rejects the password.
+            $code = ConvertTo-AccountIssueCode -ErrorRecord $_
+            if ($code) { return [pscustomobject]@{ Created = $false; IssueCode = [string]$code } }
+            throw
+        }
+        return [pscustomobject]@{ Created = $true; IssueCode = '' }
+    }
+
+    # ADSI fallback (no LocalAccounts module). NetUserAdd runs at CommitChanges with the password,
+    # description and flags together, and creates nothing when the password fails the policy.
+    $hresultCodes = @{
+        '800708C5' = 'SVC_PASSWORD_POLICY'   # NERR_PasswordTooShort: the password fails the policy
+        '8007052D' = 'SVC_PASSWORD_POLICY'   # ERROR_PASSWORD_RESTRICTION
+        '800708B0' = 'SVC_NAME_IN_USE'       # NERR_UserExists
+        '800708AF' = 'SVC_NAME_IN_USE'       # NERR_GroupExists
+        '80070563' = 'SVC_NAME_IN_USE'       # ERROR_ALIAS_EXISTS: a local group has the name
+        '80070524' = 'SVC_NAME_IN_USE'       # ERROR_USER_EXISTS
+    }
+    $computer = New-Object System.DirectoryServices.DirectoryEntry("WinNT://$($env:COMPUTERNAME),computer")
+    $user = $null
+    $plain = $null
+    $bstr = [System.IntPtr]::Zero
+    try {
+        $user = $computer.Children.Add($Name, 'user')
+        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+        $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        $null = $user.Invoke('SetPassword', [object[]]@($plain))
+        $plain = $null
+        $null = $user.Invoke('Put', [object[]]@('Description', $Description))
+        # 0x10241 = script + normal account + user cannot change password + password never expires.
+        # A new WinNT account has no expiry date, so the account never expires.
+        $null = $user.Invoke('Put', [object[]]@('UserFlags', 0x10241))
+        $user.CommitChanges()
+        return [pscustomobject]@{ Created = $true; IssueCode = '' }
+    } catch {
+        $ex = $_.Exception
+        $depth = 0
+        while ($null -ne $ex -and $depth -lt 10) {
+            $hex = '{0:X8}' -f $ex.HResult
+            if ($hresultCodes.ContainsKey($hex)) { return [pscustomobject]@{ Created = $false; IssueCode = [string]$hresultCodes[$hex] } }
+            $ex = $ex.InnerException
+            $depth++
+        }
+        throw
+    } finally {
+        $plain = $null
+        if ($bstr -ne [System.IntPtr]::Zero) { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+        if ($null -ne $user) { try { $user.Dispose() } catch { } }
+        try { $computer.Dispose() } catch { }
+    }
+}
+
+function Set-ServiceAccountFlags {
+    # Sets: password never expires, user cannot change the password, account never expires.
+    # Never touches the password, the enabled state or a lockout.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string] $Name)
+
+    if (Get-Command -Name 'Set-LocalUser' -ErrorAction SilentlyContinue) {
+        Set-LocalUser -Name $Name -PasswordNeverExpires $true -UserMayChangePassword $false -AccountNeverExpires -ErrorAction Stop
+        return
+    }
+
+    # ADSI fallback: sets the two UserFlags bits. WinNT has no clean way to clear an expiry
+    # date, so that drift stays and the re-read reports it.
+    $user = New-Object System.DirectoryServices.DirectoryEntry("WinNT://$($env:COMPUTERNAME)/$Name,user")
+    try {
+        $user.RefreshCache()
+        $flags = [int]$user.Properties['UserFlags'].Value
+        $user.Properties['UserFlags'].Value = ($flags -bor 0x40 -bor 0x10000)
+        $user.CommitChanges()
+        if ($user.Properties.Contains('AccountExpirationDate')) {
+            Write-Log -Message ('Account {0} has an expiry date. Without the LocalAccounts module the script cannot clear it.' -f $Name) -Level 'WARN'
+        }
+    } finally {
+        try { $user.Dispose() } catch { }
+    }
+}
+
+function Invoke-ServiceAccountStep {
+    # Spec 7.2. Reads the account, fixes what the mode allows, and adds one issue (exit 5) for
+    # each problem that remains. BlocksDb is true when the account is missing, the name is a
+    # group, or the account is not in Administrators after this step.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][hashtable] $Config,
+        [Parameter(Mandatory = $true)][bool] $Apply,
+        [Parameter(Mandatory = $true)][bool] $CreateRequested
+    )
+    $name = [string]$Config['ServiceAccountName']
+    if ([string]::IsNullOrEmpty($name)) { $name = 'svc_veeam' }
+    $description = [string]$Config['ServiceAccountDescription']
+    if ([string]::IsNullOrEmpty($description)) { $description = 'Veeam maintenance account (PostgreSQL SSPI map)' }
+    $envVar = [string]$Config['PasswordEnvVar']
+    if ([string]::IsNullOrEmpty($envVar)) { $envVar = 'VEEAM_SVC_PASSWORD' }
+    $createAction = "Set RMM secure variable $envVar and re-run with -CreateServiceAccount"
+    $fix = ($Apply -or $CreateRequested)
+
+    Write-Log -Message ('Checking local account {0}.' -f $name) -Level 'INFO'
+    # Read and clear the variable in every mode, so the secret never stays in this process's
+    # environment, where every child process (psql.exe, reg.exe) would inherit it.
+    $password = Read-ServiceAccountPassword -EnvVarName $envVar
+    try {
+        $info = Get-ServiceAccountInfo -Name $name
+        $status = Get-ServiceAccountStatus -Info $info
+
+        if ($status.Status -eq 'MISSING') {
+            if (-not $CreateRequested) {
+                Add-RunIssue -Code 'SVC_ACCOUNT_MISSING' -ExitCode 5 -Detail ('Local account {0} does not exist. No database change was made.' -f $name) -Action $createAction
+                Write-Log -Message ('Account {0} is missing.' -f $name) -Level 'WARN'
+                return [pscustomobject]@{ Status = 'MISSING'; Info = $info; BlocksDb = $true }
+            }
+            if ($null -eq $password) {
+                Add-RunIssue -Code 'SVC_PASSWORD_REQUIRED' -ExitCode 5 -Detail ('-CreateServiceAccount was given, but environment variable {0} is empty. Account {1} was not created and no database change was made.' -f $envVar, $name) -Action $createAction
+                Write-Log -Message ('Account {0} is missing and {1} is empty; nothing was created.' -f $name, $envVar) -Level 'WARN'
+                return [pscustomobject]@{ Status = 'MISSING'; Info = $info; BlocksDb = $true }
+            }
+            $created = New-ServiceAccount -Name $name -Password $password -Description $description
+            if (-not $created.Created) {
+                $code = [string]$created.IssueCode
+                if ($code -eq 'SVC_PASSWORD_POLICY') {
+                    Add-RunIssue -Code 'SVC_PASSWORD_POLICY' -ExitCode 5 -Detail ('The password in {0} does not meet the Windows password policy. Account {1} was not created.' -f $envVar, $name) -Action ('Set a {0} value that meets the Windows password policy, then re-run with -CreateServiceAccount' -f $envVar)
+                    Write-Log -Message ('Account {0} was not created: the password does not meet the password policy.' -f $name) -Level 'WARN'
+                    return [pscustomobject]@{ Status = 'MISSING'; Info = $info; BlocksDb = $true }
+                }
+                if ($code -eq 'SVC_NAME_IN_USE') {
+                    Add-RunIssue -Code 'SVC_NAME_IN_USE' -ExitCode 5 -Detail ('Account {0} was not created: the name is already in use.' -f $name) -Action ('Rename or remove the local group or account named {0}, then re-run' -f $name)
+                    Write-Log -Message ('Account {0} was not created: the name is already in use.' -f $name) -Level 'WARN'
+                    return [pscustomobject]@{ Status = 'NAME_IN_USE'; Info = $info; BlocksDb = $true }
+                }
+                Add-RunIssue -Code 'SVC_ACCOUNT_MISSING' -ExitCode 5 -Detail ('Account {0} could not be created.' -f $name) -Action $createAction
+                return [pscustomobject]@{ Status = 'MISSING'; Info = $info; BlocksDb = $true }
+            }
+            Write-Log -Message ('Created local account {0}.' -f $name) -Level 'OK'
+            # Never trust the call: read the account again.
+            $info = Get-ServiceAccountInfo -Name $name
+            $status = Get-ServiceAccountStatus -Info $info
+            if ($status.Status -eq 'MISSING') {
+                Add-RunIssue -Code 'SVC_ACCOUNT_MISSING' -ExitCode 5 -Detail ('Account {0} was created but cannot be read back.' -f $name) -Action ('Check local account {0} by hand, then re-run' -f $name)
+                return [pscustomobject]@{ Status = 'MISSING'; Info = $info; BlocksDb = $true }
+            }
+        }
+
+        if ($status.Status -eq 'NAME_IN_USE') {
+            Add-RunIssue -Code 'SVC_NAME_IN_USE' -ExitCode 5 -Detail ('The name {0} belongs to a local group, so the account cannot exist. No database change was made.' -f $name) -Action ('Rename or remove the local group named {0}, then re-run' -f $name)
+            Write-Log -Message ('The name {0} belongs to a local group.' -f $name) -Level 'WARN'
+            return [pscustomobject]@{ Status = 'NAME_IN_USE'; Info = $info; BlocksDb = $true }
+        }
+
+        $adminFailure = ''
+        $flagsFailure = ''
+        if ($fix -and ($status.NeedsAdmin -or $status.NeedsFlags)) {
+            if ($status.NeedsAdmin) {
+                try {
+                    Add-AdministratorsMember -UserSid (Get-CfgValue -Object $info -Name 'Sid') -UserName $name
+                    Write-Log -Message ('Added {0} to local Administrators.' -f $name) -Level 'OK'
+                } catch {
+                    $adminFailure = Format-ShortText -Text $_.Exception.Message -MaxLength 300
+                    Write-Log -Message ('Could not add {0} to local Administrators: {1}' -f $name, $adminFailure) -Level 'WARN'
+                }
+            }
+            if ($status.NeedsFlags) {
+                try {
+                    Set-ServiceAccountFlags -Name $name
+                    Write-Log -Message ('Set the account flags of {0}.' -f $name) -Level 'OK'
+                } catch {
+                    $flagsFailure = Format-ShortText -Text $_.Exception.Message -MaxLength 300
+                    Write-Log -Message ('Could not set the account flags of {0}: {1}' -f $name, $flagsFailure) -Level 'WARN'
+                }
+            }
+            # Never trust the calls: read the account again and check every item by SID.
+            $info = Get-ServiceAccountInfo -Name $name
+            $status = Get-ServiceAccountStatus -Info $info
+        }
+
+        $flags = [int](Get-CfgValue -Object $info -Name 'UserFlags' -Default 0)
+        foreach ($code in @($status.Codes)) {
+            $detail = ''
+            $action = ''
+            switch ($code) {
+                'SVC_NOT_ADMIN' {
+                    $detail = "Account $name is not a member of local Administrators (S-1-5-32-544). No database change was made."
+                    if ($adminFailure) { $detail += " Adding it failed: $adminFailure" }
+                    if ($fix) { $action = "Add $name to local Administrators by hand, and check for a Group Policy (Restricted Groups) that removes it" }
+                    else { $action = "Re-run with -Apply to add $name to local Administrators" }
+                }
+                'SVC_FLAGS_DRIFT' {
+                    $drift = New-Object System.Collections.Generic.List[string]
+                    if (($flags -band 0x10000) -eq 0) { $drift.Add('the password expires') }
+                    if (($flags -band 0x40) -eq 0) { $drift.Add('the user can change the password') }
+                    if ([bool](Get-CfgValue -Object $info -Name 'HasExpirationDate' -Default $false)) { $drift.Add('the account has an expiry date') }
+                    $detail = "Account $name flag drift: " + ($drift -join ', ') + '.'
+                    if ($flagsFailure) { $detail += " Setting the flags failed: $flagsFailure" }
+                    if ($fix) { $action = "Set the $name flags by hand: password never expires, user cannot change password, account never expires" }
+                    else { $action = "Re-run with -Apply to set the $name account flags" }
+                }
+                'SVC_DISABLED' {
+                    $detail = "Account $name is disabled. The script never enables it."
+                    $action = "Check why $name is disabled, and enable it by hand if it should be in use"
+                }
+                'SVC_LOCKED_OUT' {
+                    $detail = "Account $name is locked out. The script never unlocks it."
+                    $action = "Check the failed logons of $name, then unlock it by hand"
+                }
+                'SVC_PASSWORD_EXPIRED' {
+                    $detail = "The password of $name has expired or must change at next logon. The script never resets it."
+                    $action = "Reset the $name password by hand from the vault"
+                }
+                'SVC_ACCOUNT_MISSING' {
+                    $detail = "Local account $name does not exist. No database change was made."
+                    $action = $createAction
+                }
+                'SVC_NAME_IN_USE' {
+                    $detail = "The name $name belongs to a local group, so the account cannot exist. No database change was made."
+                    $action = "Rename or remove the local group named $name, then re-run"
+                }
+            }
+            Add-RunIssue -Code $code -ExitCode 5 -Detail $detail -Action $action
+        }
+
+        $sidText = ''
+        $sidValue = Get-CfgValue -Object $info -Name 'Sid'
+        if ($null -ne $sidValue) { $sidText = [string]$sidValue }
+        $mapName = [string](Get-CfgValue -Object $info -Name 'MapName' -Default '')
+        $level = 'OK'
+        if ($status.Status -ne 'OK') { $level = 'WARN' }
+        Write-Log -Message ('Account {0}: {1} (SID {2}, map name {3}).' -f $name, $status.Status, $sidText, $mapName) -Level $level
+
+        $isAdmin = [bool](Get-CfgValue -Object $info -Name 'IsAdmin' -Default $false)
+        $blocks = (($status.Status -eq 'MISSING') -or ($status.Status -eq 'NAME_IN_USE') -or (-not $isAdmin))
+        return [pscustomobject]@{ Status = [string]$status.Status; Info = $info; BlocksDb = [bool]$blocks }
+    } finally {
+        if ($null -ne $password) { $password.Dispose() }
+    }
+}
 #endregion Account
 
 #region ConfFiles
