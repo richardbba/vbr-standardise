@@ -4324,6 +4324,381 @@ function Invoke-PathA {
 #endregion PathA
 
 #region PathB
+# Spec 7.6 Path B rollback. Runs every step even when an earlier one fails, and
+# never throws. Reason starts with the issue code of the failure that caused the
+# rollback, for example 'VBR_DB_CONNECT_FAILED: no new VBR backend'. Returns
+# { ExitCode; Code; Detail; Action }:
+#   40 with that code (UNHANDLED_ERROR when Reason has no code) when the files and
+#      registry are back, the services run, VeeamBackupSvc stays running for
+#      RollbackSettleSec and Svc.VeeamBackup.log shows no new authentication error;
+#   50 ROLLBACK_FAILED otherwise. The marker stays on 50.
+# last-failure.json is written in both cases, so a scheduled -Apply does not cause
+# the same outage again.
+function Invoke-PathBRollback {
+    param(
+        [Parameter(Mandatory)][hashtable] $Ctx,
+        [Parameter(Mandatory)][string] $Reason
+    )
+    $cfg = $Ctx.Config
+    $vbrLog = 'C:\ProgramData\Veeam\Backup\Svc.VeeamBackup.log'
+    $timeoutSec = [int]$cfg.ServiceStopTimeoutSec
+    $problems = New-Object System.Collections.ArrayList
+    $stopSet = @($Ctx['StopSet'] | Where-Object { $_ })
+    $reasonCode = 'UNHANDLED_ERROR'
+    if ($Reason -match '^([A-Z][A-Z0-9_]+):') { $reasonCode = $Matches[1] }
+    $reasonText = $Reason -replace '^[A-Z][A-Z0-9_]+:\s*', ''
+    Write-Log "PATH B ROLLBACK: $Reason" -Level ERROR
+
+    Write-Log 'Rollback step 1 - stop the Veeam services' -Level STEP
+    if ($stopSet.Count -gt 0) {
+        try {
+            $stop = Stop-ServicesBounded -Names $stopSet -TimeoutSec $timeoutSec
+            if (-not $stop.Ok) { [void]$problems.Add('service(s) did not stop: ' + (@($stop.NotStopped) -join ', ')) }
+        } catch {
+            [void]$problems.Add("stopping the services failed: $($_.Exception.Message)")
+        }
+    }
+
+    Write-Log 'Rollback step 2 - restore pg_ident.conf and pg_hba.conf from the run folder' -Level STEP
+    $files = @(
+        @{ Name = 'pg_ident.conf'; Live = "$($Ctx.Pg.IdentPath)"; Backup = "$($Ctx['IdentBackupPath'])"; Sddl = "$($Ctx.Ident.Sddl)" },
+        @{ Name = 'pg_hba.conf';   Live = "$($Ctx.Pg.HbaPath)";   Backup = "$($Ctx['HbaBackupPath'])";   Sddl = "$($Ctx.Hba.Sddl)" }
+    )
+    foreach ($file in $files) {
+        try {
+            if ([string]::IsNullOrEmpty($file.Backup)) { throw "no backup of $($file.Name) is recorded" }
+            $null = Restore-ConfFile -Path $file.Live -BackupPath $file.Backup -ExpectedSddl $file.Sddl
+            Write-Log "Restored $($file.Name) from $($file.Backup)" -Level OK
+        } catch {
+            [void]$problems.Add("restoring $($file.Name) failed: $($_.Exception.Message)")
+        }
+    }
+
+    Write-Log 'Rollback step 3 - restore the registry values from registry-before.json' -Level STEP
+    try {
+        $snapshot = $Ctx['RegSnapshot']
+        if ($snapshot -isnot [hashtable]) { throw 'no registry snapshot is recorded' }
+        $restoreArgs = @{ KeyPath = "$($Ctx.Db.KeyPath)"; Snapshot = $snapshot }
+        if ($null -ne $Ctx['RegBackup']) {
+            $regExport = "$(Get-CfgValue -Object $Ctx['RegBackup'] -Name 'RegPath' -Default '')"
+            if ($regExport) { $restoreArgs['RegExportPath'] = $regExport }
+        }
+        if (-not (Restore-RegistrySnapshot @restoreArgs)) {
+            [void]$problems.Add('the registry values still differ from registry-before.json after the restore and the reg.exe import')
+        }
+    } catch {
+        [void]$problems.Add("restoring the registry failed: $($_.Exception.Message)")
+    }
+
+    Write-Log 'Rollback step 4 - start the services that were running before' -Level STEP
+    $logOffset = [long]0
+    try { $logOffset = [long](Get-FileLength -Path $vbrLog) } catch { $logOffset = [long]0 }
+    if ($stopSet.Count -gt 0) {
+        try {
+            $order = @(Get-StartOrder -Snapshot @($Ctx['Snapshot']) -Names $stopSet)
+            $start = Start-ServicesBounded -Names $order -TimeoutSec $timeoutSec
+            if (-not $start.Ok) { [void]$problems.Add('service(s) did not start: ' + (@($start.NotStarted) -join ', ')) }
+        } catch {
+            [void]$problems.Add("starting the services failed: $($_.Exception.Message)")
+        }
+    }
+
+    Write-Log 'Rollback step 5 - check that VBR works again' -Level STEP
+    if ($problems.Count -eq 0) {
+        try {
+            $settleSec = [int]$cfg.RollbackSettleSec
+            if (-not (Test-ServiceStaysRunning -Name 'VeeamBackupSvc' -Seconds $settleSec)) {
+                [void]$problems.Add("VeeamBackupSvc did not stay running for $settleSec seconds")
+            }
+            $newLines = @(Read-LogTail -Path $vbrLog -FromOffset $logOffset)
+            if ($newLines.Count -gt 0) {
+                $authErrors = @(Find-AuthErrors -Lines $newLines)
+                if ($authErrors.Count -gt 0) {
+                    [void]$problems.Add('new authentication errors in Svc.VeeamBackup.log: ' + (Format-ShortText -Text ($authErrors -join ' | ') -MaxLength 300))
+                }
+            }
+        } catch {
+            [void]$problems.Add("the check after the rollback failed: $($_.Exception.Message)")
+        }
+    } else {
+        Write-Log 'Skipping the settle check, because the rollback already failed.' -Level WARN
+    }
+
+    Write-Log 'Rollback step 6 - write last-failure.json' -Level STEP
+    $exitCode = 40
+    if ($problems.Count -gt 0) { $exitCode = 50 }
+    $summary = 'rollback complete: pg_ident.conf, pg_hba.conf and the registry were restored, the Veeam services run and VeeamBackupSvc stayed up with no new authentication error.'
+    if ($exitCode -eq 50) { $summary = 'ROLLBACK FAILED: ' + ($problems -join '; ') + '.' }
+    $notes = ''
+    try {
+        $null = Write-LastFailure -WorkRoot $Ctx.WorkRoot -RunDir "$($Ctx['RunDir'])" -Reason "$Reason | $summary"
+    } catch {
+        $notes += " last-failure.json could not be written ($($_.Exception.Message)), so a scheduled -Apply can repeat this outage."
+    }
+    if ($exitCode -eq 40) {
+        if (-not (Remove-ChangeMarker -WorkRoot $Ctx.WorkRoot)) {
+            $notes += " The marker could not be removed: delete $(Join-Path $Ctx.WorkRoot 'CHANGES-IN-PROGRESS.marker') after checking."
+        }
+        Write-Log $summary -Level WARN
+        return [pscustomobject]@{
+            ExitCode = 40
+            Code     = $reasonCode
+            Detail   = "$reasonText; $summary Run folder: $($Ctx['RunDir']).$notes"
+            Action   = "PAGE AN OPERATOR. VBR works again on its old settings. Read the run folder named in $(Join-Path $Ctx.WorkRoot 'last-failure.json'), fix the cause, delete that file, then re-run with -Apply in a maintenance window."
+        }
+    }
+    Write-Log $summary -Level ERROR
+    return [pscustomobject]@{
+        ExitCode = 50
+        Code     = 'ROLLBACK_FAILED'
+        Detail   = "$Reason; $summary The marker stays. Run folder: $($Ctx['RunDir']).$notes"
+        Action   = 'PAGE AN OPERATOR NOW. VBR may be down. Follow the MARKER_PRESENT recovery steps in README.md with the run folder in Detail.'
+    }
+}
+
+# Spec 7.6 Path B: full conversion to Windows authentication, with a short outage.
+# Returns { ExitCode; Code; Detail; Action } (Code '' means success). Every failure
+# from the first service stop to the VBR connect check runs Invoke-PathBRollback
+# here. An unexpected error after the marker but outside that block reaches the
+# trap, which runs the same rollback because the stage is PATH_B_CHANGING.
+function Invoke-PathB {
+    param([Parameter(Mandatory)][hashtable] $Ctx)
+    $cfg = $Ctx.Config
+    $state = $Ctx['State']
+    $timeoutSec = [int]$cfg.ServiceStopTimeoutSec
+    $psql = "$($Ctx.Pg.Psql)"
+    $port = [int]$Ctx.Pg.Port
+    $addresses = @($Ctx.Addresses)
+    $database = "$($Ctx.Db.DatabaseName)"
+    $vbrLog = 'C:\ProgramData\Veeam\Backup\Svc.VeeamBackup.log'
+    $notes = New-Object System.Collections.ArrayList
+
+    # Spec 7.11 idle gate. Returns a result object when the server is busy, else $null.
+    $idleGate = {
+        $processes = @(Get-Process -Name 'Veeam*' -ErrorAction SilentlyContinue | ForEach-Object {
+            $proc = $_
+            $started = $null
+            try { $started = $proc.StartTime } catch { $started = $null }
+            if ($null -eq $started) { $started = Get-Date }
+            [pscustomobject]@{ Name = "$($proc.ProcessName)"; StartTime = $started }
+        })
+        $busy = Get-BusyVeeamWork -Processes $processes -Now (Get-Date) -PersistentHours ([int]$cfg.BusyPersistentHours)
+        $names = (@($busy.Names) -join ', ')
+        if ($busy.Persistent) {
+            return [pscustomobject]@{
+                ExitCode = 5
+                Code     = 'VEEAM_BUSY_PERSISTENT'
+                Detail   = "Veeam work has run for more than $($cfg.BusyPersistentHours) hours: $names"
+                Action   = 'Pause log backup or CDP jobs and re-run in a maintenance window'
+            }
+        }
+        if ($busy.Busy) {
+            return [pscustomobject]@{ ExitCode = 10; Code = 'VEEAM_BUSY'; Detail = "Veeam work is running: $names"; Action = '' }
+        }
+        return $null
+    }
+
+    Write-Log 'Path B step 1 - check for an earlier failed conversion' -Level STEP
+    if (Test-LastFailure -WorkRoot $Ctx.WorkRoot) {
+        return [pscustomobject]@{
+            ExitCode = 5
+            Code     = 'PATH_B_PREVIOUS_FAILURE'
+            Detail   = "An earlier Path B run failed and was rolled back: $(Join-Path $Ctx.WorkRoot 'last-failure.json')"
+            Action   = 'Read the run folder named in last-failure.json, fix the cause, delete last-failure.json, then re-run with -Apply'
+        }
+    }
+
+    Write-Log 'Path B step 2 - idle gate' -Level STEP
+    $gate = & $idleGate
+    if ($null -ne $gate) { return $gate }
+
+    Write-Log 'Path B step 3 - record the Veeam services and find the stop set' -Level STEP
+    $Ctx['Snapshot'] = @(Get-VeeamServiceSnapshot)
+    $Ctx['StopSet'] = @(Get-StopSet -Snapshot $Ctx['Snapshot'])
+    $Ctx['Stopped'] = @()
+    $external = @()
+    if ($Ctx['StopSet'].Count -gt 0) {
+        $allServices = @(Get-Service -ErrorAction SilentlyContinue | ForEach-Object {
+            $svc = $_
+            $dependsOn = @()
+            try { $dependsOn = @($svc.ServicesDependedOn | ForEach-Object { $_.Name }) } catch { $dependsOn = @() }
+            [pscustomobject]@{ Name = "$($svc.Name)"; Status = "$($svc.Status)"; DependsOn = $dependsOn }
+        })
+        $external = @(Get-ExternalDependents -StopSet $Ctx['StopSet'] -AllServices $allServices)
+    }
+    if ($external.Count -gt 0) {
+        return [pscustomobject]@{
+            ExitCode = 5
+            Code     = 'SERVICE_DEPENDENT_OUTSIDE_SET'
+            Detail   = 'Running service(s) outside the Veeam stop set depend on a Veeam service: ' + ($external -join ', ')
+            Action   = 'Stop or reconfigure the dependent service(s) named in Detail, then re-run with -Apply'
+        }
+    }
+    Write-Log ('Stop set: ' + ($Ctx['StopSet'] -join ', '))
+
+    # Render both new texts before any backup, marker or service stop (Task 10): a name
+    # that cannot be written as ASCII then stops the run here, at stage UNTOUCHED, with
+    # nothing changed and no outage.
+    $identText = ''
+    $hbaText = ''
+    if ("$($state['PgIdent'])" -ne 'STANDARD') { $identText = New-PgIdentText -Lines @($Ctx.IdentLines) -RequiredNames @($Ctx.RequiredIdentNames) -LineEnding $Ctx.Ident.LineEnding -Stamp $Ctx.Stamp }
+    if ("$($state['PgHba'])" -ne 'STANDARD') { $hbaText = New-PgHbaText -Lines @($Ctx.HbaLines) -LineEnding $Ctx.Hba.LineEnding -Stamp $Ctx.Stamp }
+
+    Write-Log 'Path B step 4 - back up the config files and the registry, then write the marker' -Level STEP
+    $Ctx['RunDir'] = New-RunFolder -WorkRoot $Ctx.WorkRoot -Stamp $Ctx.Stamp
+    $Ctx['HbaBackupPath'] = Backup-ConfFile -Path $Ctx.Pg.HbaPath -RunDir $Ctx.RunDir
+    $Ctx['IdentBackupPath'] = Backup-ConfFile -Path $Ctx.Pg.IdentPath -RunDir $Ctx.RunDir
+    Write-Log "pg_hba.conf SDDL before the change: $($Ctx.Hba.Sddl)"
+    Write-Log "pg_ident.conf SDDL before the change: $($Ctx.Ident.Sddl)"
+    # For a person who recovers by hand (README, MARKER_PRESENT): which services ran.
+    $null = Write-AtomicJson -Path (Join-Path $Ctx.RunDir 'services-before.json') -Object ([ordered]@{ StopSet = @($Ctx['StopSet']); Services = @($Ctx['Snapshot']) })
+    $Ctx['RegSnapshot'] = Get-RegistryValueSnapshot -KeyPath $Ctx.Db.KeyPath -Names @('SqlUserName', 'SqlSecuredPassword', 'PostgresUserForWindowsAuth', 'SqlHostName')
+    $Ctx['RegBackup'] = Save-RegistryBackup -KeyPath $Ctx.Db.KeyPath -ExportKeyPath (ConvertTo-RegExePath -KeyPath $Ctx.Db.KeyPath) -RunDir $Ctx.RunDir -Snapshot $Ctx['RegSnapshot']
+    $null = Write-ChangeMarker -WorkRoot $Ctx.WorkRoot -RunDir $Ctx.RunDir -PathName 'B' -Stage 'PATH_B_CHANGING'
+    $script:Stage = 'PATH_B_CHANGING'
+
+    Write-Log 'Path B step 5 - idle gate again, then stop the stop set' -Level STEP
+    $gate = & $idleGate
+    if ($null -ne $gate) {
+        $null = Remove-ChangeMarker -WorkRoot $Ctx.WorkRoot
+        $script:Stage = 'UNTOUCHED'
+        return $gate
+    }
+    if ($Ctx['StopSet'].Count -gt 0) {
+        $stop = Stop-ServicesBounded -Names $Ctx['StopSet'] -TimeoutSec $timeoutSec
+        $Ctx['Stopped'] = @($stop.Stopped | Where-Object { $_ })
+        if (-not $stop.Ok) {
+            $notStopped = (@($stop.NotStopped) -join ', ')
+            Write-Log "Service(s) did not stop: $notStopped. Starting what this run stopped." -Level ERROR
+            if ($Ctx['Stopped'].Count -gt 0) {
+                $restart = Start-ServicesBounded -Names @(Get-StartOrder -Snapshot $Ctx['Snapshot'] -Names $Ctx['Stopped']) -TimeoutSec $timeoutSec
+                if (-not $restart.Ok) {
+                    return [pscustomobject]@{
+                        ExitCode = 50
+                        Code     = 'ROLLBACK_FAILED'
+                        Detail   = "SERVICES_WONT_STOP: $notStopped did not stop, and $(@($restart.NotStarted) -join ', ') did not start again. No file or registry value was changed. The marker stays."
+                        Action   = 'PAGE AN OPERATOR NOW. Start the stopped Veeam services, then delete the marker.'
+                    }
+                }
+            }
+            $null = Remove-ChangeMarker -WorkRoot $Ctx.WorkRoot
+            $script:Stage = 'UNTOUCHED'
+            return [pscustomobject]@{
+                ExitCode = 10
+                Code     = 'SERVICES_WONT_STOP'
+                Detail   = "$notStopped did not stop within $timeoutSec seconds. The services this run stopped were started again; nothing else was changed."
+                Action   = ''
+            }
+        }
+    }
+
+    $failReason = ''
+    try {
+        Write-Log 'Path B step 6 - write pg_ident.conf, then pg_hba.conf' -Level STEP
+        if ("$($state['PgIdent'])" -ne 'STANDARD') {
+            $null = Write-ConfFileAtomic -Path $Ctx.Pg.IdentPath -Bytes (ConvertTo-Latin1Bytes -Text $identText) -ExpectedSddl $Ctx.Ident.Sddl
+            Write-Log "Wrote $($Ctx.Pg.IdentPath)" -Level OK
+        }
+        if ("$($state['PgHba'])" -ne 'STANDARD') {
+            $hbaRules = @($Ctx.HbaRules | Where-Object { $null -ne $_ })
+            if ($hbaRules.Count -gt 0) {
+                foreach ($rule in @(Get-NonLoopbackHbaRules -Rules $hbaRules)) {
+                    $ruleText = "line $([int]$rule.LineIndex + 1): $($rule.Type) $($rule.Database) $($rule.User) $($rule.Address) $($rule.Method)"
+                    Write-Log "pg_hba.conf line for another address is commented out: $ruleText" -Level WARN
+                    [void]$notes.Add("Commented out pg_hba.conf $ruleText.")
+                }
+            }
+            $null = Write-ConfFileAtomic -Path $Ctx.Pg.HbaPath -Bytes (ConvertTo-Latin1Bytes -Text $hbaText) -ExpectedSddl $Ctx.Hba.Sddl
+            Write-Log "Wrote $($Ctx.Pg.HbaPath)" -Level OK
+        }
+
+        Write-Log 'Path B step 7 - SSPI test as SYSTEM and PostgreSQL config check' -Level STEP
+        $sspi = Test-PgSspiLogin -Psql $psql -Port $port -Addresses $addresses -Database $database
+        if (-not $sspi.Passed) {
+            $failed = @($sspi.Results | Where-Object { $null -ne $_ -and "$($_.Kind)" -ne 'OK' } | ForEach-Object { "$($_.Address) $($_.Kind) $($_.StdErr)" })
+            $failReason = 'PG_SSPI_TEST_FAILED: SSPI login as SYSTEM failed after the write: ' + ($failed -join '; ')
+        } else {
+            $health = Test-PgConfigHealth -Psql $psql -Port $port -Address $addresses[0] -Database $database -Major ([int]$Ctx.Pg.Major) -HbaPath "$($Ctx.Pg.HbaPath)" -IdentPath "$($Ctx.Pg.IdentPath)"
+            if (-not $health.Ok) { $failReason = "PG_SSPI_TEST_FAILED: PostgreSQL reports a problem with the new files: $($health.Detail)" }
+        }
+
+        if (-not $failReason) {
+            Write-Log 'Path B step 8 - switch the VBR registry values to Windows authentication' -Level STEP
+            $targets = Get-RegistryTargets -DbConfig $Ctx.Db -Addresses $addresses
+            $null = Set-RegistryTargets -KeyPath $Ctx.Db.KeyPath -Targets $targets
+            Write-Log ('Registry values set: ' + (@($targets.Keys) -join ', ')) -Level OK
+
+            Write-Log 'Path B step 9 - start the services that were running' -Level STEP
+            $Ctx['StartUtc'] = [DateTime]::UtcNow
+            $Ctx['LogOffset'] = [long](Get-FileLength -Path $vbrLog)
+            if ($Ctx['StopSet'].Count -gt 0) {
+                $start = Start-ServicesBounded -Names @(Get-StartOrder -Snapshot $Ctx['Snapshot'] -Names $Ctx['StopSet']) -TimeoutSec $timeoutSec
+                if (-not $start.Ok) {
+                    $failReason = 'VBR_DB_CONNECT_FAILED: service(s) did not start after the switch: ' + (@($start.NotStarted) -join ', ')
+                }
+            }
+        }
+
+        if (-not $failReason) {
+            Write-Log 'Path B step 10 - wait until VBR connects to its database' -Level STEP
+            $wait = Wait-VbrDbConnected -Psql $psql -Port $port -Address $addresses[0] -Database $database -SinceUtc $Ctx['StartUtc'] -TimeoutSec ([int]$cfg.VbrConnectTimeoutSec) -LogPath $vbrLog -LogOffset ([long]$Ctx['LogOffset'])
+            if (-not $wait.Ok) { $failReason = "VBR_DB_CONNECT_FAILED: $($wait.Detail)" }
+        }
+    } catch {
+        $failReason = "UNHANDLED_ERROR: $($_.Exception.Message)"
+    }
+    if ($failReason) {
+        Write-Log $failReason -Level ERROR
+        return (Invoke-PathBRollback -Ctx $Ctx -Reason $failReason)
+    }
+
+    Write-Log 'Path B step 11 - VBR works with Windows authentication; from here on there is no rollback' -Level STEP
+    $script:Stage = 'VERIFIED'
+    $markerRemoved = $false
+    try { $markerRemoved = [bool](Remove-ChangeMarker -WorkRoot $Ctx.WorkRoot) } catch { $markerRemoved = $false }
+    if (-not $markerRemoved) {
+        $null = Add-RunIssue -Code 'POST_CONVERSION_STEP_FAILED' -ExitCode 5 -Detail "VBR works with Windows authentication, but the marker could not be removed: $(Join-Path $Ctx.WorkRoot 'CHANGES-IN-PROGRESS.marker')" -Action 'Delete the marker file named in Detail, then re-run'
+    }
+    Clear-PathFixedIssues -Ctx $Ctx
+    [void]$notes.Add("VBR now uses Windows authentication. Backups: $($Ctx['RunDir']).")
+
+    $passwordFailure = ''
+    try {
+        Write-Log 'Path B step 12 - clear the postgres password' -Level STEP
+        $clear = Clear-PostgresPassword -Psql $psql -Port $port -Address $addresses[0] -Database $database
+        if ($clear.Ok) {
+            $Ctx['PasswordCleared'] = $true
+            Write-Log 'The postgres password is cleared.' -Level OK
+        } else {
+            $passwordFailure = "$($clear.Detail)"
+        }
+        Clear-PathFixedIssues -Ctx $Ctx -IncludePassword
+
+        Write-Log 'Path B step 13 - list other roles that log in with a password' -Level STEP
+        $otherRoles = @(Get-OtherPasswordRoles -Psql $psql -Port $port -Address $addresses[0] -Database $database | Where-Object { $_ })
+        if ($otherRoles.Count -gt 0) {
+            Write-Log ('Roles with LOGIN and a password, which can no longer log in: ' + ($otherRoles -join ', ')) -Level WARN
+            [void]$notes.Add('Roles with LOGIN and a password that can no longer log in: ' + ($otherRoles -join ', ') + '.')
+        }
+    } catch {
+        return [pscustomobject]@{
+            ExitCode = 5
+            Code     = 'POST_CONVERSION_STEP_FAILED'
+            Detail   = "VBR works with Windows authentication, but a step after the switch failed: $($_.Exception.Message) $($notes -join ' ')"
+            Action   = 'Re-run with -Apply to finish the remaining steps'
+        }
+    }
+
+    if ($passwordFailure) {
+        return [pscustomobject]@{
+            ExitCode = 5
+            Code     = 'PG_PASSWORD_NOT_CLEARED'
+            Detail   = "VBR works with Windows authentication, but the postgres password could not be cleared: $passwordFailure $($notes -join ' ')"
+            Action   = 'Re-run with -Apply to clear the postgres password'
+        }
+    }
+    return [pscustomobject]@{ ExitCode = 0; Code = ''; Detail = ($notes -join ' '); Action = '' }
+}
 #endregion PathB
 
 #region MainHelpers

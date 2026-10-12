@@ -4101,6 +4101,378 @@ $t16Mocks = {
 }
 $script:Stage = 'UNTOUCHED'
 $script:Issues = New-Object System.Collections.ArrayList
+# --- Task 17: Path B flow and rollback ---
+# A native-auth server: registry has a user and password, SYSTEM cannot log in yet.
+function New-T17Ctx {
+    $ctx = New-T16Ctx -PgHba 'NOT_STANDARD' -PgIdent 'MISSING_ENTRY' -PgPassword 'UNKNOWN'
+    $ctx.State['RegistryAuth'] = 'NATIVE'
+    $ctx.State['DbAuth'] = 'NATIVE'
+    $ctx.State['SspiPassed'] = $false
+    $ctx.Db.UserName = 'postgres'
+    $ctx.Db.PasswordSet = $true
+    return $ctx
+}
+
+# Mocks for every function Path B and its rollback call, plus Get-Process and
+# Get-Service so nothing real is read. Dot-source inside '& { }'.
+$t17Mocks = {
+    $calls = New-Object System.Collections.ArrayList
+    $sspiQueue = New-Object System.Collections.Queue
+    $busyQueue = New-Object System.Collections.Queue
+    $startQueue = New-Object System.Collections.Queue
+    $fake = @{
+        LastFailure = $false; External = @(); NotStopped = @(); HealthOk = $true; ConnectOk = $true
+        ClearOk = $true; OtherRoles = @('pg_native_admin'); RegRestoreOk = $true; SettleOk = $true
+        LogLines = @(); AuthErrors = @(); WriteThrows = ''; LastFailureReason = ''; RemoveMarkerOk = $true
+    }
+    function Get-Process { [CmdletBinding()] param([string[]] $Name) }
+    function Get-Service { [CmdletBinding()] param([string[]] $Name) }
+    function Test-LastFailure { param($WorkRoot) [void]$calls.Add('Test-LastFailure'); return [bool]$fake.LastFailure }
+    function Get-BusyVeeamWork {
+        param($Processes, $Now, $PersistentHours)
+        [void]$calls.Add('Get-BusyVeeamWork')
+        if ($busyQueue.Count -gt 0) { return $busyQueue.Dequeue() }
+        return [pscustomobject]@{ Busy = $false; Persistent = $false; Names = @() }
+    }
+    function Get-VeeamServiceSnapshot {
+        [void]$calls.Add('Get-VeeamServiceSnapshot')
+        return @(
+            [pscustomobject]@{ Name = 'VeeamBackupSvc'; Status = 'Running'; StartType = 'Automatic'; DependsOn = @(); Dependents = @() },
+            [pscustomobject]@{ Name = 'VeeamBrokerSvc'; Status = 'Running'; StartType = 'Automatic'; DependsOn = @(); Dependents = @() }
+        )
+    }
+    function Get-StopSet { param($Snapshot) return @('VeeamBackupSvc', 'VeeamBrokerSvc') }
+    function Get-ExternalDependents { param($StopSet, $AllServices) [void]$calls.Add('Get-ExternalDependents'); return @($fake.External) }
+    function New-RunFolder { param($WorkRoot, $Stamp) [void]$calls.Add('New-RunFolder'); return (Join-Path $WorkRoot "runs\$Stamp") }
+    function Backup-ConfFile { param($Path, $RunDir) [void]$calls.Add("Backup-ConfFile:$(Split-Path -Leaf $Path)"); return (Join-Path $RunDir ((Split-Path -Leaf $Path) + '.before')) }
+    function Write-AtomicJson { param($Path, $Object) [void]$calls.Add("Write-AtomicJson:$(Split-Path -Leaf $Path):" + (@($Object['StopSet']) -join ',')) }
+    function Get-RegistryValueSnapshot {
+        param($KeyPath, $Names)
+        [void]$calls.Add('Get-RegistryValueSnapshot:' + (@($Names) -join ','))
+        return @{ SqlUserName = [pscustomobject]@{ Exists = $true; Kind = 'String'; Data = 'postgres' } }
+    }
+    function ConvertTo-RegExePath { param($KeyPath) return ($KeyPath -replace '^(HKLM|HKCU):', '$1') }
+    function Save-RegistryBackup {
+        param($KeyPath, $ExportKeyPath, $RunDir, $Snapshot)
+        [void]$calls.Add("Save-RegistryBackup:$ExportKeyPath")
+        return [pscustomobject]@{ JsonPath = (Join-Path $RunDir 'registry-before.json'); RegPath = (Join-Path $RunDir 'vbr-key.reg') }
+    }
+    function Write-ChangeMarker { param($WorkRoot, $RunDir, $PathName, $Stage) [void]$calls.Add("Write-ChangeMarker:${PathName}:$Stage") }
+    function Remove-ChangeMarker { param($WorkRoot) [void]$calls.Add('Remove-ChangeMarker'); return [bool]$fake.RemoveMarkerOk }
+    function Stop-ServicesBounded {
+        param($Names, $TimeoutSec)
+        [void]$calls.Add('Stop-ServicesBounded:' + (@($Names) -join ',') + ":$script:Stage")
+        $notStopped = @($fake.NotStopped)
+        return [pscustomobject]@{ Ok = ($notStopped.Count -eq 0); Stopped = @($Names | Where-Object { $notStopped -notcontains $_ }); NotStopped = $notStopped }
+    }
+    function Get-StartOrder { param($Snapshot, $Names) return @($Names) }
+    function Start-ServicesBounded {
+        param($Names, $TimeoutSec)
+        [void]$calls.Add('Start-ServicesBounded:' + (@($Names) -join ','))
+        $ok = $true
+        if ($startQueue.Count -gt 0) { $ok = [bool]$startQueue.Dequeue() }
+        $notStarted = @()
+        if (-not $ok) { $notStarted = @(@($Names)[0]) }
+        return [pscustomobject]@{ Ok = $ok; Started = @($Names | Where-Object { $notStarted -notcontains $_ }); NotStarted = $notStarted }
+    }
+    function New-PgIdentText { param($Lines, $RequiredNames, $LineEnding, $Stamp) return "veeam `"SYSTEM@NT AUTHORITY`" postgres$LineEnding" }
+    function New-PgHbaText { param($Lines, $LineEnding, $Stamp) return "host all all 127.0.0.1/32 sspi map=veeam$LineEnding" }
+    function ConvertTo-Latin1Bytes { param($Text) return [System.Text.Encoding]::GetEncoding(28591).GetBytes($Text) }
+    function Get-NonLoopbackHbaRules { param($Rules) return @($Rules | Where-Object { "$($_.Type)" -like 'host*' -and @('127.0.0.1/32', '::1/128') -notcontains "$($_.Address)" }) }
+    function Write-ConfFileAtomic {
+        param($Path, $Bytes, $ExpectedSddl)
+        [void]$calls.Add("Write-ConfFileAtomic:$(Split-Path -Leaf $Path):$script:Stage")
+        if ($fake.WriteThrows) { throw $fake.WriteThrows }
+    }
+    function Test-PgSspiLogin {
+        param($Psql, $Port, $Addresses, $Database)
+        [void]$calls.Add('Test-PgSspiLogin')
+        $passed = $true
+        if ($sspiQueue.Count -gt 0) { $passed = [bool]$sspiQueue.Dequeue() }
+        $kind = 'OK'
+        if (-not $passed) { $kind = 'AUTH' }
+        return [pscustomobject]@{ Passed = $passed; Results = @([pscustomobject]@{ Address = '127.0.0.1'; ExitCode = 2; Kind = $kind; StdErr = 'SSPI authentication failed' }) }
+    }
+    function Test-PgConfigHealth { param($Psql, $Port, $Address, $Database, $Major, $HbaPath, $IdentPath) [void]$calls.Add('Test-PgConfigHealth'); return [pscustomobject]@{ Ok = [bool]$fake.HealthOk; Detail = 'hba_file differs' } }
+    function Get-RegistryTargets {
+        param($DbConfig, $Addresses)
+        [void]$calls.Add('Get-RegistryTargets')
+        $targets = [ordered]@{}
+        $targets['SqlUserName'] = ''
+        $targets['SqlSecuredPassword'] = ''
+        return $targets
+    }
+    function Set-RegistryTargets { param($KeyPath, $Targets) [void]$calls.Add('Set-RegistryTargets:' + (@($Targets.Keys) -join ',') + ":$script:Stage") }
+    function Get-FileLength { param($Path) [void]$calls.Add("Get-FileLength:$(Split-Path -Leaf $Path)"); return [long]1234 }
+    function Wait-VbrDbConnected {
+        param($Psql, $Port, $Address, $Database, $SinceUtc, $TimeoutSec, $LogPath, $LogOffset, $PollSec, $ServiceName)
+        [void]$calls.Add("Wait-VbrDbConnected:${LogOffset}:$TimeoutSec")
+        return [pscustomobject]@{ Ok = [bool]$fake.ConnectOk; Detail = 'no new VBR backend within 600 seconds' }
+    }
+    function Clear-PostgresPassword { param($Psql, $Port, $Address, $Database) [void]$calls.Add("Clear-PostgresPassword:$script:Stage"); return [pscustomobject]@{ Ok = [bool]$fake.ClearOk; Detail = 'ALTER ROLE failed' } }
+    function Get-OtherPasswordRoles { param($Psql, $Port, $Address, $Database) [void]$calls.Add('Get-OtherPasswordRoles'); return @($fake.OtherRoles) }
+    function Restore-ConfFile { param($Path, $BackupPath, $ExpectedSddl) [void]$calls.Add("Restore-ConfFile:$(Split-Path -Leaf $Path):$ExpectedSddl") }
+    function Restore-RegistrySnapshot {
+        param($KeyPath, $Snapshot, $RegExportPath)
+        [void]$calls.Add("Restore-RegistrySnapshot:$([IO.Path]::GetFileName("$RegExportPath"))")
+        return [bool]$fake.RegRestoreOk
+    }
+    function Test-ServiceStaysRunning { param($Name, $Seconds) [void]$calls.Add("Test-ServiceStaysRunning:${Name}:$Seconds"); return [bool]$fake.SettleOk }
+    function Read-LogTail { param($Path, $FromOffset) [void]$calls.Add("Read-LogTail:$FromOffset"); return @($fake.LogLines) }
+    function Find-AuthErrors { param($Lines) return @($fake.AuthErrors) }
+    function Write-LastFailure { param($WorkRoot, $RunDir, $Reason) [void]$calls.Add('Write-LastFailure'); $fake.LastFailureReason = $Reason }
+}
+
+# Happy path: every step in spec order, VERIFIED before the password is cleared.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'APPLY'
+    foreach ($code in @('SVC_DISABLED', 'DB_NATIVE_AUTH', 'PG_HBA_NOT_STANDARD', 'PG_IDENT_NOT_STANDARD')) { $null = Add-RunIssue -Code $code -ExitCode 5 -Detail 'test' }
+    $ctx = New-T17Ctx
+    $result = Invoke-PathB -Ctx $ctx
+    Check 'T17 happy: exit 0' $result.ExitCode 0
+    Check 'T17 happy: no issue code' $result.Code ''
+    Check 'T17 happy: spec order' ($calls -join ' > ') ('Test-LastFailure > Get-BusyVeeamWork > Get-VeeamServiceSnapshot > Get-ExternalDependents > ' +
+        'New-RunFolder > Backup-ConfFile:pg_hba.conf > Backup-ConfFile:pg_ident.conf > Write-AtomicJson:services-before.json:VeeamBackupSvc,VeeamBrokerSvc > ' +
+        'Get-RegistryValueSnapshot:SqlUserName,SqlSecuredPassword,PostgresUserForWindowsAuth,SqlHostName > ' +
+        'Save-RegistryBackup:HKLM\SOFTWARE\Veeam\Veeam Backup and Replication\DatabaseConfigurations\PostgreSql > ' +
+        'Write-ChangeMarker:B:PATH_B_CHANGING > Get-BusyVeeamWork > Stop-ServicesBounded:VeeamBackupSvc,VeeamBrokerSvc:PATH_B_CHANGING > ' +
+        'Write-ConfFileAtomic:pg_ident.conf:PATH_B_CHANGING > Write-ConfFileAtomic:pg_hba.conf:PATH_B_CHANGING > ' +
+        'Test-PgSspiLogin > Test-PgConfigHealth > Get-RegistryTargets > Set-RegistryTargets:SqlUserName,SqlSecuredPassword:PATH_B_CHANGING > ' +
+        'Get-FileLength:Svc.VeeamBackup.log > Start-ServicesBounded:VeeamBackupSvc,VeeamBrokerSvc > Wait-VbrDbConnected:1234:600 > ' +
+        'Remove-ChangeMarker > Clear-PostgresPassword:VERIFIED > Get-OtherPasswordRoles')
+    Check 'T17 happy: stage VERIFIED' $script:Stage 'VERIFIED'
+    Check 'T17 happy: Stopped recorded' ($ctx.Stopped -join ',') 'VeeamBackupSvc,VeeamBrokerSvc'
+    Check 'T17 happy: StartUtc recorded' ($ctx.StartUtc -gt [DateTime]::MinValue) 'True'
+    Check 'T17 happy: LogOffset recorded' $ctx.LogOffset 1234
+    Check 'T17 happy: registry backup recorded' $ctx.RegBackup.RegPath (Join-Path $t16Root 'runs\20261012-101500\vbr-key.reg')
+    Check 'T17 happy: PasswordCleared' $ctx.PasswordCleared 'True'
+    Check 'T17 happy: only the account issue is left' ((@($script:Issues) | ForEach-Object { $_.Code }) -join ',') 'SVC_DISABLED'
+    Check 'T17 happy: report DbAuth WINDOWS' $script:Report['DbAuth'] 'WINDOWS'
+    Check 'T17 happy: report PgPassword NONE' $script:Report['PgPassword'] 'NONE'
+    Check 'T17 happy: other password roles in Detail' ($result.Detail -like '*pg_native_admin*') 'True'
+    Check 'T17 happy: no last-failure written' (@($calls | Where-Object { $_ -eq 'Write-LastFailure' }).Count) 0
+}
+
+# Step 1: last-failure.json blocks Path B before anything else.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $fake.LastFailure = $true
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 previous failure: exit 5' $result.ExitCode 5
+    Check 'T17 previous failure: code' $result.Code 'PATH_B_PREVIOUS_FAILURE'
+    Check 'T17 previous failure: nothing else ran' ($calls -join ' > ') 'Test-LastFailure'
+}
+
+# Step 2: busy, and busy for longer than BusyPersistentHours.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $busyQueue.Enqueue([pscustomobject]@{ Busy = $true; Persistent = $false; Names = @('VeeamAgent') })
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 busy: exit 10' $result.ExitCode 10
+    Check 'T17 busy: code' $result.Code 'VEEAM_BUSY'
+    Check 'T17 busy: names the process' ($result.Detail -like '*VeeamAgent*') 'True'
+    Check 'T17 busy: no service snapshot' (@($calls | Where-Object { $_ -eq 'Get-VeeamServiceSnapshot' }).Count) 0
+    $calls.Clear()
+    $busyQueue.Enqueue([pscustomobject]@{ Busy = $true; Persistent = $true; Names = @('Veeam.Backup.Manager') })
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 persistent: exit 5' $result.ExitCode 5
+    Check 'T17 persistent: code' $result.Code 'VEEAM_BUSY_PERSISTENT'
+    Check 'T17 persistent: action' $result.Action 'Pause log backup or CDP jobs and re-run in a maintenance window'
+}
+
+# Step 3: a running service outside the stop set depends on a Veeam service.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $fake.External = @('ThirdPartyMonitor')
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 external dependent: exit 5' $result.ExitCode 5
+    Check 'T17 external dependent: code' $result.Code 'SERVICE_DEPENDENT_OUTSIDE_SET'
+    Check 'T17 external dependent: named' ($result.Detail -like '*ThirdPartyMonitor*') 'True'
+    Check 'T17 external dependent: no backup, no marker' (@($calls | Where-Object { $_ -like 'Backup-ConfFile*' -or $_ -like 'Write-ChangeMarker*' }).Count) 0
+}
+
+# Both texts are rendered before step 4: a name that cannot be written as ASCII stops
+# Path B before any backup, marker or service stop, so there is no outage.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    function New-PgIdentText { param($Lines, $RequiredNames, $LineEnding, $Stamp) throw 'New-PgIdentText: the name is not printable ASCII' }
+    Throws 'T17 render error reaches the trap' { Invoke-PathB -Ctx (New-T17Ctx) }
+    Check 'T17 render error: no run folder, backup, marker or stop' (@($calls | Where-Object { $_ -like 'New-RunFolder*' -or $_ -like 'Backup-ConfFile*' -or $_ -like 'Write-ChangeMarker*' -or $_ -like 'Stop-ServicesBounded*' }).Count) 0
+    Check 'T17 render error: stage stays UNTOUCHED' $script:Stage 'UNTOUCHED'
+}
+
+# Step 5: busy again after the marker: marker removed, nothing stopped.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $busyQueue.Enqueue([pscustomobject]@{ Busy = $false; Persistent = $false; Names = @() })
+    $busyQueue.Enqueue([pscustomobject]@{ Busy = $true; Persistent = $false; Names = @('VeeamAgent') })
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 busy at step 5: exit 10' $result.ExitCode 10
+    Check 'T17 busy at step 5: marker removed' (@($calls)[-1]) 'Remove-ChangeMarker'
+    Check 'T17 busy at step 5: nothing stopped' (@($calls | Where-Object { $_ -like 'Stop-ServicesBounded*' }).Count) 0
+    Check 'T17 busy at step 5: stage back to UNTOUCHED' $script:Stage 'UNTOUCHED'
+}
+
+# Step 5: a service does not stop: start what was stopped, remove the marker, exit 10.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $fake.NotStopped = @('VeeamBrokerSvc')
+    $ctx = New-T17Ctx
+    $result = Invoke-PathB -Ctx $ctx
+    Check 'T17 wont stop: exit 10' $result.ExitCode 10
+    Check 'T17 wont stop: code' $result.Code 'SERVICES_WONT_STOP'
+    $afterStop = @($calls)[($calls.IndexOf('Stop-ServicesBounded:VeeamBackupSvc,VeeamBrokerSvc:PATH_B_CHANGING') + 1)..($calls.Count - 1)] -join ' > '
+    Check 'T17 wont stop: starts only what it stopped, then removes the marker' $afterStop 'Start-ServicesBounded:VeeamBackupSvc > Remove-ChangeMarker'
+    Check 'T17 wont stop: no file written' (@($calls | Where-Object { $_ -like 'Write-ConfFileAtomic*' }).Count) 0
+    Check 'T17 wont stop: no last-failure' (@($calls | Where-Object { $_ -eq 'Write-LastFailure' }).Count) 0
+    Check 'T17 wont stop: stage back to UNTOUCHED' $script:Stage 'UNTOUCHED'
+    Check 'T17 wont stop: Stopped is what stopped' ($ctx.Stopped -join ',') 'VeeamBackupSvc'
+}
+
+# Step 5: a service does not stop and a stopped one does not start again -> 50, marker stays.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $fake.NotStopped = @('VeeamBrokerSvc')
+    $startQueue.Enqueue($false)
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 wont stop, wont start: exit 50' $result.ExitCode 50
+    Check 'T17 wont stop, wont start: code' $result.Code 'ROLLBACK_FAILED'
+    Check 'T17 wont stop, wont start: marker stays' (@($calls | Where-Object { $_ -eq 'Remove-ChangeMarker' }).Count) 0
+}
+
+# Step 7: SSPI test fails -> rollback before any registry change -> 40.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $sspiQueue.Enqueue($false)
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 SSPI fails: exit 40' $result.ExitCode 40
+    Check 'T17 SSPI fails: code' $result.Code 'PG_SSPI_TEST_FAILED'
+    Check 'T17 SSPI fails: registry never changed' (@($calls | Where-Object { $_ -like 'Set-RegistryTargets*' }).Count) 0
+    Check 'T17 SSPI fails: password never cleared' (@($calls | Where-Object { $_ -like 'Clear-PostgresPassword*' }).Count) 0
+    $afterTest = @($calls)[($calls.IndexOf('Test-PgSspiLogin') + 1)..($calls.Count - 1)] -join ' > '
+    Check 'T17 SSPI fails: rollback order' $afterTest ('Stop-ServicesBounded:VeeamBackupSvc,VeeamBrokerSvc:PATH_B_CHANGING > ' +
+        'Restore-ConfFile:pg_ident.conf:SDDL-IDENT > Restore-ConfFile:pg_hba.conf:SDDL-HBA > Restore-RegistrySnapshot:vbr-key.reg > ' +
+        'Get-FileLength:Svc.VeeamBackup.log > Start-ServicesBounded:VeeamBackupSvc,VeeamBrokerSvc > Test-ServiceStaysRunning:VeeamBackupSvc:300 > ' +
+        'Read-LogTail:1234 > Write-LastFailure > Remove-ChangeMarker')
+    Check 'T17 SSPI fails: last-failure names the reason' ($fake.LastFailureReason -like 'PG_SSPI_TEST_FAILED:*') 'True'
+}
+
+# Step 10: VBR does not connect -> rollback -> 40; the password is never cleared.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $fake.ConnectOk = $false
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 connect fails: exit 40' $result.ExitCode 40
+    Check 'T17 connect fails: code' $result.Code 'VBR_DB_CONNECT_FAILED'
+    Check 'T17 connect fails: registry was switched first' (@($calls | Where-Object { $_ -like 'Set-RegistryTargets*' }).Count) 1
+    Check 'T17 connect fails: password never cleared' (@($calls | Where-Object { $_ -like 'Clear-PostgresPassword*' }).Count) 0
+    Check 'T17 connect fails: last-failure written' (@($calls | Where-Object { $_ -eq 'Write-LastFailure' }).Count) 1
+    Check 'T17 connect fails: never VERIFIED' $script:Stage 'PATH_B_CHANGING'
+}
+
+# Step 10 fails and the rollback cannot prove VBR works -> 50, marker stays.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $fake.ConnectOk = $false
+    $fake.SettleOk = $false
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 rollback fails: exit 50' $result.ExitCode 50
+    Check 'T17 rollback fails: code' $result.Code 'ROLLBACK_FAILED'
+    Check 'T17 rollback fails: detail keeps the cause' ($result.Detail -like 'VBR_DB_CONNECT_FAILED:*') 'True'
+    Check 'T17 rollback fails: marker stays' (@($calls | Where-Object { $_ -eq 'Remove-ChangeMarker' }).Count) 0
+    Check 'T17 rollback fails: last-failure still written' (@($calls | Where-Object { $_ -eq 'Write-LastFailure' }).Count) 1
+}
+
+# Step 6: an unexpected write error -> rollback here -> 40 UNHANDLED_ERROR.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $fake.WriteThrows = 'The process cannot access the file'
+    $result = Invoke-PathB -Ctx (New-T17Ctx)
+    Check 'T17 write error: exit 40' $result.ExitCode 40
+    Check 'T17 write error: code' $result.Code 'UNHANDLED_ERROR'
+    Check 'T17 write error: rollback restored the files' (@($calls | Where-Object { $_ -like 'Restore-ConfFile*' }).Count) 2
+}
+
+# Step 12: the password cannot be cleared after VERIFIED -> 5, no rollback.
+& {
+    . $t17Mocks
+    $script:Stage = 'UNTOUCHED'
+    $script:Issues = New-Object System.Collections.ArrayList
+    $script:Report = New-RunReport -Mode 'APPLY'
+    $fake.ClearOk = $false
+    $ctx = New-T17Ctx
+    $result = Invoke-PathB -Ctx $ctx
+    Check 'T17 password not cleared: exit 5' $result.ExitCode 5
+    Check 'T17 password not cleared: code' $result.Code 'PG_PASSWORD_NOT_CLEARED'
+    Check 'T17 password not cleared: stage VERIFIED' $script:Stage 'VERIFIED'
+    Check 'T17 password not cleared: no rollback' (@($calls | Where-Object { $_ -like 'Restore-*' -or $_ -eq 'Write-LastFailure' }).Count) 0
+    Check 'T17 password not cleared: marker removed before the password step' ($calls.IndexOf('Remove-ChangeMarker') -lt $calls.IndexOf('Clear-PostgresPassword:VERIFIED')) 'True'
+    Check 'T17 password not cleared: step 13 still ran' (@($calls)[-1]) 'Get-OtherPasswordRoles'
+}
+
+# Invoke-PathBRollback on its own: order and the 40 rule.
+& {
+    . $t17Mocks
+    $script:Stage = 'PATH_B_CHANGING'
+    $ctx = New-T17Ctx
+    $ctx.StopSet = @('VeeamBackupSvc', 'VeeamBrokerSvc')
+    $ctx.RunDir = 'C:\runs\20261012-101500'
+    $ctx.HbaBackupPath = 'C:\runs\20261012-101500\pg_hba.conf.before'
+    $ctx.IdentBackupPath = 'C:\runs\20261012-101500\pg_ident.conf.before'
+    $ctx.RegSnapshot = @{ SqlUserName = [pscustomobject]@{ Exists = $true; Kind = 'String'; Data = 'postgres' } }
+    $ctx.RegBackup = [pscustomobject]@{ JsonPath = 'C:\runs\20261012-101500\registry-before.json'; RegPath = 'C:\runs\20261012-101500\vbr-key.reg' }
+    $result = Invoke-PathBRollback -Ctx $ctx -Reason 'VBR_DB_CONNECT_FAILED: no new VBR backend'
+    Check 'T17 rollback: exit 40' $result.ExitCode 40
+    Check 'T17 rollback: code from the reason' $result.Code 'VBR_DB_CONNECT_FAILED'
+    Check 'T17 rollback: files, then registry, then services, then checks' ($calls -join ' > ') ('Stop-ServicesBounded:VeeamBackupSvc,VeeamBrokerSvc:PATH_B_CHANGING > ' +
+        'Restore-ConfFile:pg_ident.conf:SDDL-IDENT > Restore-ConfFile:pg_hba.conf:SDDL-HBA > Restore-RegistrySnapshot:vbr-key.reg > ' +
+        'Get-FileLength:Svc.VeeamBackup.log > Start-ServicesBounded:VeeamBackupSvc,VeeamBrokerSvc > Test-ServiceStaysRunning:VeeamBackupSvc:300 > ' +
+        'Read-LogTail:1234 > Write-LastFailure > Remove-ChangeMarker')
+    Check 'T17 rollback: detail has no doubled code' ($result.Detail -like 'no new VBR backend*') 'True'
+
+    $calls.Clear()
+    $result = Invoke-PathBRollback -Ctx $ctx -Reason 'something odd'
+    Check 'T17 rollback: reason without a code -> UNHANDLED_ERROR' $result.Code 'UNHANDLED_ERROR'
+
+    $calls.Clear()
+    $fake.NotStopped = @('VeeamBrokerSvc')
+    $result = Invoke-PathBRollback -Ctx $ctx -Reason 'VBR_DB_CONNECT_FAILED: x'
+    Check 'T17 rollback: a service will not stop -> 50' "$($result.ExitCode) $($result.Code)" '50 ROLLBACK_FAILED'
+    Check 'T17 rollback: still restores files and registry and starts services' (@($calls | Where-Object { $_ -like 'Restore-*' -or $_ -like 'Start-ServicesBounded*' }).Count) 4
+    Check 'T17 rollback: no settle wait after a failure' (@($calls | Where-Object { $_ -like 'Test-ServiceStaysRunning*' }).Count) 0
+    Check 'T17 rollback: 50 keeps the marker' (@($calls | Where-Object { $_ -eq 'Remove-ChangeMarker' }).Count) 0
+    Check 'T17 rollback: 50 still writes last-failure' (@($calls | Where-Object { $_ -eq 'Write-LastFailure' }).Count) 1
+
+    $calls.Clear()
+    $fake.NotStopped = @()
+    $fake.RegRestoreOk = $false
+    $result = Invoke-PathBRollback -Ctx $ctx -Reason 'VBR_DB_CONNECT_FAILED: x'
+    Check 'T17 rollback: registry mismatch -> 50' $result.ExitCode 50
+
+    $calls.Clear()
+    $fake.RegRestoreOk = $true
+    $fake.LogLines = @('2026-10-12 FATAL: SSPI authentication failed for user "postgres"')
+    $fake.AuthErrors = @('2026-10-12 FATAL: SSPI authentication failed for user "postgres"')
+    $result = Invoke-PathBRollback -Ctx $ctx -Reason 'VBR_DB_CONNECT_FAILED: x'
+    Check 'T17 rollback: new auth error in the VBR log -> 50' $result.ExitCode 50
+    Check 'T17 rollback: auth error named in Detail' ($result.Detail -like '*SSPI authentication failed*') 'True'
+}
+$script:Stage = 'UNTOUCHED'
+$script:Issues = New-Object System.Collections.ArrayList
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue
