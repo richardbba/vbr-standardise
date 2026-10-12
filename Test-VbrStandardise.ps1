@@ -3073,6 +3073,153 @@ try {
 } catch {
     Check 'Task 11: password role tests ran to the end' $_.Exception.Message ''
 }
+# --- Task 12: DbAuth state and blockers ---
+try {
+    & {
+        $be = { param($Db, $User, $Addr) [pscustomobject]@{ Pid = 1; UseName = $User; DatName = $Db; ClientAddr = $Addr; BackendStartUtc = [datetime]::UtcNow } }
+        $good = @(
+            (& $be 'VeeamBackup' 'postgres' '127.0.0.1'),
+            (& $be 'veeambackup' 'postgres' '::1'),
+            (& $be 'postgres' 'pg_native_admin' '192.168.1.9')
+        )
+        Check 'vbr backends: loopback postgres sessions are OK'      (Test-VbrBackendsOk -Backends $good -Database 'VeeamBackup') 'True'
+        Check 'vbr backends: other role on the VBR database fails'   (Test-VbrBackendsOk -Backends ($good + @(& $be 'VeeamBackup' 'pg_native_admin' '127.0.0.1')) -Database 'VeeamBackup') 'False'
+        Check 'vbr backends: role name is case-sensitive'            (Test-VbrBackendsOk -Backends @(& $be 'VeeamBackup' 'Postgres' '127.0.0.1') -Database 'VeeamBackup') 'False'
+        Check 'vbr backends: LAN address on the VBR database fails'  (Test-VbrBackendsOk -Backends ($good + @(& $be 'VeeamBackup' 'postgres' '192.168.1.20')) -Database 'VeeamBackup') 'False'
+        Check 'vbr backends: missing address on the VBR database fails' (Test-VbrBackendsOk -Backends @(& $be 'VeeamBackup' 'postgres' '') -Database 'VeeamBackup') 'False'
+        Check 'vbr backends: no sessions is OK'                      (Test-VbrBackendsOk -Backends @() -Database 'VeeamBackup') 'True'
+        Check 'vbr backends: null list is OK'                        (Test-VbrBackendsOk -Backends $null -Database 'VeeamBackup') 'True'
+    }
+} catch {
+    Check 'Task 12: Test-VbrBackendsOk tests ran to the end' $_.Exception.Message ''
+}
+
+try {
+    & {
+        Check 'db auth: registry NATIVE wins'                  (Get-DbAuthState -RegistryAuth 'NATIVE'  -SspiPassed $true  -FirstMatchOk $true  -VbrBackendsOk $true) 'NATIVE'
+        Check 'db auth: registry NATIVE without SSPI'          (Get-DbAuthState -RegistryAuth 'NATIVE'  -SspiPassed $false -FirstMatchOk $false -VbrBackendsOk $false) 'NATIVE'
+        Check 'db auth: WINDOWS when all checks pass'          (Get-DbAuthState -RegistryAuth 'WINDOWS' -SspiPassed $true  -FirstMatchOk $true  -VbrBackendsOk $true) 'WINDOWS'
+        Check 'db auth: SSPI failure is UNKNOWN'               (Get-DbAuthState -RegistryAuth 'WINDOWS' -SspiPassed $false -FirstMatchOk $true  -VbrBackendsOk $true) 'UNKNOWN'
+        Check 'db auth: first hba match not sspi is UNKNOWN'   (Get-DbAuthState -RegistryAuth 'WINDOWS' -SspiPassed $true  -FirstMatchOk $false -VbrBackendsOk $true) 'UNKNOWN'
+        Check 'db auth: odd VBR backends is UNKNOWN'           (Get-DbAuthState -RegistryAuth 'WINDOWS' -SspiPassed $true  -FirstMatchOk $true  -VbrBackendsOk $false) 'UNKNOWN'
+        Check 'db auth: unknown registry value is UNKNOWN'     (Get-DbAuthState -RegistryAuth ''        -SspiPassed $true  -FirstMatchOk $true  -VbrBackendsOk $true) 'UNKNOWN'
+    }
+} catch {
+    Check 'Task 12: Get-DbAuthState tests ran to the end' $_.Exception.Message ''
+}
+
+try {
+    & {
+        $tcp = { param($Port, $Remote, $State) [pscustomobject]@{ LocalAddress = '0.0.0.0'; LocalPort = $Port; RemoteAddress = $Remote; RemotePort = 50000; State = $State } }
+        $connections = @(
+            (& $tcp 5432 '192.168.1.50' 'Established'),
+            (& $tcp 5432 '127.0.0.1' 'Established'),
+            (& $tcp 5432 '::1' 'Established'),
+            (& $tcp 5432 '::ffff:127.0.0.1' 'Established'),
+            (& $tcp 5432 '0.0.0.0' 'Listen'),
+            (& $tcp 5432 '192.168.1.51' 'TimeWait'),
+            (& $tcp 9392 '192.168.1.52' 'Established'),
+            (& $tcp 5432 '192.168.1.50' 'Established'),
+            (& $tcp 5432 'fe80::5%12' 'Established')
+        )
+        Check 'remote clients: only established, this port, not loopback, once each' (@(Select-RemoteClients -Connections $connections -Port 5432) -join ',') '192.168.1.50,fe80::5%12'
+        Check 'remote clients: none'                 @(Select-RemoteClients -Connections @() -Port 5432).Count 0
+        Check 'remote clients: other port only'      @(Select-RemoteClients -Connections @(& $tcp 5433 '10.0.0.1' 'Established') -Port 5432).Count 0
+    }
+} catch {
+    Check 'Task 12: Select-RemoteClients tests ran to the end' $_.Exception.Message ''
+}
+
+try {
+    & {
+        $mode = @{ Value = 'list' }
+        $seen = New-Object System.Collections.ArrayList
+        function Get-NetTCPConnection {
+            [CmdletBinding()] param($State, $LocalPort)
+            [void]$seen.Add("$State|$LocalPort")
+            if ($mode.Value -eq 'none') {
+                Write-Error -Message "No MSFT_NetTCPConnection objects found with property 'LocalPort' equal to '$LocalPort'." -Category ObjectNotFound
+                return
+            }
+            if ($mode.Value -eq 'broken') {
+                Write-Error -Message 'Access denied' -Category PermissionDenied
+                return
+            }
+            [pscustomobject]@{ LocalPort = 5432; RemoteAddress = '10.0.0.9'; State = 'Established' }
+            [pscustomobject]@{ LocalPort = 5432; RemoteAddress = '127.0.0.1'; State = 'Established' }
+        }
+        Check 'tcp clients: remote address from Get-NetTCPConnection' (@(Get-EstablishedRemoteClients -Port 5432) -join ',') '10.0.0.9'
+        Check 'tcp clients: asks for established connections on the port' $seen[0] 'Established|5432'
+        $mode.Value = 'none'
+        Check 'tcp clients: no connection is not an error'   @(Get-EstablishedRemoteClients -Port 5432).Count 0
+        $mode.Value = 'broken'
+        Throws 'tcp clients: other errors are not hidden'    { Get-EstablishedRemoteClients -Port 5432 }
+    }
+} catch {
+    Check 'Task 12: Get-EstablishedRemoteClients tests ran to the end' $_.Exception.Message ''
+}
+
+try {
+    & {
+        $localNames = @('VBR01', 'vbr01.corp.local', '192.168.1.10', 'fe80::10%4')
+        $db = {
+            param([string] $HostName = '127.0.0.1', [string] $EntraHost = '', $EntraPort = $null, [bool] $EntraPassword = $false)
+            [pscustomobject]@{
+                RootKey = 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication'; KeyPath = 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication\DatabaseConfigurations\PostgreSql'
+                ActiveConfiguration = 'PostgreSql'; HostName = $HostName; Port = 5432; DatabaseName = 'VeeamBackup'; UserName = ''; PasswordSet = $false
+                WindowsAuthRole = 'postgres'; EntraIdHost = $EntraHost; EntraIdPort = $EntraPort; EntraIdPasswordSet = $EntraPassword
+            }
+        }
+        $em = { param([string] $Active, [string] $HostName, $Port, [bool] $Password) [pscustomobject]@{ ActiveConfiguration = $Active; HostName = $HostName; Port = $Port; PasswordSet = $Password } }
+        $be = { param($Db, $User, $Addr) [pscustomobject]@{ Pid = 1; UseName = $User; DatName = $Db; ClientAddr = $Addr; BackendStartUtc = [datetime]::UtcNow } }
+        $vbrOnly = @((& $be 'VeeamBackup' 'postgres' '127.0.0.1'), (& $be 'postgres' 'postgres' '::1'))
+        $consumers = { param($DbConfig, $EmConfig, $Backends, $Remote) Get-ConsumerIssues -DbConfig $DbConfig -EmConfig $EmConfig -Backends $Backends -RemoteClients $Remote -LocalNames $localNames }
+
+        $r = @(& $consumers (& $db) $null $vbrOnly @())
+        Check 'consumers: clean server has none'                  $r.Count 0
+
+        $r = @(& $consumers (& $db) (& $em 'PostgreSql' 'localhost' 5432 $true) $vbrOnly @())
+        Check 'consumers: local EM with a password'               ($r | ForEach-Object { $_.Code }) 'PG_PASSWORD_CONSUMER'
+        Check 'consumers: EM named in Detail'                     ($r[0].Detail -match 'Enterprise Manager') 'True'
+        Check 'consumers: password consumer has an action'        ($r[0].Action -ne '') 'True'
+        Check 'consumers: EM on its own server is not ours'       @(& $consumers (& $db) (& $em 'PostgreSql' 'sql02.corp.local' 5432 $true) $vbrOnly @()).Count 0
+        Check 'consumers: EM on MsSql is not ours'                @(& $consumers (& $db) (& $em 'MsSql' 'localhost' 5432 $true) $vbrOnly @()).Count 0
+        Check 'consumers: EM on another port is not ours'         @(& $consumers (& $db) (& $em 'PostgreSql' 'VBR01' 5433 $true) $vbrOnly @()).Count 0
+        Check 'consumers: EM with Windows auth is fine'           @(& $consumers (& $db) (& $em 'PostgreSql' 'localhost' 5432 $false) $vbrOnly @()).Count 0
+        Check 'consumers: EM by server IP with a password'        (@(& $consumers (& $db) (& $em 'PostgreSql' '192.168.1.10' 5432 $true) $vbrOnly @()) | ForEach-Object { $_.Code }) 'PG_PASSWORD_CONSUMER'
+
+        $r = @(& $consumers (& $db -EntraHost 'localhost' -EntraPort 5432 -EntraPassword $true) $null $vbrOnly @())
+        Check 'consumers: Entra ID repository with a password'    ($r | ForEach-Object { $_.Code }) 'PG_PASSWORD_CONSUMER'
+        Check 'consumers: Entra ID named in Detail'               ($r[0].Detail -match 'Entra ID') 'True'
+        Check 'consumers: Entra ID with no host or port counts'   @(& $consumers (& $db -EntraPassword $true) $null $vbrOnly @()).Count 1
+        Check 'consumers: Entra ID on another server is not ours' @(& $consumers (& $db -EntraHost 'pg02.corp.local' -EntraPort 5432 -EntraPassword $true) $null $vbrOnly @()).Count 0
+
+        $r = @(& $consumers (& $db) $null ($vbrOnly + @(& $be 'VeeamBackup' 'pg_native_admin' '127.0.0.1')) @())
+        Check 'consumers: session as another role'                ($r | ForEach-Object { $_.Code }) 'PG_PASSWORD_CONSUMER'
+        Check 'consumers: other role named in Detail'             ($r[0].Detail -match 'pg_native_admin') 'True'
+
+        $r = @(& $consumers (& $db) $null ($vbrOnly + @(& $be 'VeeamBackup' 'postgres' '192.168.1.77')) @())
+        Check 'consumers: session from a LAN address'             ($r | ForEach-Object { $_.Code }) 'PG_REMOTE_CONSUMER'
+        Check 'consumers: LAN address named in Detail'            ($r[0].Detail -match '192\.168\.1\.77') 'True'
+        Check 'consumers: remote action text'                     $r[0].Action 'Move or stop the remote client, then re-run'
+
+        $r = @(& $consumers (& $db) $null $null @('10.1.1.1'))
+        Check 'consumers: TCP client without SSPI'                ($r | ForEach-Object { $_.Code }) 'PG_REMOTE_CONSUMER'
+        Check 'consumers: TCP client named in Detail'             ($r[0].Detail -match '10\.1\.1\.1') 'True'
+        Check 'consumers: no SSPI and no TCP client'              @(& $consumers (& $db) $null $null @()).Count 0
+
+        Check 'consumers: own IP is VBR when SqlHostName is the server name' @(& $consumers (& $db -HostName 'VBR01') $null @(& $be 'VeeamBackup' 'postgres' '192.168.1.10') @('192.168.1.10')).Count 0
+        $r = @(& $consumers (& $db) $null $vbrOnly @('192.168.1.10'))
+        Check 'consumers: own IP is another client when VBR uses loopback' ($r | ForEach-Object { $_.Code }) 'PG_REMOTE_CONSUMER'
+
+        $r = @(& $consumers (& $db) (& $em 'PostgreSql' 'localhost' 5432 $true) ($vbrOnly + @(& $be 'Reports' 'zabbix' '10.2.2.2')) @('10.3.3.3'))
+        Check 'consumers: password and remote issues together'    (($r | ForEach-Object { $_.Code }) -join ',') 'PG_PASSWORD_CONSUMER,PG_REMOTE_CONSUMER'
+        Check 'consumers: every remote address listed'            (($r[1].Detail -match '10\.2\.2\.2') -and ($r[1].Detail -match '10\.3\.3\.3')) 'True'
+        Check 'consumers: every password source listed'          (($r[0].Detail -match 'Enterprise Manager') -and ($r[0].Detail -match 'zabbix')) 'True'
+    }
+} catch {
+    Check 'Task 12: Get-ConsumerIssues tests ran to the end' $_.Exception.Message ''
+}
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue

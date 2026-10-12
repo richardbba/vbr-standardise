@@ -3225,6 +3225,170 @@ function Clear-PostgresPassword {
 #endregion Psql
 
 #region State
+# Spec 7.4, third WINDOWS condition: every session on the VBR database is the
+# postgres role from 127.0.0.1 or ::1. No session at all contradicts nothing.
+function Test-VbrBackendsOk {
+    param(
+        [object[]] $Backends,
+        [Parameter(Mandatory)][string] $Database
+    )
+    foreach ($backend in @($Backends)) {
+        if ($null -eq $backend) { continue }
+        $datName = "$(Get-CfgValue -Object $backend -Name 'DatName' -Default '')"
+        if ($datName -ine $Database) { continue }
+        $useName = "$(Get-CfgValue -Object $backend -Name 'UseName' -Default '')"
+        $address = "$(Get-CfgValue -Object $backend -Name 'ClientAddr' -Default '')".Trim()
+        if ($useName -cne 'postgres') { return $false }
+        if ($address -ne '127.0.0.1' -and $address -ne '::1') { return $false }
+    }
+    return $true
+}
+
+# Spec 7.4: NATIVE follows the registry alone. WINDOWS needs the registry and all
+# three live checks. Anything else is UNKNOWN, and UNKNOWN blocks every change.
+function Get-DbAuthState {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string] $RegistryAuth,
+        [Parameter(Mandatory)][bool] $SspiPassed,
+        [Parameter(Mandatory)][bool] $FirstMatchOk,
+        [Parameter(Mandatory)][bool] $VbrBackendsOk
+    )
+    if ($RegistryAuth -eq 'NATIVE') { return 'NATIVE' }
+    if ($RegistryAuth -eq 'WINDOWS' -and $SspiPassed -and $FirstMatchOk -and $VbrBackendsOk) { return 'WINDOWS' }
+    return 'UNKNOWN'
+}
+
+# Spec 7.5 without SSPI: remote addresses of established TCP sessions on the
+# PostgreSQL port. Loopback (127.0.0.0/8, ::1, ::ffff:127.x) is left out; each
+# address is listed once, sorted.
+function Select-RemoteClients {
+    param(
+        [object[]] $Connections,
+        [Parameter(Mandatory)][int] $Port
+    )
+    $found = New-Object System.Collections.ArrayList
+    foreach ($connection in @($Connections)) {
+        if ($null -eq $connection) { continue }
+        if ("$(Get-CfgValue -Object $connection -Name 'State' -Default '')" -ne 'Established') { continue }
+        $localPort = "$(Get-CfgValue -Object $connection -Name 'LocalPort' -Default '')" -as [int]
+        if ($null -eq $localPort -or $localPort -ne $Port) { continue }
+        $remote = "$(Get-CfgValue -Object $connection -Name 'RemoteAddress' -Default '')".Trim()
+        if ($remote -eq '' -or $remote -eq '::1' -or $remote -like '127.*' -or $remote -like '::ffff:127.*') { continue }
+        if (-not ($found -contains $remote)) { [void]$found.Add($remote) }
+    }
+    return [string[]]@($found | Sort-Object)
+}
+
+# Wrapper over Get-NetTCPConnection. "No MSFT_NetTCPConnection objects found" is
+# how the cmdlet says "no session"; any other error is thrown, so a broken check
+# never reads as "no remote client".
+function Get-EstablishedRemoteClients {
+    param([Parameter(Mandatory)][int] $Port)
+    $tcpErrors = $null
+    $connections = @(Get-NetTCPConnection -State Established -LocalPort $Port -ErrorAction SilentlyContinue -ErrorVariable tcpErrors)
+    foreach ($tcpError in @($tcpErrors)) {
+        if ($null -eq $tcpError) { continue }
+        if ("$($tcpError.CategoryInfo.Category)" -ne 'ObjectNotFound') {
+            throw "Get-NetTCPConnection failed for port ${Port}: $($tcpError.Exception.Message)"
+        }
+    }
+    return [string[]]@(Select-RemoteClients -Connections $connections -Port $Port)
+}
+
+# Spec 7.5 blockers. Returns at most one PG_PASSWORD_CONSUMER and one
+# PG_REMOTE_CONSUMER, each listing every source. Backends is $null when SYSTEM
+# cannot log in over SSPI yet; then only the TCP view (RemoteClients) is used.
+function Get-ConsumerIssues {
+    param(
+        [Parameter(Mandatory)][object] $DbConfig,
+        [object]   $EmConfig,
+        [object[]] $Backends,
+        [string[]] $RemoteClients,
+        [string[]] $LocalNames
+    )
+    $hostNames = @(@($LocalNames) + @('localhost') | Where-Object { "$_" -ne '' })
+    $ownAddresses = @($hostNames | ForEach-Object { ("$_" -replace '%.*$', '').ToLowerInvariant() })
+    $dbHost = "$(Get-CfgValue -Object $DbConfig -Name 'HostName' -Default '')".Trim()
+    $dbPort = "$(Get-CfgValue -Object $DbConfig -Name 'Port' -Default '')" -as [int]
+    $vbrUsesOwnAddress = ($dbHost -ne '' -and (Get-DbHostClass -HostName $dbHost -LocalNames $hostNames) -eq 'LOCAL')
+
+    # Fail closed: an empty host or port counts as this instance.
+    $onThisInstance = {
+        param([string] $HostName, $PortValue)
+        $name = "$HostName".Trim()
+        $hostOk = ($name -eq '') -or ((Get-DbHostClass -HostName $name -LocalNames $hostNames) -ne 'REMOTE')
+        $portNumber = "$PortValue" -as [int]
+        $portOk = ($null -eq $portNumber) -or ($portNumber -eq 0) -or ($null -eq $dbPort) -or ($portNumber -eq $dbPort)
+        return ($hostOk -and $portOk)
+    }
+
+    $passwordReasons = New-Object System.Collections.ArrayList
+    $remote = New-Object System.Collections.ArrayList
+    $addRemote = {
+        param([string] $Address)
+        $bare = ($Address -replace '%.*$', '').ToLowerInvariant()
+        if ($vbrUsesOwnAddress -and ($ownAddresses -contains $bare)) { return }
+        if (-not ($remote -contains $Address)) { [void]$remote.Add($Address) }
+    }
+
+    if ($null -ne $EmConfig) {
+        $emActive = "$(Get-CfgValue -Object $EmConfig -Name 'ActiveConfiguration' -Default '')".Trim()
+        $emHost = "$(Get-CfgValue -Object $EmConfig -Name 'HostName' -Default '')".Trim()
+        $emPort = Get-CfgValue -Object $EmConfig -Name 'Port' -Default $null
+        $emPassword = ((Get-CfgValue -Object $EmConfig -Name 'PasswordSet' -Default $false) -eq $true)
+        if ($emPassword -and ($emActive -eq '' -or $emActive -ieq 'PostgreSql') -and (& $onThisInstance $emHost $emPort)) {
+            [void]$passwordReasons.Add("Enterprise Manager uses a password for its database on this instance (host '$emHost', port '$emPort')")
+        }
+    }
+
+    if ((Get-CfgValue -Object $DbConfig -Name 'EntraIdPasswordSet' -Default $false) -eq $true) {
+        $entraHost = "$(Get-CfgValue -Object $DbConfig -Name 'EntraIdHost' -Default '')".Trim()
+        $entraPort = Get-CfgValue -Object $DbConfig -Name 'EntraIdPort' -Default $null
+        if (& $onThisInstance $entraHost $entraPort) {
+            [void]$passwordReasons.Add("Entra ID repository uses a password for its database on this instance (host '$entraHost', port '$entraPort')")
+        }
+    }
+
+    if ($null -ne $Backends) {
+        $otherRoles = New-Object System.Collections.ArrayList
+        foreach ($backend in @($Backends)) {
+            if ($null -eq $backend) { continue }
+            $useName = "$(Get-CfgValue -Object $backend -Name 'UseName' -Default '')"
+            $address = "$(Get-CfgValue -Object $backend -Name 'ClientAddr' -Default '')".Trim()
+            if ($useName -cne 'postgres') {
+                $label = $useName
+                if ($label -eq '') { $label = '(unknown role)' }
+                if (-not $otherRoles.Contains($label)) { [void]$otherRoles.Add($label) }
+            }
+            if ($address -ne '' -and $address -ne '127.0.0.1' -and $address -ne '::1') { & $addRemote $address }
+        }
+        if ($otherRoles.Count -gt 0) {
+            [void]$passwordReasons.Add("sessions as role(s) other than postgres: $($otherRoles -join ', ')")
+        }
+    }
+
+    foreach ($client in @($RemoteClients)) {
+        $text = "$client".Trim()
+        if ($text -ne '') { & $addRemote $text }
+    }
+
+    $issues = New-Object System.Collections.ArrayList
+    if ($passwordReasons.Count -gt 0) {
+        [void]$issues.Add([pscustomobject]@{
+            Code   = 'PG_PASSWORD_CONSUMER'
+            Detail = "PostgreSQL password clients: $($passwordReasons -join '; ')"
+            Action = 'Move the listed PostgreSQL password clients to Windows authentication or stop them, then re-run'
+        })
+    }
+    if ($remote.Count -gt 0) {
+        [void]$issues.Add([pscustomobject]@{
+            Code   = 'PG_REMOTE_CONSUMER'
+            Detail = "Clients connected to PostgreSQL from other addresses: $((@($remote) | Sort-Object) -join ', ')"
+            Action = 'Move or stop the remote client, then re-run'
+        })
+    }
+    return $issues.ToArray()
+}
 #endregion State
 
 #region Services
