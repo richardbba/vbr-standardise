@@ -2143,6 +2143,291 @@ $script:Issues = New-Object System.Collections.ArrayList
         Check 'T8 backup and restore checks ran without an error' $_.Exception.Message ''
     }
 }
+# --- Task 9: pg_hba.conf parse, check and render ---
+# Fixtures, shared by the Task 9 groups below.
+# Stock PostgreSQL file from a native-auth install: scram-sha-256 everywhere.
+$T9Native = @'
+# PostgreSQL Client Authentication Configuration File
+# ===================================================
+#
+# Refer to the "Client Authentication" section in the PostgreSQL
+# documentation for a complete description of this file.
+
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# "local" is for Unix domain socket connections only
+local   all             all                                     scram-sha-256
+# IPv4 local connections:
+host    all             all             127.0.0.1/32            scram-sha-256
+# IPv6 local connections:
+host    all             all             ::1/128                 scram-sha-256
+# Allow replication connections from localhost, by a user with the
+# replication privilege.
+local   replication     all                                     scram-sha-256
+host    replication     all             127.0.0.1/32            scram-sha-256
+host    replication     all             ::1/128                 scram-sha-256
+'@
+# Veeam's default SSPI file (KB4818, spec 7.3).
+$T9Veeam = @'
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# "local" is for Unix domain socket connections only
+local   all             all                                     sspi map=veeam
+# IPv4 local connections:
+host    all             all             127.0.0.1/32            sspi map=veeam
+# IPv6 local connections:
+host    all             all             ::1/128                 sspi map=veeam
+# Allow replication connections from localhost, by a user with the
+# replication privilege.
+local   replication     all                                     sspi map=veeam
+host    replication     all             127.0.0.1/32            sspi map=veeam
+host    replication     all             ::1/128                 sspi map=veeam
+'@
+# VBR-PILOT01: split by role. postgres uses SSPI, every other role (pg_native_admin)
+# uses a password. The postgres lines sit above all the scram lines.
+$T9Pilot = @'
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+# postgres (VBR services, SYSTEM) uses Windows authentication
+local   all             postgres                                sspi map=veeam
+host    all             postgres        127.0.0.1/32            sspi map=veeam
+host    all             postgres        ::1/128                 sspi map=veeam
+local   replication     postgres                                sspi map=veeam
+host    replication     postgres        127.0.0.1/32            sspi map=veeam
+host    replication     postgres        ::1/128                 sspi map=veeam
+# every other role uses a password
+local   all             all                                     scram-sha-256
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             ::1/128                 scram-sha-256
+local   replication     all                                     scram-sha-256
+host    replication     all             127.0.0.1/32            scram-sha-256
+host    replication     all             ::1/128                 scram-sha-256
+'@
+# Veeam default plus a LAN line.
+$T9Lan = $T9Veeam + "`n" + 'host    all             all             10.0.0.0/24             scram-sha-256'
+# Address and netmask columns.
+$T9Netmask = @'
+host    all             all             127.0.0.1 255.255.255.255   sspi map=veeam
+host    all             all             192.168.1.0 255.255.255.0   md5
+host    all             all             fe80:: ffff:ffff:ffff:ffff::   md5
+'@
+# Include directives (PostgreSQL 16 and later) and @file lists.
+$T9IncludeDir = $T9Veeam + "`n" + 'include_dir conf.d'
+$T9IncludeFile = 'include "extra.conf"' + "`n" + $T9Veeam
+$T9AtFile = 'host    all             @admins.txt     127.0.0.1/32            md5'
+$T9Stamp = '20261012-101500'
+$T9Prefix = "# [VbrStandardise $T9Stamp] "
+
+# Split-ConfTokens.
+& {
+    try {
+        Check 'T9 tokens of a host line' (@(Split-ConfTokens -Line 'host  all all 127.0.0.1/32   sspi map=veeam') -join '|') 'host|all|all|127.0.0.1/32|sspi|map=veeam'
+        Check 'T9 tabs separate tokens' (@(Split-ConfTokens -Line "host`tall`tall`t::1/128`tsspi") -join '|') 'host|all|all|::1/128|sspi'
+        Check 'T9 a trailing comment is dropped' (@(Split-ConfTokens -Line 'local all all sspi # was md5') -join '|') 'local|all|all|sspi'
+        Check 'T9 a comment line has no tokens' (@(Split-ConfTokens -Line '# host all all 10.0.0.0/8 md5').Count) 0
+        Check 'T9 a blank line has no tokens' (@(Split-ConfTokens -Line '   ').Count) 0
+        Check 'T9 an empty line has no tokens' (@(Split-ConfTokens -Line '').Count) 0
+        Check 'T9 quotes keep a token whole and are removed' (@(Split-ConfTokens -Line 'veeam   "SYSTEM@NT AUTHORITY"   postgres') -join '|') 'veeam|SYSTEM@NT AUTHORITY|postgres'
+        Check 'T9 # inside quotes is not a comment' (@(Split-ConfTokens -Line 'host all "a#b" 10.0.0.0/8 md5') -join '|') 'host|all|a#b|10.0.0.0/8|md5'
+        Check 'T9 a non-breaking space is not a separator' (@(Split-ConfTokens -Line ('a' + [char]0xA0 + 'b c')).Count) 2
+    } catch {
+        Check 'T9 token checks ran without an error' $_.Exception.Message ''
+    }
+}
+
+# Get-PgHbaRules and Test-PgHbaHasInclude.
+& {
+    try {
+        $native = @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Native))
+        Check 'T9 stock native file has 6 rules' $native.Count 6
+        Check 'T9 rule 1 is the local line' ('{0}|{1}|{2}|{3}|{4}|{5}' -f $native[0].Type, $native[0].Database, $native[0].User, $native[0].Address, $native[0].Method, $native[0].Options) 'local|all|all||scram-sha-256|'
+        Check 'T9 rule 1 points at its line' $native[0].LineIndex 9
+        Check 'T9 rule 2 is host 127.0.0.1/32' ('{0}|{1}|{2}' -f $native[1].Type, $native[1].Address, $native[1].Method) 'host|127.0.0.1/32|scram-sha-256'
+        Check 'T9 rule 6 is host replication ::1/128' ('{0}|{1}|{2}|{3}' -f $native[5].Type, $native[5].Database, $native[5].Address, $native[5].LineIndex) 'host|replication|::1/128|18'
+        $veeam = @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Veeam))
+        Check 'T9 sspi rule keeps map=veeam in Options' ('{0}|{1}' -f $veeam[1].Method, $veeam[1].Options) 'sspi|map=veeam'
+        $mask = @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Netmask))
+        Check 'T9 127.0.0.1 + 255.255.255.255 becomes 127.0.0.1/32' ('{0}|{1}|{2}' -f $mask[0].Address, $mask[0].Method, $mask[0].Options) '127.0.0.1/32|sspi|map=veeam'
+        Check 'T9 192.168.1.0 + 255.255.255.0 becomes /24' ('{0}|{1}' -f $mask[1].Address, $mask[1].Method) '192.168.1.0/24|md5'
+        Check 'T9 an IPv6 netmask becomes /64' ('{0}|{1}' -f $mask[2].Address, $mask[2].Method) 'fe80::/64|md5'
+        $named = @(Get-PgHbaRules -Lines @('host all all .corp.local md5', 'host all all samehost scram-sha-256', 'hostssl all all all md5'))
+        Check 'T9 a host name address has no netmask column' ('{0}|{1}' -f $named[0].Address, $named[0].Method) '.corp.local|md5'
+        Check 'T9 samehost is kept as the address' ('{0}|{1}' -f $named[1].Address, $named[1].Method) 'samehost|scram-sha-256'
+        Check 'T9 hostssl is a rule type' ('{0}|{1}' -f $named[2].Type, $named[2].Address) 'hostssl|all'
+        $include = @(Get-PgHbaRules -Lines @('include_dir conf.d'))
+        Check 'T9 an include line is still a rule' ('{0}|{1}' -f $include[0].Type, $include[0].Database) 'include_dir|conf.d'
+        Check 'T9 no rules from comments only' (@(Get-PgHbaRules -Lines @('# nothing', '')).Count) 0
+
+        Check 'T9 stock native file has no include' (Test-PgHbaHasInclude -Lines @(Split-ConfLines -Text $T9Native)) $false
+        Check 'T9 Veeam default file has no include' (Test-PgHbaHasInclude -Lines @(Split-ConfLines -Text $T9Veeam)) $false
+        Check 'T9 include_dir is an include' (Test-PgHbaHasInclude -Lines @(Split-ConfLines -Text $T9IncludeDir)) $true
+        Check 'T9 include "file" is an include' (Test-PgHbaHasInclude -Lines @(Split-ConfLines -Text $T9IncludeFile)) $true
+        Check 'T9 include_if_exists is an include' (Test-PgHbaHasInclude -Lines @('include_if_exists extra.conf')) $true
+        Check 'T9 @file in the user column is an include' (Test-PgHbaHasInclude -Lines @($T9AtFile)) $true
+        Check 'T9 @file inside a comma list is an include' (Test-PgHbaHasInclude -Lines @('host VeeamBackup,@dbs.txt all 127.0.0.1/32 md5')) $true
+        Check 'T9 a commented include is not an include' (Test-PgHbaHasInclude -Lines @('# include_dir conf.d')) $false
+    } catch {
+        Check 'T9 rule parsing checks ran without an error' $_.Exception.Message ''
+    }
+}
+
+# Get-StandardPgHbaLines, Test-PgHbaStandard and Get-NonLoopbackHbaRules.
+& {
+    try {
+        $standardLines = @(Get-StandardPgHbaLines)
+        Check 'T9 six standard lines' $standardLines.Count 6
+        Check 'T9 first standard line' $standardLines[0] 'local   all             all                                     sspi map=veeam'
+        Check 'T9 standard lines are standard' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines $standardLines)) $true
+        Check 'T9 Veeam default file is standard' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Veeam))) $true
+        Check 'T9 stock native file is not standard' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Native))) $false
+        Check 'T9 pilot split-by-role file is not standard' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Pilot))) $false
+        Check 'T9 a LAN line makes the file not standard' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Lan))) $false
+        Check 'T9 an include line makes the file not standard' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9IncludeDir))) $false
+        Check 'T9 no rules is not standard' (Test-PgHbaStandard -Rules @()) $false
+        Check 'T9 five of six rules is not standard' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines $standardLines[0..4])) $false
+        $swapped = @($standardLines[1], $standardLines[0]) + $standardLines[2..5]
+        Check 'T9 the right rules in the wrong order are not standard' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines $swapped)) $false
+        $spaced = @('LOCAL all ALL SSPI map=veeam', 'host all all 127.0.0.1 255.255.255.255 sspi    map=veeam') + $standardLines[2..5]
+        Check 'T9 spacing, case and a netmask column do not matter' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines $spaced)) $true
+        $mapCase = @('local all all sspi map=Veeam') + $standardLines[1..5]
+        Check 'T9 a map name in another case is not standard' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines $mapCase)) $false
+        $extraOption = @('local all all sspi map=veeam include_realm=0') + $standardLines[1..5]
+        Check 'T9 an extra option is not standard' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines $extraOption)) $false
+        # Options compare as a set: the same option twice, in any spacing, is one option.
+        $optionSet = @("local all all sspi map=veeam`tmap=veeam") + $standardLines[1..5]
+        Check 'T9 Options compare as a set of words' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines $optionSet)) $true
+        $ruleObjects = @(Get-PgHbaRules -Lines $standardLines | ForEach-Object { @{ Type = $_.Type; Database = $_.Database; User = $_.User; Address = $_.Address; Method = $_.Method; Options = $_.Options } })
+        Check 'T9 rules given as hashtables are read too' (Test-PgHbaStandard -Rules $ruleObjects) $true
+
+        Check 'T9 Veeam default file has no non-loopback rule' (@(Get-NonLoopbackHbaRules -Rules @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Veeam))).Count) 0
+        Check 'T9 pilot file has no non-loopback rule' (@(Get-NonLoopbackHbaRules -Rules @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Pilot))).Count) 0
+        $lan = @(Get-NonLoopbackHbaRules -Rules @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Lan)))
+        Check 'T9 the LAN line is the one non-loopback rule' ('{0}|{1}' -f $lan.Count, $lan[0].Address) '1|10.0.0.0/24'
+        $maskOther = @(Get-NonLoopbackHbaRules -Rules @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Netmask)))
+        Check 'T9 netmask lines: only the 127.0.0.1/32 line is loopback' (@($maskOther | ForEach-Object { $_.Address }) -join ',') '192.168.1.0/24,fe80::/64'
+        $odd = @(Get-NonLoopbackHbaRules -Rules @(Get-PgHbaRules -Lines @('host all all samehost md5', 'host all all 127.0.0.0/8 md5', 'host all all 0:0:0:0:0:0:0:1/128 md5', 'local all all md5')))
+        Check 'T9 samehost and 127.0.0.0/8 are non-loopback; ::1 in long form is loopback' (@($odd | ForEach-Object { $_.Address }) -join ',') 'samehost,127.0.0.0/8'
+    } catch {
+        Check 'T9 standard and non-loopback checks ran without an error' $_.Exception.Message ''
+    }
+}
+
+# Get-HbaFirstMatch.
+& {
+    try {
+        $veeam = @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Veeam))
+        $hit = Get-HbaFirstMatch -Rules $veeam -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1'
+        Check 'T9 Veeam default: 127.0.0.1 matches the IPv4 sspi line' ('{0}|{1}|{2}' -f $hit.LineIndex, $hit.Method, $hit.Options) '5|sspi|map=veeam'
+        $hit = Get-HbaFirstMatch -Rules $veeam -Database 'VeeamBackup' -User 'postgres' -Address '::1'
+        Check 'T9 Veeam default: ::1 matches the IPv6 sspi line' ('{0}|{1}' -f $hit.LineIndex, $hit.Address) '7|::1/128'
+        $hit = Get-HbaFirstMatch -Rules @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Native)) -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1'
+        Check 'T9 stock native: the first match is scram-sha-256' $hit.Method 'scram-sha-256'
+        $pilot = @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Pilot))
+        $hit = Get-HbaFirstMatch -Rules $pilot -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1'
+        Check 'T9 pilot: postgres matches its sspi line' ('{0}|{1}|{2}' -f $hit.LineIndex, $hit.User, $hit.Method) '3|postgres|sspi'
+        $hit = Get-HbaFirstMatch -Rules $pilot -Database 'VeeamBackup' -User 'pg_native_admin' -Address '::1'
+        Check 'T9 pilot: pg_native_admin matches a scram line' ('{0}|{1}|{2}' -f $hit.LineIndex, $hit.User, $hit.Method) '11|all|scram-sha-256'
+        $lan = @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Lan))
+        $hit = Get-HbaFirstMatch -Rules $lan -Database 'VeeamBackup' -User 'postgres' -Address '10.0.0.77'
+        Check 'T9 LAN: 10.0.0.77 matches 10.0.0.0/24' ('{0}|{1}' -f $hit.Address, $hit.Method) '10.0.0.0/24|scram-sha-256'
+        Check 'T9 LAN: 10.0.1.77 matches nothing' ($null -eq (Get-HbaFirstMatch -Rules $lan -Database 'VeeamBackup' -User 'postgres' -Address '10.0.1.77')) $true
+        $mask = @(Get-PgHbaRules -Lines @(Split-ConfLines -Text $T9Netmask))
+        $hit = Get-HbaFirstMatch -Rules $mask -Database 'VeeamBackup' -User 'postgres' -Address '192.168.1.200'
+        Check 'T9 netmask: 192.168.1.200 matches 192.168.1.0/24' $hit.LineIndex 1
+        $hit = Get-HbaFirstMatch -Rules $mask -Database 'VeeamBackup' -User 'postgres' -Address 'fe80::1'
+        Check 'T9 netmask: fe80::1 matches fe80::/64' $hit.LineIndex 2
+        $rules = @(Get-PgHbaRules -Lines @('host replication all 127.0.0.1/32 trust', 'host all all 0.0.0.0/0 md5', 'host all all ::/0 sspi map=veeam'))
+        $hit = Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '::1'
+        Check 'T9 replication lines and IPv4 lines never match an IPv6 client' $hit.LineIndex 2
+        $rules = @(Get-PgHbaRules -Lines @('local all all trust', 'host sameuser all 127.0.0.1/32 trust', 'host veeambackup all 127.0.0.1/32 trust', 'host VeeamBackup,postgres pg_native_admin,postgres 127.0.0.1/32 md5'))
+        $hit = Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1'
+        Check 'T9 local, sameuser and a database name in another case do not match; a comma list does' $hit.LineIndex 3
+        $hit = Get-HbaFirstMatch -Rules $rules -Database 'postgres' -User 'postgres' -Address '127.0.0.1'
+        Check 'T9 sameuser matches when the database equals the user' $hit.LineIndex 1
+        $rules = @(Get-PgHbaRules -Lines @('host all +admins 127.0.0.1/32 md5', 'host all all 127.0.0.1/32 sspi map=veeam'))
+        Check 'T9 +group counts as a match (cannot decide offline)' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1').LineIndex 0
+        $rules = @(Get-PgHbaRules -Lines @('host all all samehost md5', 'host all all 127.0.0.1/32 sspi map=veeam'))
+        Check 'T9 samehost counts as a match' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1').LineIndex 0
+        $rules = @(Get-PgHbaRules -Lines @('hostssl all all 127.0.0.1/32 md5', 'host all all 127.0.0.1/32 sspi map=veeam'))
+        Check 'T9 hostssl counts as a match' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1').LineIndex 0
+        $rules = @(Get-PgHbaRules -Lines @('host all pg_native_admin 127.0.0.1/32 md5', 'host all all 127.0.0.1/32 sspi map=veeam'))
+        Check 'T9 another user name does not match' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1').LineIndex 1
+        $rules = @(Get-PgHbaRules -Lines @('host all all 10.1.1.1 sspi map=veeam', 'host all all 127.0.0.1/32 md5'))
+        Check 'T9 a bare IPv4 address is one host, not every host' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1').LineIndex 1
+        $rules = @(Get-PgHbaRules -Lines @('host all all ::1 sspi map=veeam', 'host all all 127.0.0.1/32 md5'))
+        Check 'T9 a bare IPv6 address is one host, not every host' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1').LineIndex 1
+        $rules = @(Get-PgHbaRules -Lines @('host all all 127.0.0.1 sspi map=veeam'))
+        Check 'T9 a bare IPv4 address matches its own client' (Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address '127.0.0.1').LineIndex 0
+        Throws 'T9 a client address that is not an IP throws' { Get-HbaFirstMatch -Rules $rules -Database 'VeeamBackup' -User 'postgres' -Address 'localhost' }
+    } catch {
+        Check 'T9 first-match checks ran without an error' $_.Exception.Message ''
+    }
+}
+
+# New-PgHbaText.
+& {
+    try {
+        $expected = @'
+# Standardised by Invoke-VbrStandardise.ps1 on 20261012-101500
+local   all             all                                     sspi map=veeam
+host    all             all             127.0.0.1/32            sspi map=veeam
+host    all             all             ::1/128                 sspi map=veeam
+local   replication     all                                     sspi map=veeam
+host    replication     all             127.0.0.1/32            sspi map=veeam
+host    replication     all             ::1/128                 sspi map=veeam
+# PostgreSQL Client Authentication Configuration File
+# ===================================================
+#
+# Refer to the "Client Authentication" section in the PostgreSQL
+# documentation for a complete description of this file.
+
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# "local" is for Unix domain socket connections only
+# [VbrStandardise 20261012-101500] local   all             all                                     scram-sha-256
+# IPv4 local connections:
+# [VbrStandardise 20261012-101500] host    all             all             127.0.0.1/32            scram-sha-256
+# IPv6 local connections:
+# [VbrStandardise 20261012-101500] host    all             all             ::1/128                 scram-sha-256
+# Allow replication connections from localhost, by a user with the
+# replication privilege.
+# [VbrStandardise 20261012-101500] local   replication     all                                     scram-sha-256
+# [VbrStandardise 20261012-101500] host    replication     all             127.0.0.1/32            scram-sha-256
+# [VbrStandardise 20261012-101500] host    replication     all             ::1/128                 scram-sha-256
+'@
+        $out = New-PgHbaText -Lines @(Split-ConfLines -Text $T9Native) -LineEnding "`r`n" -Stamp $T9Stamp
+        Check 'T9 stock native file renders exactly as expected (CRLF)' ($out -ceq (Join-ConfLines -Lines @(Split-ConfLines -Text $expected) -LineEnding "`r`n")) $true
+        Check 'T9 CRLF output has no lone LF' (($out -replace "`r`n", '').Contains("`n")) $false
+        $outLines = @(Split-ConfLines -Text $out)
+        Check 'T9 rendered native file is standard' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines $outLines)) $true
+
+        $pilotLines = @(Split-ConfLines -Text $T9Pilot)
+        $pilotOut = @(Split-ConfLines -Text (New-PgHbaText -Lines $pilotLines -LineEnding "`n" -Stamp $T9Stamp))
+        Check 'T9 rendered pilot file is standard' (Test-PgHbaStandard -Rules @(Get-PgHbaRules -Lines $pilotOut)) $true
+        Check 'T9 rendered pilot file keeps every original line' $pilotOut.Count (1 + 6 + $pilotLines.Count)
+        Check 'T9 pilot sspi postgres line is commented out' ($pilotOut -ccontains ($T9Prefix + 'host    all             postgres        127.0.0.1/32            sspi map=veeam')) $true
+        Check 'T9 pilot comment line is unchanged' ($pilotOut -ccontains '# every other role uses a password') $true
+        Check 'T9 LF output has no CR' ((New-PgHbaText -Lines $pilotLines -LineEnding "`n" -Stamp $T9Stamp).Contains("`r")) $false
+
+        $lanOut = @(Split-ConfLines -Text (New-PgHbaText -Lines @(Split-ConfLines -Text $T9Lan) -LineEnding "`r`n" -Stamp $T9Stamp))
+        Check 'T9 the LAN line is commented out' ($lanOut -ccontains ($T9Prefix + 'host    all             all             10.0.0.0/24             scram-sha-256')) $true
+        Check 'T9 rendered LAN file has no non-loopback rule' (@(Get-NonLoopbackHbaRules -Rules @(Get-PgHbaRules -Lines $lanOut)).Count) 0
+
+        # CP1252 and UTF-8 bytes in a comment line and in an active line's trailing
+        # comment survive byte for byte; only the ASCII prefix is added.
+        $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+        $commentBytes = [byte[]]($latin1.GetBytes('# caf') + [byte[]](0xE9, 0x20, 0x80) + $latin1.GetBytes(' UTF-8 ') + [byte[]](0xC3, 0xA9))
+        $activeBytes = [byte[]]($latin1.GetBytes('host all all 10.0.0.0/8 md5 # Caf') + [byte[]](0xE9))
+        $fileBytes = [byte[]]($commentBytes + [byte[]](13, 10) + $activeBytes + [byte[]](13, 10))
+        $outBytes = ConvertTo-Latin1Bytes -Text (New-PgHbaText -Lines @(Split-ConfLines -Text (ConvertFrom-Latin1Bytes -Bytes $fileBytes)) -LineEnding "`r`n" -Stamp $T9Stamp)
+        $hex = { param([byte[]] $B) '-' + [System.BitConverter]::ToString($B) + '-' }
+        Check 'T9 a comment with CP1252 and UTF-8 bytes survives byte for byte' ((& $hex $outBytes).Contains((& $hex ([byte[]]($commentBytes + [byte[]](13, 10)))))) $true
+        Check 'T9 a commented-out active line keeps its bytes after the ASCII prefix' ((& $hex $outBytes).Contains((& $hex ([byte[]]($latin1.GetBytes($T9Prefix) + $activeBytes + [byte[]](13, 10)))))) $true
+        Check 'T9 rendering adds no non-ASCII byte' (@($outBytes | Where-Object { $_ -ge 0x80 }).Count) (@($fileBytes | Where-Object { $_ -ge 0x80 }).Count)
+        Throws 'T9 a stamp that is not ASCII is refused' { New-PgHbaText -Lines @('local all all md5') -LineEnding "`n" -Stamp ('2026' + [char]0xE9) }
+    } catch {
+        Check 'T9 render checks ran without an error' $_.Exception.Message ''
+    }
+}
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue

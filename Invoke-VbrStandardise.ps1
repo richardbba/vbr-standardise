@@ -2500,6 +2500,287 @@ function Restore-ConfFile {
 #endregion ConfFiles
 
 #region PgHba
+# Splits one pg_hba.conf or pg_ident.conf line into tokens. Space, tab, CR and LF
+# separate tokens (PostgreSQL's blanks; a Latin-1 0xA0 is not one). Double quotes keep
+# a token whole and are removed. '#' outside quotes starts a comment. Callers wrap the
+# result in @().
+function Split-ConfTokens {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string] $Line)
+    $tokens = New-Object System.Collections.Generic.List[string]
+    $current = New-Object System.Text.StringBuilder
+    $inQuote = $false
+    $hasToken = $false
+    foreach ($ch in $Line.ToCharArray()) {
+        if ($inQuote) {
+            if ($ch -eq [char]34) { $inQuote = $false } else { [void]$current.Append($ch) }
+            continue
+        }
+        if ($ch -eq [char]34) {
+            $inQuote = $true
+            $hasToken = $true
+            continue
+        }
+        if ($ch -eq [char]35) { break }
+        if ($ch -eq [char]32 -or $ch -eq [char]9 -or $ch -eq [char]13 -or $ch -eq [char]10) {
+            if ($hasToken) {
+                $tokens.Add($current.ToString())
+                [void]$current.Clear()
+                $hasToken = $false
+            }
+            continue
+        }
+        [void]$current.Append($ch)
+        $hasToken = $true
+    }
+    if ($hasToken) { $tokens.Add($current.ToString()) }
+    return $tokens.ToArray()
+}
+
+# One object per active pg_hba.conf line: { LineIndex; Type; Database; User; Address;
+# Method; Options }. local lines have Address ''. An IP address followed by a netmask
+# column becomes address/prefix. Options is the rest of the line joined by one space.
+# A line of any other type (include, include_dir, ...) is still returned, with its
+# arguments in Database, so no active line is ever invisible to Test-PgHbaStandard.
+function Get-PgHbaRules {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]] $Lines)
+    $isIpLiteral = {
+        param([string] $Text)
+        $ip = $null
+        return ((($Text -match '^\d{1,3}(\.\d{1,3}){3}$') -or $Text.Contains(':')) -and
+            [System.Net.IPAddress]::TryParse($Text, [ref]$ip))
+    }
+    $rules = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $Lines.Length; $i++) {
+        $t = @(Split-ConfTokens -Line $Lines[$i])
+        if ($t.Count -eq 0) { continue }
+        $type = $t[0]
+        $database = ''
+        $user = ''
+        $address = ''
+        $method = ''
+        $options = ''
+        if ($type -eq 'local' -or $type -like 'host*') {
+            if ($t.Count -gt 1) { $database = $t[1] }
+            if ($t.Count -gt 2) { $user = $t[2] }
+            $next = 3
+            if ($type -like 'host*') {
+                $next = 4
+                if ($t.Count -gt 3) {
+                    $address = $t[3]
+                    if ($t.Count -gt 4 -and -not $address.Contains('/') -and (& $isIpLiteral $address) -and (& $isIpLiteral $t[4])) {
+                        $bits = 0
+                        $contiguous = $true
+                        $seenZero = $false
+                        foreach ($b in ([System.Net.IPAddress]::Parse($t[4])).GetAddressBytes()) {
+                            for ($k = 7; $k -ge 0; $k--) {
+                                if ((($b -shr $k) -band 1) -eq 1) {
+                                    if ($seenZero) { $contiguous = $false }
+                                    $bits++
+                                } else {
+                                    $seenZero = $true
+                                }
+                            }
+                        }
+                        if ($contiguous) { $address = "$address/$bits" } else { $address = "$address/$($t[4])" }
+                        $next = 5
+                    }
+                }
+            }
+            if ($t.Count -gt $next) { $method = $t[$next] }
+            if ($t.Count -gt $next + 1) { $options = ($t[($next + 1)..($t.Count - 1)]) -join ' ' }
+        } elseif ($t.Count -gt 1) {
+            $database = ($t[1..($t.Count - 1)]) -join ' '
+        }
+        [void]$rules.Add([pscustomobject]@{
+            LineIndex = $i
+            Type      = $type
+            Database  = $database
+            User      = $user
+            Address   = $address
+            Method    = $method
+            Options   = $options
+        })
+    }
+    return $rules.ToArray()
+}
+
+# True when an active line includes other files: include, include_if_exists,
+# include_dir, or any token (or comma-list item) that starts with @. The script cannot
+# see or safely edit included rules (spec 7.1 step 13).
+function Test-PgHbaHasInclude {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]] $Lines)
+    foreach ($line in $Lines) {
+        $t = @(Split-ConfTokens -Line $line)
+        if ($t.Count -eq 0) { continue }
+        if (@('include', 'include_if_exists', 'include_dir') -contains $t[0]) { return $true }
+        foreach ($token in $t) {
+            foreach ($item in $token.Split(',')) {
+                if ($item.Length -gt 0 -and $item[0] -eq [char]64) { return $true }
+            }
+        }
+    }
+    return $false
+}
+
+# Veeam's default SSPI layout (KB4818), spec 7.3.
+function Get-StandardPgHbaLines {
+    return @(
+        'local   all             all                                     sspi map=veeam',
+        'host    all             all             127.0.0.1/32            sspi map=veeam',
+        'host    all             all             ::1/128                 sspi map=veeam',
+        'local   replication     all                                     sspi map=veeam',
+        'host    replication     all             127.0.0.1/32            sspi map=veeam',
+        'host    replication     all             ::1/128                 sspi map=veeam'
+    )
+}
+
+# True when the rules are exactly the six standard rules, in order. Type, Database,
+# User, Address and Method compare case-insensitively. Options compare as a set of
+# words, case-sensitively, because PostgreSQL map names are case-sensitive.
+function Test-PgHbaStandard {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Rules)
+    $standard = @(Get-PgHbaRules -Lines @(Get-StandardPgHbaLines))
+    if ($Rules.Count -ne $standard.Count) { return $false }
+    for ($i = 0; $i -lt $standard.Count; $i++) {
+        foreach ($field in @('Type', 'Database', 'User', 'Address', 'Method')) {
+            $have = [string](Get-CfgValue -Object $Rules[$i] -Name $field -Default '')
+            if ($have -ne [string]$standard[$i].$field) { return $false }
+        }
+        $haveSet = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::Ordinal)
+        $wantSet = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::Ordinal)
+        foreach ($word in ([string](Get-CfgValue -Object $Rules[$i] -Name 'Options' -Default '')).Split([char[]]@([char]32, [char]9))) {
+            if ($word.Length -gt 0) { [void]$haveSet.Add($word) }
+        }
+        foreach ($word in ([string]$standard[$i].Options).Split([char[]]@([char]32, [char]9))) {
+            if ($word.Length -gt 0) { [void]$wantSet.Add($word) }
+        }
+        if (-not $haveSet.SetEquals($wantSet)) { return $false }
+    }
+    return $true
+}
+
+# Rules of type host* whose Address is not 127.0.0.1/32 or ::1/128 (LAN lines,
+# samehost, samenet, host names). Spec 7.5 lists them in Detail when they are
+# commented out.
+function Get-NonLoopbackHbaRules {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Rules)
+    $result = New-Object System.Collections.ArrayList
+    foreach ($rule in $Rules) {
+        if ([string](Get-CfgValue -Object $rule -Name 'Type' -Default '') -notlike 'host*') { continue }
+        $address = [string](Get-CfgValue -Object $rule -Name 'Address' -Default '')
+        $isLoopback = $false
+        if ($address -match '^([^/]+)/(\d+)$') {
+            $prefix = $Matches[2]
+            $ip = $null
+            if ([System.Net.IPAddress]::TryParse($Matches[1], [ref]$ip)) {
+                $text = $ip.ToString()
+                if (($text -eq '127.0.0.1' -and $prefix -eq '32') -or ($text -eq '::1' -and $prefix -eq '128')) {
+                    $isLoopback = $true
+                }
+            }
+        }
+        if (-not $isLoopback) { [void]$result.Add($rule) }
+    }
+    return $result.ToArray()
+}
+
+# The first rule that a TCP connection (database, user, client IP) would use, or $null.
+# local lines never match. Database: all, sameuser (only when Database equals User),
+# or an exact case-sensitive name; replication never matches a normal connection. User:
+# all or an exact name. Comma lists match when any item matches. What the script cannot
+# decide offline counts as a match: samerole, +group, @file, /regex, host names,
+# samehost, samenet, hostssl and hostnossl. So the answer can be "the first rule may be
+# another one", but never a false "the first rule is sspi".
+function Get-HbaFirstMatch {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Rules,
+        [Parameter(Mandatory = $true)][string] $Database,
+        [Parameter(Mandatory = $true)][string] $User,
+        [Parameter(Mandatory = $true)][string] $Address
+    )
+    $client = $null
+    if (-not [System.Net.IPAddress]::TryParse($Address, [ref]$client)) {
+        throw "Get-HbaFirstMatch: '$Address' is not an IP address."
+    }
+    $clientBytes = $client.GetAddressBytes()
+    foreach ($rule in $Rules) {
+        if ([string](Get-CfgValue -Object $rule -Name 'Type' -Default '') -notlike 'host*') { continue }
+
+        $databaseOk = $false
+        foreach ($item in ([string](Get-CfgValue -Object $rule -Name 'Database' -Default '')).Split(',')) {
+            if ($item -eq 'all') { $databaseOk = $true }
+            elseif ($item -eq 'sameuser') { if ($Database -ceq $User) { $databaseOk = $true } }
+            elseif ($item -ceq 'replication') { }
+            elseif ($item -eq 'samerole' -or $item -eq 'samegroup') { $databaseOk = $true }
+            elseif ($item.Length -gt 0 -and ($item[0] -eq [char]64 -or $item[0] -eq [char]47)) { $databaseOk = $true }
+            elseif ($item -ceq $Database) { $databaseOk = $true }
+        }
+        if (-not $databaseOk) { continue }
+
+        $userOk = $false
+        foreach ($item in ([string](Get-CfgValue -Object $rule -Name 'User' -Default '')).Split(',')) {
+            if ($item -eq 'all') { $userOk = $true }
+            elseif ($item.Length -gt 0 -and ($item[0] -eq [char]43 -or $item[0] -eq [char]64 -or $item[0] -eq [char]47)) { $userOk = $true }
+            elseif ($item -ceq $User) { $userOk = $true }
+        }
+        if (-not $userOk) { continue }
+
+        $addressOk = $true
+        $ruleAddress = [string](Get-CfgValue -Object $rule -Name 'Address' -Default '')
+        $bareIp = $null
+        if ($ruleAddress -notmatch '/' -and ($ruleAddress -match '^\d{1,3}(\.\d{1,3}){3}$' -or $ruleAddress.Contains(':')) -and [System.Net.IPAddress]::TryParse($ruleAddress, [ref]$bareIp)) {
+            # A bare IP literal names one host: /32 for IPv4, /128 for IPv6.
+            $hostBits = 32
+            if ($bareIp.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) { $hostBits = 128 }
+            $ruleAddress = "$ruleAddress/$hostBits"
+        }
+        if ($ruleAddress -match '^([^/]+)/(\d{1,3})$') {
+            $prefix = [int]$Matches[2]
+            $network = $null
+            if ([System.Net.IPAddress]::TryParse($Matches[1], [ref]$network)) {
+                $networkBytes = $network.GetAddressBytes()
+                if ($networkBytes.Length -ne $clientBytes.Length) {
+                    $addressOk = $false
+                } elseif ($prefix -le $networkBytes.Length * 8) {
+                    $wholeBytes = [int][System.Math]::Floor($prefix / 8)
+                    $restBits = $prefix % 8
+                    for ($k = 0; $k -lt $wholeBytes; $k++) {
+                        if ($clientBytes[$k] -ne $networkBytes[$k]) { $addressOk = $false; break }
+                    }
+                    if ($addressOk -and $restBits -gt 0) {
+                        $mask = (0xFF -shl (8 - $restBits)) -band 0xFF
+                        if (([int]$clientBytes[$wholeBytes] -band $mask) -ne ([int]$networkBytes[$wholeBytes] -band $mask)) {
+                            $addressOk = $false
+                        }
+                    }
+                }
+            }
+        }
+        if ($addressOk) { return $rule }
+    }
+    return $null
+}
+
+# The new pg_hba.conf text (spec 7.8): a header comment, the six standard lines, then
+# every original line. Original active lines are commented out with the ASCII prefix
+# '# [VbrStandardise <Stamp>] ' in front of their original characters; comment and blank
+# lines stay as they are.
+function New-PgHbaText {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]] $Lines,
+        [Parameter(Mandatory = $true)][string] $LineEnding,
+        [Parameter(Mandatory = $true)][string] $Stamp
+    )
+    if (-not (Test-AsciiText -Text $Stamp)) { throw "New-PgHbaText: the stamp '$Stamp' is not printable ASCII." }
+    $out = New-Object System.Collections.Generic.List[string]
+    $out.Add("# Standardised by Invoke-VbrStandardise.ps1 on $Stamp")
+    foreach ($line in @(Get-StandardPgHbaLines)) { $out.Add($line) }
+    $prefix = "# [VbrStandardise $Stamp] "
+    foreach ($line in $Lines) {
+        if (@(Split-ConfTokens -Line $line).Count -gt 0) { $out.Add($prefix + $line) } else { $out.Add($line) }
+    }
+    return (Join-ConfLines -Lines $out.ToArray() -LineEnding $LineEnding)
+}
 #endregion PgHba
 
 #region PgIdent
