@@ -1,0 +1,301 @@
+# Tests for Invoke-VbrStandardise.ps1. Never copy this file to a VBR server or add it
+# to the RMM.
+#
+# The harness parses Invoke-VbrStandardise.ps1, loads every top-level function through
+# the AST and never runs the main body. Tests mock by redefining functions inside
+# & { } child scopes, and use New-TestFolder folders and throwaway HKCU:\Software
+# keys. They never create local users, change real services or write to HKLM.
+#
+# Run from an elevated prompt in the project folder:
+#   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Test-VbrStandardise.ps1
+# A pass ends with "RESULT: <n> passed, 0 failed" and exit code 0.
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+$ScriptPath = Join-Path $PSScriptRoot 'Invoke-VbrStandardise.ps1'
+if (-not (Test-Path -LiteralPath $ScriptPath)) {
+    Write-Host "FATAL: $ScriptPath not found."
+    exit 1
+}
+$ScriptText = [System.IO.File]::ReadAllText($ScriptPath)
+$parseTokens = $null
+$parseErrors = $null
+$ScriptAst = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$parseTokens, [ref]$parseErrors)
+if ($parseErrors -and $parseErrors.Count -gt 0) {
+    foreach ($parseError in $parseErrors) {
+        Write-Host ("FATAL: parse error at line {0}: {1}" -f $parseError.Extent.StartLineNumber, $parseError.Message)
+    }
+    exit 1
+}
+
+# Load every top-level function at script scope. A foreach statement (not
+# ForEach-Object) runs in this scope, so the dot-sourced definitions land here.
+# The main body below the MAIN line never runs.
+foreach ($topStatement in $ScriptAst.EndBlock.Statements) {
+    if ($topStatement -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+        . ([scriptblock]::Create($topStatement.Extent.Text))
+    }
+}
+
+# ===================== HARNESS =====================
+# Defined after the script's functions, so these definitions win.
+$script:PassCount = 0
+$script:FailCount = 0
+$script:SkipCount = 0
+$script:TestFolders = New-Object System.Collections.ArrayList
+$script:TestFolderCount = 0
+$script:LogLines = New-Object System.Collections.ArrayList
+
+# Write-Log records "[LEVEL] message" instead of printing.
+function Write-Log {
+    param(
+        [AllowEmptyString()][string] $Message = '',
+        [string] $Level = 'INFO'
+    )
+    [void]$script:LogLines.Add("[$Level] $Message")
+}
+
+function Check {
+    param([string] $Name, $Actual, $Expected)
+    if ("$Actual" -ceq "$Expected") {
+        $script:PassCount++
+        Write-Host "  PASS  $Name"
+    } else {
+        $script:FailCount++
+        Write-Host "  FAIL  $Name  expected '$Expected' got '$Actual'" -ForegroundColor Red
+    }
+}
+
+function Throws {
+    param([string] $Name, [scriptblock] $Block)
+    $threw = $false
+    try { $null = & $Block } catch { $threw = $true }
+    if ($threw) {
+        $script:PassCount++
+        Write-Host "  PASS  $Name"
+    } else {
+        $script:FailCount++
+        Write-Host "  FAIL  $Name  expected an exception, none was thrown" -ForegroundColor Red
+    }
+}
+
+function Skip {
+    param([string] $Name, [string] $Reason)
+    $script:SkipCount++
+    Write-Host "  SKIP  $Name  ($Reason)" -ForegroundColor Yellow
+}
+
+function New-TestFolder {
+    param([string] $Tag = 'test')
+    $script:TestFolderCount++
+    $path = Join-Path $env:TEMP ('vbrstd-{0}-{1}-{2}' -f $Tag, $PID, $script:TestFolderCount)
+    if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+    [void](New-Item -ItemType Directory -Path $path -Force)
+    [void]$script:TestFolders.Add($path)
+    return $path
+}
+
+# An error that escapes a test statement counts as one failure. The run goes on
+# with the next statement, so one broken task cannot hide the other results.
+trap {
+    $script:FailCount++
+    Write-Host ("  FAIL  UNHANDLED  {0}" -f $_.Exception.Message) -ForegroundColor Red
+    continue
+}
+
+# --- Task 1: Project scaffold, test harness and core helpers ---
+Write-Host '--- Task 1: Project scaffold, test harness and core helpers ---'
+
+# Script skeleton: parameters, help, strict mode, regions, MAIN line.
+$t1Params = @($ScriptAst.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+Check 'T1 parameters are Apply, CreateServiceAccount, WorkRoot' ($t1Params -join ',') 'Apply,CreateServiceAccount,WorkRoot'
+$t1WorkRootParam = @($ScriptAst.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'WorkRoot' })[0]
+Check 'T1 WorkRoot default' $t1WorkRootParam.DefaultValue.Value 'C:\ProgramData\VeeamStandardise'
+Check 'T1 script has [CmdletBinding()]' (@($ScriptAst.ParamBlock.Attributes | Where-Object { $_.TypeName.Name -eq 'CmdletBinding' }).Count) 1
+$t1FirstTwo = @($ScriptAst.EndBlock.Statements | Select-Object -First 2 | ForEach-Object { $_.Extent.Text }) -join ' / '
+Check 'T1 strict mode and Stop come first' $t1FirstTwo "Set-StrictMode -Version 2.0 / `$ErrorActionPreference = 'Stop'"
+$t1Help = $ScriptAst.GetHelpContent()
+Check 'T1 help is recognised' ($null -ne $t1Help) 'True'
+Check 'T1 help has a synopsis' ([bool]$t1Help.Synopsis) 'True'
+Check 'T1 help has a description' ([bool]$t1Help.Description) 'True'
+Check 'T1 help documents the three parameters' ((@($t1Help.Parameters.Keys) | Sort-Object) -join ',') 'APPLY,CREATESERVICEACCOUNT,WORKROOT'
+foreach ($t1Row in @('0 OK', '5 ACTION_NEEDED', '10 RETRY', '11 UNSUPPORTED', '20 PREFLIGHT', '40 ESCALATE', '50 ESCALATE_NOW')) {
+    $t1Pattern = '(?m)^\s*' +($t1Row -replace ' ', '\s+') + '\s'
+    Check "T1 help NOTES list exit code '$t1Row'" ($t1Help.Notes -match $t1Pattern) 'True'
+}
+Check 'T1 script is ASCII only' ($ScriptText -cmatch '[^\x00-\x7F]') 'False'
+
+$t1RegionNames = @('Core', 'Outcome', 'Preflight', 'Vbr', 'PgDiscovery', 'Names', 'Account', 'ConfFiles', 'PgHba', 'PgIdent', 'Psql', 'State', 'Services', 'Registry', 'ConnectCheck', 'PathA', 'PathB', 'MainHelpers')
+$t1Lines = $ScriptText -split "`r?`n"
+$t1Markers = @($t1Lines | Where-Object { $_ -match '^#(end)?region\b' } | ForEach-Object { $_.TrimEnd() })
+$t1ExpectedMarkers = @($t1RegionNames | ForEach-Object { "#region $_"; "#endregion $_" })
+Check 'T1 regions open and close in order, never nested' ($t1Markers -join '|') ($t1ExpectedMarkers -join '|')
+$t1MainLine = '# ===================== MAIN ====================='
+Check 'T1 MAIN line appears once' (@($t1Lines | Where-Object { $_ -ceq $t1MainLine }).Count) 1
+$t1MainNumber = [array]::IndexOf($t1Lines, $t1MainLine) + 1
+$t1LastRegionNumber = [array]::IndexOf($t1Lines, '#endregion MainHelpers') + 1
+Check 'T1 MAIN line follows the last region' ($t1MainNumber -gt $t1LastRegionNumber -and $t1LastRegionNumber -gt 0) 'True'
+$t1Functions = @($ScriptAst.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] })
+Check 'T1 no function below the MAIN line' (@($t1Functions | Where-Object { $_.Extent.StartLineNumber -gt $t1MainNumber }).Count) 0
+$t1MarkerInfo = @(for ($t1i = 0; $t1i -lt $t1Lines.Count; $t1i++) {
+    if ($t1Lines[$t1i] -match '^#(end)?region\b') { [pscustomobject]@{ Line = $t1i + 1; Text = $t1Lines[$t1i].TrimEnd() } }
+})
+$t1Outside = @(foreach ($t1Function in $t1Functions) {
+    $t1Before = @($t1MarkerInfo | Where-Object { $_.Line -lt $t1Function.Extent.StartLineNumber } | Select-Object -Last 1)
+    if ($t1Before.Count -eq 0 -or $t1Before[0].Text -notlike '#region *') { $t1Function.Name }
+})
+Check 'T1 every function sits inside a region' ($t1Outside -join ',') ''
+
+# Harness self-checks.
+[void]$script:LogLines.Clear()
+Write-Log 'harness check' 'WARN'
+Check 'T1 harness Write-Log records the line' (@($script:LogLines) -join '|') '[WARN] harness check'
+[void]$script:LogLines.Clear()
+$t1Folder = New-TestFolder 't1harness'
+Check 'T1 New-TestFolder creates the folder' (Test-Path -LiteralPath $t1Folder -PathType Container) 'True'
+Check 'T1 New-TestFolder name' ((Split-Path -Leaf $t1Folder) -match ('^vbrstd-t1harness-' + $PID + '-\d+$')) 'True'
+
+# Get-DefaultConfig
+$t1Cfg = Get-DefaultConfig
+Check 'T1 config is a hashtable' ($t1Cfg -is [hashtable]) 'True'
+Check 'T1 config has 8 settings' $t1Cfg.Count 8
+Check 'T1 config ServiceAccountName' $t1Cfg.ServiceAccountName 'svc_veeam'
+Check 'T1 config ServiceAccountDescription' $t1Cfg.ServiceAccountDescription 'Veeam maintenance account (PostgreSQL SSPI map)'
+Check 'T1 config description is 48 characters or fewer' ($t1Cfg.ServiceAccountDescription.Length -le 48) 'True'
+Check 'T1 config PasswordEnvVar' $t1Cfg.PasswordEnvVar 'VEEAM_SVC_PASSWORD'
+Check 'T1 config ServiceStopTimeoutSec' $t1Cfg.ServiceStopTimeoutSec 300
+Check 'T1 config VbrConnectTimeoutSec' $t1Cfg.VbrConnectTimeoutSec 600
+Check 'T1 config RollbackSettleSec' $t1Cfg.RollbackSettleSec 300
+Check 'T1 config BusyPersistentHours' $t1Cfg.BusyPersistentHours 6
+Check 'T1 config RetentionDays' $t1Cfg.RetentionDays 30
+
+# Get-ExitCodeTable
+$t1Exit = Get-ExitCodeTable
+Check 'T1 exit table is a hashtable' ($t1Exit -is [hashtable]) 'True'
+Check 'T1 exit table has 7 codes' $t1Exit.Count 7
+Check 'T1 exit codes' ('{0},{1},{2},{3},{4},{5},{6}' -f $t1Exit.OK, $t1Exit.ACTION_NEEDED, $t1Exit.RETRY, $t1Exit.UNSUPPORTED, $t1Exit.PREFLIGHT, $t1Exit.ESCALATE, $t1Exit.ESCALATE_NOW) '0,5,10,11,20,40,50'
+
+# Write-Log (the real one, loaded into a child scope; the harness version is replaced there only)
+$t1WriteLogAst = @($t1Functions | Where-Object { $_.Name -eq 'Write-Log' })
+Check 'T1 script defines Write-Log' $t1WriteLogAst.Count 1
+& {
+    . ([scriptblock]::Create($t1WriteLogAst[0].Extent.Text))
+    $t1Out = @(Write-Log -Message 'hello world' -Level 'WARN' 6>&1 | ForEach-Object { "$_" })
+    Check 'T1 Write-Log line format' ($t1Out[-1] -cmatch '^\d{2}:\d{2}:\d{2} \[WARN \] hello world$') 'True'
+    $t1Default = @(Write-Log 'plain' 6>&1 | ForEach-Object { "$_" })
+    Check 'T1 Write-Log default level is INFO' ($t1Default[-1] -cmatch '^\d{2}:\d{2}:\d{2} \[INFO \] plain$') 'True'
+    $t1Step = @(Write-Log 'next step' 'STEP' 6>&1 | ForEach-Object { "$_" })
+    Check 'T1 Write-Log STEP prints a blank line first' ('{0}|{1}' -f $t1Step.Count, $t1Step[0]) '2|'
+    $t1Empty = @(Write-Log '' 6>&1 | ForEach-Object { "$_" })
+    Check 'T1 Write-Log accepts an empty message' ($t1Empty[-1] -cmatch '^\d{2}:\d{2}:\d{2} \[INFO \] $') 'True'
+    Throws 'T1 Write-Log rejects an unknown level' { Write-Log -Message 'x' -Level 'DEBUG' }
+}
+
+# Format-ShortText
+Check 'T1 Format-ShortText collapses whitespace' (Format-ShortText -Text "  a`r`n`tb   c  ") 'a b c'
+Check 'T1 Format-ShortText empty text' (Format-ShortText -Text '') ''
+Check 'T1 Format-ShortText null text' (Format-ShortText -Text $null) ''
+$t1Long = Format-ShortText -Text ('x' * 1000)
+Check 'T1 Format-ShortText default cap is 900' $t1Long.Length 900
+Check 'T1 Format-ShortText cut text ends with three dots' $t1Long.EndsWith('...') 'True'
+Check 'T1 Format-ShortText custom cap' (Format-ShortText -Text 'abcdefghij' -MaxLength 8) 'abcde...'
+Check 'T1 Format-ShortText text at the cap is unchanged' (Format-ShortText -Text 'abcdefgh' -MaxLength 8) 'abcdefgh'
+
+# Invoke-Native
+$t1Cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
+$t1Fail = Invoke-Native -FilePath $t1Cmd -Arguments @('/c', 'echo oops 1>&2 & exit /b 3')
+Check 'T1 Invoke-Native returns the exit code' $t1Fail.ExitCode 3
+Check 'T1 Invoke-Native exit code is int' ($t1Fail.ExitCode -is [int]) 'True'
+Check 'T1 Invoke-Native returns clean stderr text' $t1Fail.StdErr 'oops'
+Check 'T1 Invoke-Native stdout stays clean' $t1Fail.StdOut ''
+$t1Ok = Invoke-Native -FilePath $t1Cmd -Arguments @('/c', 'echo one& echo two')
+Check 'T1 Invoke-Native success exit code' $t1Ok.ExitCode 0
+Check 'T1 Invoke-Native stdout lines' (($t1Ok.StdOut -split "`r?`n") -join ',') 'one,two'
+Check 'T1 Invoke-Native success has no stderr' $t1Ok.StdErr ''
+$t1In = Invoke-Native -FilePath $t1Cmd -Arguments @('/c', 'more') -StdinText "line1`nline2"
+Check 'T1 Invoke-Native passes stdin' (($t1In.StdOut -split "`r?`n") -join ',') 'line1,line2'
+$t1Missing = Invoke-Native -FilePath (Join-Path $env:TEMP "vbrstd-no-such-program-$PID.exe") -Arguments @('x')
+Check 'T1 Invoke-Native missing program gives -1' $t1Missing.ExitCode -1
+Check 'T1 Invoke-Native missing program explains' ($t1Missing.StdErr -like 'Could not run*') 'True'
+
+# Get-RegValue (throwaway HKCU key)
+$t1Key = "HKCU:\Software\VbrStdTest-T1-$PID"
+try {
+    [void](New-Item -Path $t1Key -Force)
+    [void](New-ItemProperty -Path $t1Key -Name 'Str' -Value 'abc' -PropertyType String -Force)
+    [void](New-ItemProperty -Path $t1Key -Name 'Num' -Value 5432 -PropertyType DWord -Force)
+    [void](New-ItemProperty -Path $t1Key -Name 'Empty' -Value '' -PropertyType String -Force)
+    Check 'T1 Get-RegValue string' (Get-RegValue -Path $t1Key -Name 'Str') 'abc'
+    $t1Num = Get-RegValue -Path $t1Key -Name 'Num'
+    Check 'T1 Get-RegValue DWord value' $t1Num 5432
+    Check 'T1 Get-RegValue DWord is int' ($t1Num -is [int]) 'True'
+    Check 'T1 Get-RegValue empty string is not null' ($null -ne (Get-RegValue -Path $t1Key -Name 'Empty')) 'True'
+    Check 'T1 Get-RegValue missing value is null' ($null -eq (Get-RegValue -Path $t1Key -Name 'Nope')) 'True'
+    Check 'T1 Get-RegValue missing key is null' ($null -eq (Get-RegValue -Path "$t1Key\NoSuchKey" -Name 'Str')) 'True'
+} finally {
+    Remove-Item -LiteralPath $t1Key -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Get-CfgValue
+$t1Obj = [pscustomobject]@{ A = 1; N = $null }
+$t1Hash = @{ B = 'two'; Z = $null }
+$t1Ordered = [ordered]@{ C = 3 }
+Check 'T1 Get-CfgValue property' (Get-CfgValue -Object $t1Obj -Name 'A') 1
+Check 'T1 Get-CfgValue missing property gives the default' (Get-CfgValue -Object $t1Obj -Name 'Q' -Default 9) 9
+Check 'T1 Get-CfgValue null property is null, not the default' ($null -eq (Get-CfgValue -Object $t1Obj -Name 'N' -Default 9)) 'True'
+Check 'T1 Get-CfgValue no default gives null' ($null -eq (Get-CfgValue -Object $t1Obj -Name 'Q')) 'True'
+Check 'T1 Get-CfgValue hashtable key' (Get-CfgValue -Object $t1Hash -Name 'B') 'two'
+Check 'T1 Get-CfgValue missing hashtable key' (Get-CfgValue -Object $t1Hash -Name 'Q' -Default 'd') 'd'
+Check 'T1 Get-CfgValue hashtable Count is not a key' (Get-CfgValue -Object $t1Hash -Name 'Count' -Default 'd') 'd'
+Check 'T1 Get-CfgValue null hashtable value' ($null -eq (Get-CfgValue -Object $t1Hash -Name 'Z' -Default 'd')) 'True'
+Check 'T1 Get-CfgValue ordered key' (Get-CfgValue -Object $t1Ordered -Name 'C') 3
+Check 'T1 Get-CfgValue null object' (Get-CfgValue -Object $null -Name 'A' -Default 7) 7
+
+# ConvertFrom-JsonArrayText
+Check 'T1 JSON empty array' (@(ConvertFrom-JsonArrayText -Text '[]').Count) 0
+Check 'T1 JSON empty text' (@(ConvertFrom-JsonArrayText -Text '').Count) 0
+Check 'T1 JSON null' (@(ConvertFrom-JsonArrayText -Text 'null').Count) 0
+$t1One = @(ConvertFrom-JsonArrayText -Text '[{"pid":12,"usename":"postgres"}]')
+Check 'T1 JSON one item' $t1One.Count 1
+Check 'T1 JSON one item field' $t1One[0].usename 'postgres'
+$t1Two = @(ConvertFrom-JsonArrayText -Text '[{"a":1},{"a":2}]')
+Check 'T1 JSON two items' $t1Two.Count 2
+Check 'T1 JSON second item field' $t1Two[1].a 2
+Check 'T1 JSON scalar items' (@(ConvertFrom-JsonArrayText -Text '[1,2,3]') -join ',') '1,2,3'
+$t1JsonErrorId = ''
+try { $null = ConvertFrom-JsonArrayText -Text '[{' } catch { $t1JsonErrorId = $_.FullyQualifiedErrorId }
+Check 'T1 JSON invalid text throws a JSON error' ($t1JsonErrorId -like '*ConvertFromJsonCommand') 'True'
+
+# Write-AtomicText and Write-AtomicJson
+$t1Dir = New-TestFolder 't1atomic'
+$t1File = Join-Path $t1Dir 'sub\out.txt'
+$t1Text = 'caf' + [char]0x00E9 + "`r`nline2"
+Write-AtomicText -Path $t1File -Text $t1Text
+Check 'T1 Write-AtomicText creates the parent folder' (Test-Path -LiteralPath $t1File) 'True'
+$t1Bytes = [System.IO.File]::ReadAllBytes($t1File)
+Check 'T1 Write-AtomicText writes no BOM' ($t1Bytes[0] -ne 0xEF) 'True'
+Check 'T1 Write-AtomicText writes UTF-8 bytes' $t1Bytes.Length 12
+Check 'T1 Write-AtomicText text round trip' ([System.Text.Encoding]::UTF8.GetString($t1Bytes) -ceq $t1Text) 'True'
+Write-AtomicText -Path $t1File -Text 'second'
+Check 'T1 Write-AtomicText replaces an existing file' ([System.IO.File]::ReadAllText($t1File)) 'second'
+Check 'T1 Write-AtomicText leaves no temp file' (@(Get-ChildItem -LiteralPath (Join-Path $t1Dir 'sub') -Force).Count) 1
+Write-AtomicText -Path $t1File -Text ''
+Check 'T1 Write-AtomicText writes empty text' ((Get-Item -LiteralPath $t1File).Length) 0
+$t1Json = Join-Path $t1Dir 'result.json'
+Write-AtomicJson -Path $t1Json -Object ([ordered]@{ Name = 'x'; Number = 3; Nested = @{ Inner = @(1, 2) } })
+$t1JsonBytes = [System.IO.File]::ReadAllBytes($t1Json)
+Check 'T1 Write-AtomicJson writes no BOM' ($t1JsonBytes[0] -ne 0xEF) 'True'
+$t1Back = [System.IO.File]::ReadAllText($t1Json) | ConvertFrom-Json
+Check 'T1 Write-AtomicJson string field' $t1Back.Name 'x'
+Check 'T1 Write-AtomicJson number field' $t1Back.Number 3
+Check 'T1 Write-AtomicJson keeps nested arrays' (@($t1Back.Nested.Inner) -join ',') '1,2'
+
+# ===================== RESULT =====================
+foreach ($testFolder in @($script:TestFolders)) {
+    Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue
+}
+Write-Host ''
+if ($script:SkipCount -gt 0) { Write-Host "($script:SkipCount skipped)" }
+Write-Host "RESULT: $script:PassCount passed, $script:FailCount failed"
+if ($script:FailCount -gt 0) { exit 1 }
+exit 0
