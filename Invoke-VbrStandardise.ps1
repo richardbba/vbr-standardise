@@ -2837,6 +2837,19 @@ function Get-PgIdentEntries {
     return $entries.ToArray()
 }
 
+# A set of names that compares case-insensitively, as PostgreSQL compares SSPI names.
+# Empty and $null names are skipped. Every name lookup in this region goes through this
+# one set, so the de-duplication, the check and the render cannot disagree on case. The
+# set is returned with the unary comma so that PowerShell does not unroll it into a list.
+function New-IdentNameSet {
+    param([AllowNull()][AllowEmptyCollection()][string[]] $Names = @())
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in @($Names)) {
+        if (-not [string]::IsNullOrEmpty($name)) { [void]$set.Add($name) }
+    }
+    return ,$set
+}
+
 # The names the veeam map must hold (spec 7.3): SYSTEM, then svc_veeam, then the
 # accounts of Veeam services that do not run as LocalSystem. Duplicates are removed
 # case-insensitively (PostgreSQL compares SSPI names case-insensitively); the first
@@ -2846,7 +2859,7 @@ function Get-RequiredIdentNames {
         [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $SvcMapName,
         [string[]] $ServiceAccountMapNames = @()
     )
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    $seen = New-IdentNameSet
     $names = New-Object System.Collections.Generic.List[string]
     foreach ($name in (@('SYSTEM@NT AUTHORITY', $SvcMapName) + @($ServiceAccountMapNames))) {
         if ([string]::IsNullOrEmpty($name)) { continue }
@@ -2855,20 +2868,25 @@ function Get-RequiredIdentNames {
     return $names.ToArray()
 }
 
-# STANDARD when the veeam map holds every required name mapped to postgres and nothing
-# else. MISSING_ENTRY when a required name has no veeam entry to postgres; EXTRA_ENTRY
-# when a veeam entry is not required or maps to another role. MISSING wins over EXTRA.
-# System names compare case-insensitively. The map name and the role are
-# case-sensitive, as in PostgreSQL: 'Veeam' is another map, 'Postgres' another role.
-function Get-PgIdentStatus {
+# The one place that decides how a pg_ident.conf maps against the required names. Both
+# Get-PgIdentStatus (the check) and New-PgIdentText (the render) read its result, so the
+# text the renderer writes is always the text the checker calls STANDARD.
+# Only the map named exactly 'veeam' is managed; the map name and the role are
+# case-sensitive, as in PostgreSQL ('Veeam' is another map, 'Postgres' another role).
+# System names compare case-insensitively. A veeam entry is kept when it maps a required
+# name to postgres; any other veeam entry is extra (this includes a regex system user,
+# which is never a required literal, and a short line). A required name that appears
+# twice is not extra. Returns { ExtraLineIndexes: int[]; MissingNames: string[] }:
+# the LineIndex of every extra entry (-1 for an entry that has none), and every required
+# name with no kept entry, once each, in RequiredNames order.
+function Get-PgIdentFindings {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Entries,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $RequiredNames
     )
-    $required = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($name in $RequiredNames) { if (-not [string]::IsNullOrEmpty($name)) { [void]$required.Add($name) } }
-    $mapped = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
-    $extra = $false
+    $required = New-IdentNameSet -Names $RequiredNames
+    $mapped = New-IdentNameSet
+    $extraLineIndexes = New-Object System.Collections.Generic.List[int]
     foreach ($entry in $Entries) {
         if ([string](Get-CfgValue -Object $entry -Name 'Map' -Default '') -cne 'veeam') { continue }
         $systemUser = [string](Get-CfgValue -Object $entry -Name 'SystemUser' -Default '')
@@ -2876,13 +2894,33 @@ function Get-PgIdentStatus {
         if ($pgUser -ceq 'postgres' -and $required.Contains($systemUser)) {
             [void]$mapped.Add($systemUser)
         } else {
-            $extra = $true
+            $extraLineIndexes.Add([int](Get-CfgValue -Object $entry -Name 'LineIndex' -Default -1))
         }
     }
-    foreach ($name in $required) {
-        if (-not $mapped.Contains($name)) { return 'MISSING_ENTRY' }
+    $missingNames = New-Object System.Collections.Generic.List[string]
+    foreach ($name in $RequiredNames) {
+        if ([string]::IsNullOrEmpty($name) -or $mapped.Contains($name)) { continue }
+        $missingNames.Add($name)
+        [void]$mapped.Add($name)
     }
-    if ($extra) { return 'EXTRA_ENTRY' }
+    return [pscustomobject]@{
+        ExtraLineIndexes = $extraLineIndexes.ToArray()
+        MissingNames     = $missingNames.ToArray()
+    }
+}
+
+# STANDARD when the veeam map holds every required name mapped to postgres and nothing
+# else. MISSING_ENTRY when a required name has no veeam entry to postgres; EXTRA_ENTRY
+# when a veeam entry is not required or maps to another role. MISSING wins over EXTRA.
+# The rules are in Get-PgIdentFindings.
+function Get-PgIdentStatus {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Entries,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $RequiredNames
+    )
+    $findings = Get-PgIdentFindings -Entries $Entries -RequiredNames $RequiredNames
+    if ($findings.MissingNames.Count -gt 0) { return 'MISSING_ENTRY' }
+    if ($findings.ExtraLineIndexes.Count -gt 0) { return 'EXTRA_ENTRY' }
     return 'STANDARD'
 }
 
@@ -2890,8 +2928,9 @@ function Get-PgIdentStatus {
 # A veeam line that is not required, or maps to another role, gets the ASCII prefix
 # '# [VbrStandardise <Stamp>] ' in front of its original characters. Each required name
 # without a veeam line to postgres is appended as: veeam   "<name>"   postgres
-# New lines are ASCII only: a name that is not printable ASCII, or holds a double
-# quote, is refused (throw) rather than written.
+# Which lines and names those are comes from Get-PgIdentFindings, the same result
+# Get-PgIdentStatus reads. New lines are ASCII only: a name that is not printable ASCII,
+# or holds a double quote, is refused (throw) rather than written.
 function New-PgIdentText {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]] $Lines,
@@ -2900,35 +2939,19 @@ function New-PgIdentText {
         [Parameter(Mandatory = $true)][string] $Stamp
     )
     if (-not (Test-AsciiText -Text $Stamp)) { throw "New-PgIdentText: the stamp '$Stamp' is not printable ASCII." }
-    $required = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($name in $RequiredNames) { if (-not [string]::IsNullOrEmpty($name)) { [void]$required.Add($name) } }
-    $mapped = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    $findings = Get-PgIdentFindings -Entries @(Get-PgIdentEntries -Lines $Lines) -RequiredNames $RequiredNames
+    $extra = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($index in $findings.ExtraLineIndexes) { [void]$extra.Add($index) }
     $prefix = "# [VbrStandardise $Stamp] "
     $out = New-Object System.Collections.Generic.List[string]
-    foreach ($line in $Lines) {
-        $t = @(Split-ConfTokens -Line $line)
-        if ($t.Count -eq 0 -or $t[0] -cne 'veeam') {
-            $out.Add($line)
-            continue
-        }
-        $systemUser = ''
-        $pgUser = ''
-        if ($t.Count -gt 1) { $systemUser = $t[1] }
-        if ($t.Count -gt 2) { $pgUser = $t[2] }
-        if ($pgUser -ceq 'postgres' -and $required.Contains($systemUser)) {
-            $out.Add($line)
-            [void]$mapped.Add($systemUser)
-        } else {
-            $out.Add($prefix + $line)
-        }
+    for ($i = 0; $i -lt $Lines.Length; $i++) {
+        if ($extra.Contains($i)) { $out.Add($prefix + $Lines[$i]) } else { $out.Add($Lines[$i]) }
     }
-    foreach ($name in $RequiredNames) {
-        if ([string]::IsNullOrEmpty($name) -or $mapped.Contains($name)) { continue }
+    foreach ($name in $findings.MissingNames) {
         if (-not (Test-AsciiText -Text $name) -or $name.Contains('"')) {
             throw "New-PgIdentText: the name '$name' is not printable ASCII or holds a double quote. It is not written to pg_ident.conf."
         }
         $out.Add('veeam   "' + $name + '"   postgres')
-        [void]$mapped.Add($name)
     }
     return (Join-ConfLines -Lines $out.ToArray() -LineEnding $LineEnding)
 }

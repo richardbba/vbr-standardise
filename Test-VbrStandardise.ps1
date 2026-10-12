@@ -2631,6 +2631,108 @@ veeam   "svc_veeam@VBR-PILOT01"   postgres
         Check 'T10 render checks ran without an error' $_.Exception.Message ''
     }
 }
+
+# One decision, two readers. Get-PgIdentFindings is the only place that decides how a
+# pg_ident.conf maps against the required names (which veeam lines stay, which are
+# extra, which names are missing). Get-PgIdentStatus (the check) and New-PgIdentText
+# (the render) both read it, so they cannot disagree.
+# New-IdentNameSet and Get-PgIdentFindings.
+& {
+    try {
+        $required = @(Get-RequiredIdentNames -SvcMapName $T10Svc)
+        $entriesOf = { param([string] $Text) @(Get-PgIdentEntries -Lines @(Split-ConfLines -Text $Text)) }
+        $findingsOf = { param([string] $Text, [string[]] $Names) Get-PgIdentFindings -Entries @(& $entriesOf $Text) -RequiredNames $Names }
+        $show = { param($F) '{0}/{1}' -f ($F.ExtraLineIndexes -join '|'), ($F.MissingNames -join '|') }
+
+        $set = New-IdentNameSet -Names @('SYSTEM@NT AUTHORITY', 'system@nt authority', '', $null, 'svc_veeam@VBR-PILOT01')
+        Check 'T10 a name set arrives as a set, not an unrolled list' ($set -is [System.Collections.Generic.HashSet[string]]) $true
+        Check 'T10 a name set drops duplicates in another case and empty names' $set.Count 2
+        Check 'T10 a name set finds a name in another case' $set.Contains('Svc_Veeam@vbr-pilot01') $true
+        Check 'T10 a name set never holds the empty name' $set.Contains('') $false
+        $emptySet = New-IdentNameSet
+        Check 'T10 a name set built from nothing is an empty set' (($emptySet -is [System.Collections.Generic.HashSet[string]]) -and $emptySet.Count -eq 0) $true
+
+        Check 'T10 findings: pilot has Administrator (line 2) as extra, nothing missing' (& $show (& $findingsOf $T10Pilot $required)) '2/'
+        Check 'T10 findings: Veeam default has Administrator extra and svc_veeam missing' (& $show (& $findingsOf $T10Veeam $required)) '2/svc_veeam@VBR-PILOT01'
+        Check 'T10 findings: a comments-only file misses both names, in required order' (& $show (& $findingsOf $T10Empty $required)) '/SYSTEM@NT AUTHORITY|svc_veeam@VBR-PILOT01'
+        Check 'T10 findings: another map is ignored' (& $show (& $findingsOf $T10OtherMap $required)) '/'
+        Check 'T10 findings: svc_veeam to another role is extra and missing' (& $show (& $findingsOf $T10OtherRole $required)) '1/svc_veeam@VBR-PILOT01'
+        Check 'T10 findings: a regex system user is extra' (& $show (& $findingsOf ($T10OtherMap + "`n" + 'veeam /^(.*)@VBR-PILOT01$ postgres') $required)) '4/'
+        Check 'T10 findings: a required line twice is not extra' (& $show (& $findingsOf ($T10OtherMap + "`n" + 'veeam "SYSTEM@NT AUTHORITY" postgres') $required)) '/'
+        Check 'T10 findings: no required names makes every veeam line extra' (& $show (& $findingsOf $T10Pilot @())) '1|2|3/'
+        Check 'T10 findings: a required name given in two cases is missing once' (& $show (& $findingsOf $T10Empty @('SYSTEM@NT AUTHORITY', 'system@nt authority'))) '/SYSTEM@NT AUTHORITY'
+        $hashEntries = @(@{ Map = 'veeam'; SystemUser = 'who@CORP'; PgUser = 'postgres' })
+        Check 'T10 findings: an entry without LineIndex reports -1' (& $show (Get-PgIdentFindings -Entries $hashEntries -RequiredNames @('SYSTEM@NT AUTHORITY'))) '-1/SYSTEM@NT AUTHORITY'
+    } catch {
+        Check 'T10 findings checks ran without an error' $_.Exception.Message ''
+    }
+}
+
+# The check and the render agree on every fixture, because both read the same findings.
+& {
+    try {
+        $required = @(Get-RequiredIdentNames -SvcMapName $T10Svc)
+        $withService = @(Get-RequiredIdentNames -SvcMapName $T10Svc -ServiceAccountMapNames @('veeamsvc@CORP'))
+        $cases = @(
+            @{ Name = 'comments only'; Text = $T10Empty; Names = $required },
+            @{ Name = 'Veeam default'; Text = $T10Veeam; Names = $required },
+            @{ Name = 'pilot'; Text = $T10Pilot; Names = $required },
+            @{ Name = 'other map'; Text = $T10OtherMap; Names = $required },
+            @{ Name = 'other role'; Text = $T10OtherRole; Names = $required },
+            @{ Name = 'role case'; Text = ('veeam "SYSTEM@NT AUTHORITY" Postgres' + "`n" + 'veeam "svc_veeam@VBR-PILOT01" postgres'); Names = $required },
+            @{ Name = 'name case'; Text = ('veeam "system@nt authority" postgres' + "`n" + 'veeam SVC_VEEAM@vbr-pilot01 postgres'); Names = $required },
+            @{ Name = 'regex'; Text = ($T10OtherMap + "`n" + 'veeam /^(.*)@VBR-PILOT01$ postgres'); Names = $required },
+            @{ Name = 'required twice'; Text = ($T10OtherMap + "`n" + 'veeam "SYSTEM@NT AUTHORITY" postgres'); Names = $required },
+            @{ Name = 'service line, required'; Text = ($T10OtherMap + "`n" + 'veeam "VEEAMSVC@corp" postgres'); Names = $withService },
+            @{ Name = 'service line, not required'; Text = ($T10OtherMap + "`n" + 'veeam "VEEAMSVC@corp" postgres'); Names = $required },
+            @{ Name = 'short veeam line'; Text = ('veeam' + "`n" + $T10OtherMap); Names = $required },
+            @{ Name = 'trailing comment'; Text = ('veeam "SYSTEM@NT AUTHORITY" postgres # keep' + "`n" + 'veeam "svc_veeam@VBR-PILOT01" postgres # keep'); Names = $required },
+            @{ Name = 'no required names'; Text = $T10Pilot; Names = @() }
+        )
+        foreach ($case in $cases) {
+            $caseName = $case.Name
+            $lines = @(Split-ConfLines -Text $case.Text)
+            $normal = Join-ConfLines -Lines $lines -LineEnding "`n"
+            $entries = @(Get-PgIdentEntries -Lines $lines)
+            $findings = Get-PgIdentFindings -Entries $entries -RequiredNames $case.Names
+            $status = Get-PgIdentStatus -Entries $entries -RequiredNames $case.Names
+            $out = New-PgIdentText -Lines $lines -RequiredNames $case.Names -LineEnding "`n" -Stamp $T10Stamp
+            $outLines = @(Split-ConfLines -Text $out)
+            $outStatus = Get-PgIdentStatus -Entries @(Get-PgIdentEntries -Lines $outLines) -RequiredNames $case.Names
+
+            $expectedStatus = 'STANDARD'
+            if ($findings.MissingNames.Count -gt 0) { $expectedStatus = 'MISSING_ENTRY' } elseif ($findings.ExtraLineIndexes.Count -gt 0) { $expectedStatus = 'EXTRA_ENTRY' }
+            Check "T10 agreement ($caseName): the status follows the findings" $status $expectedStatus
+            Check "T10 agreement ($caseName): the rendered text is STANDARD" $outStatus 'STANDARD'
+            Check "T10 agreement ($caseName): the render changes the text exactly when the status is not STANDARD" (($out -ceq $normal) -eq ($status -ceq 'STANDARD')) $true
+            Check "T10 agreement ($caseName): lines commented out = extra entries" (@($outLines | Where-Object { $_.StartsWith($T10Prefix) }).Count) $findings.ExtraLineIndexes.Count
+            Check "T10 agreement ($caseName): lines appended = missing names" ($outLines.Count - $lines.Count) $findings.MissingNames.Count
+        }
+    } catch {
+        Check 'T10 agreement checks ran without an error' $_.Exception.Message ''
+    }
+}
+
+# The decision is written once: the check and the render call Get-PgIdentFindings and
+# neither holds the veeam map or postgres role rule itself.
+& {
+    try {
+        $t10Fn = @{}
+        foreach ($t10Node in $ScriptAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) { $t10Fn[$t10Node.Name] = $t10Node }
+        $t10Calls = { param([string] $FunctionName) @($t10Fn[$FunctionName].FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.GetCommandName() }) }
+        $t10Strings = { param([string] $FunctionName) @($t10Fn[$FunctionName].FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value }) }
+        Check 'T10 Get-PgIdentStatus takes its decision from Get-PgIdentFindings' ((& $t10Calls 'Get-PgIdentStatus') -contains 'Get-PgIdentFindings') $true
+        Check 'T10 New-PgIdentText takes its decision from Get-PgIdentFindings' ((& $t10Calls 'New-PgIdentText') -contains 'Get-PgIdentFindings') $true
+        Check 'T10 New-PgIdentText reads the entries through Get-PgIdentEntries, not its own token split' (((& $t10Calls 'New-PgIdentText') -contains 'Get-PgIdentEntries') -and -not ((& $t10Calls 'New-PgIdentText') -contains 'Split-ConfTokens')) $true
+        Check 'T10 Get-PgIdentStatus holds no map or role rule of its own' (@((& $t10Strings 'Get-PgIdentStatus') | Where-Object { $_ -ceq 'veeam' -or $_ -ceq 'postgres' }).Count) 0
+        Check 'T10 New-PgIdentText holds no map or role rule of its own' (@((& $t10Strings 'New-PgIdentText') | Where-Object { $_ -ceq 'veeam' -or $_ -ceq 'postgres' }).Count) 0
+        Check 'T10 Get-PgIdentFindings holds the map rule once' (@((& $t10Strings 'Get-PgIdentFindings') | Where-Object { $_ -ceq 'veeam' }).Count) 1
+        Check 'T10 Get-PgIdentFindings holds the role rule once' (@((& $t10Strings 'Get-PgIdentFindings') | Where-Object { $_ -ceq 'postgres' }).Count) 1
+        Check 'T10 Get-RequiredIdentNames builds its set through New-IdentNameSet' ((& $t10Calls 'Get-RequiredIdentNames') -contains 'New-IdentNameSet') $true
+    } catch {
+        Check 'T10 single-decision checks ran without an error' $_.Exception.Message ''
+    }
+}
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue
