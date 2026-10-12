@@ -2958,6 +2958,270 @@ function New-PgIdentText {
 #endregion PgIdent
 
 #region Psql
+# Runs one SQL text through psql as the current Windows account (SSPI) and the
+# postgres role. libpq reads PGUSER, PGHOST, PGPASSWORD, PGSERVICE, PGSSLMODE and a
+# pgpass file; any of them could make a login work for a reason other than SSPI, so
+# they are cleared for the call, PGPASSFILE points at nul, and every old value is put
+# back in finally. -X skips psqlrc (it could add text to stdout) and -w never
+# prompts. With -ViaStdin the SQL goes to psql's stdin (-f -), not its command line.
+function Invoke-PgQuery {
+    param(
+        [Parameter(Mandatory)][string] $Psql,
+        [Parameter(Mandatory)][int]    $Port,
+        [Parameter(Mandatory)][string] $HostAddress,
+        [Parameter(Mandatory)][string] $Database,
+        [Parameter(Mandatory)][string] $Sql,
+        [switch] $ViaStdin
+    )
+    $clearNames = @('PGUSER', 'PGHOST', 'PGPASSWORD', 'PGSERVICE', 'PGSSLMODE')
+    $setValues  = [ordered]@{ PGPASSFILE = 'nul'; PGCONNECT_TIMEOUT = '10' }
+    $allNames   = @($clearNames) + @($setValues.Keys)
+    $saved = @{}
+    foreach ($name in $allNames) {
+        $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
+    $psqlArgs = @('-X', '-w', '-h', $HostAddress, '-p', "$Port", '-U', 'postgres', '-d', $Database, '-t', '-A')
+    $result = $null
+    try {
+        foreach ($name in $clearNames) { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
+        foreach ($name in @($setValues.Keys)) { [Environment]::SetEnvironmentVariable($name, $setValues[$name], 'Process') }
+        if ($ViaStdin) {
+            $result = Invoke-Native -FilePath $Psql -Arguments ($psqlArgs + @('-f', '-')) -StdinText $Sql
+        } else {
+            $result = Invoke-Native -FilePath $Psql -Arguments ($psqlArgs + @('-c', $Sql))
+        }
+    } finally {
+        foreach ($name in $allNames) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
+    }
+    return [pscustomobject]@{
+        ExitCode = $result.ExitCode
+        StdOut   = "$($result.StdOut)"
+        StdErr   = "$($result.StdErr)"
+    }
+}
+
+# Sorts a psql stderr text into AUTH (the server refused the login), CONNECT (no
+# server answered) or OTHER. AUTH is tested first: a refused login also says
+# "connection to server ... failed". The SQLSTATE codes catch a server whose
+# lc_messages is not English.
+function Get-PsqlFailureKind {
+    param([string] $StdErr)
+    $text = "$StdErr"
+    if ($text -match 'SSPI authentication failed|no pg_hba\.conf entry|no match in usermap|password authentication failed|no password supplied|\b28000:|\b28P01:') {
+        return 'AUTH'
+    }
+    if ($text -match 'Connection refused|could not connect|timeout expired|\b10061\b') {
+        return 'CONNECT'
+    }
+    return 'OTHER'
+}
+
+# Spec 7.9: SELECT 1 as postgres on every listening loopback address. Passed only
+# when every address answers 1. An empty address list is never a pass.
+function Test-PgSspiLogin {
+    param(
+        [Parameter(Mandatory)][string] $Psql,
+        [Parameter(Mandatory)][int]    $Port,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]] $Addresses,
+        [Parameter(Mandatory)][string] $Database
+    )
+    $results = New-Object System.Collections.ArrayList
+    $passed = $true
+    foreach ($address in @($Addresses)) {
+        $res = Invoke-PgQuery -Psql $Psql -Port $Port -HostAddress $address -Database $Database -Sql 'SELECT 1;'
+        $out = "$($res.StdOut)".Trim()
+        if ($res.ExitCode -eq 0 -and $out -ceq '1') {
+            $kind = 'OK'
+        } elseif ($res.ExitCode -eq 0) {
+            $kind = 'OTHER'
+        } else {
+            $kind = Get-PsqlFailureKind -StdErr $res.StdErr
+        }
+        if ($kind -ne 'OK') { $passed = $false }
+        [void]$results.Add([pscustomobject]@{
+            Address  = $address
+            ExitCode = $res.ExitCode
+            Kind     = $kind
+            StdErr   = "$($res.StdErr)"
+        })
+        if ($kind -eq 'OK') {
+            Write-Log -Message "SSPI login as postgres to '$Database' on ${address}: OK" -Level OK
+        } else {
+            Write-Log -Message (Format-ShortText -Text "SSPI login as postgres to '$Database' on ${address}: $kind (exit $($res.ExitCode)) $($res.StdErr)" -MaxLength 400) -Level WARN
+        }
+    }
+    if ($results.Count -eq 0) {
+        $passed = $false
+        Write-Log -Message 'SSPI login test had no listening address to test' -Level WARN
+    }
+    return [pscustomobject]@{ Passed = $passed; Results = $results.ToArray() }
+}
+
+# SHOW hba_file returns a forward-slash path on Windows. Turn both sides into one
+# comparable form: backslashes, full path, no trailing backslash, lower case.
+function ConvertTo-ComparablePath {
+    param([string] $Path)
+    $text = "$Path".Trim().Trim('"').Trim()
+    if ($text -eq '') { return '' }
+    $text = $text.Replace('/', '\')
+    try { $text = [IO.Path]::GetFullPath($text) } catch { $text = $text }
+    return $text.TrimEnd('\').ToLowerInvariant()
+}
+
+function Test-SamePath {
+    param([string] $Left, [string] $Right)
+    $l = ConvertTo-ComparablePath -Path $Left
+    $r = ConvertTo-ComparablePath -Path $Right
+    return ($l -ne '' -and $l -ceq $r)
+}
+
+# Spec 7.9 second half: the files PostgreSQL loads parse without errors, and the
+# live hba_file and ident_file are the files this script edits. The
+# pg_ident_file_mappings view exists from PostgreSQL 15 only.
+function Test-PgConfigHealth {
+    param(
+        [Parameter(Mandatory)][string] $Psql,
+        [Parameter(Mandatory)][int]    $Port,
+        [Parameter(Mandatory)][string] $Address,
+        [Parameter(Mandatory)][string] $Database,
+        [Parameter(Mandatory)][int]    $Major,
+        [Parameter(Mandatory)][string] $HbaPath,
+        [Parameter(Mandatory)][string] $IdentPath
+    )
+    $problems = New-Object System.Collections.ArrayList
+    $countChecks = [ordered]@{ 'pg_hba_file_rules' = 'SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL;' }
+    if ($Major -ge 15) {
+        $countChecks['pg_ident_file_mappings'] = 'SELECT count(*) FROM pg_ident_file_mappings WHERE error IS NOT NULL;'
+    }
+    foreach ($view in @($countChecks.Keys)) {
+        $res = Invoke-PgQuery -Psql $Psql -Port $Port -HostAddress $Address -Database $Database -Sql $countChecks[$view]
+        $out = "$($res.StdOut)".Trim()
+        if ($res.ExitCode -ne 0) {
+            [void]$problems.Add((Format-ShortText -Text "$view query failed (exit $($res.ExitCode)): $($res.StdErr)" -MaxLength 300))
+        } elseif ($out -cne '0') {
+            [void]$problems.Add("$view reports '$out' line(s) with errors")
+        }
+    }
+    $fileChecks = [ordered]@{ 'hba_file' = $HbaPath; 'ident_file' = $IdentPath }
+    foreach ($setting in @($fileChecks.Keys)) {
+        $res = Invoke-PgQuery -Psql $Psql -Port $Port -HostAddress $Address -Database $Database -Sql "SHOW $setting;"
+        $out = "$($res.StdOut)".Trim()
+        if ($res.ExitCode -ne 0) {
+            [void]$problems.Add((Format-ShortText -Text "SHOW $setting failed (exit $($res.ExitCode)): $($res.StdErr)" -MaxLength 300))
+        } elseif (-not (Test-SamePath -Left $out -Right $fileChecks[$setting])) {
+            [void]$problems.Add("live $setting is '$out', not '$($fileChecks[$setting])'")
+        }
+    }
+    if ($problems.Count -eq 0) {
+        return [pscustomobject]@{ Ok = $true; Detail = 'pg_hba.conf and pg_ident.conf load without errors and are the files this script edits' }
+    }
+    return [pscustomobject]@{ Ok = $false; Detail = ($problems -join '; ') }
+}
+
+# Spec 7.4: what SYSTEM can see over SSPI. PasswordSet comes from
+# "rolpassword IS NULL" only; the hash is never read. Backends are the other client
+# sessions; start times come back as epoch milliseconds and become UTC DateTimes.
+function Get-PgLiveState {
+    param(
+        [Parameter(Mandatory)][string] $Psql,
+        [Parameter(Mandatory)][int]    $Port,
+        [Parameter(Mandatory)][string] $Address,
+        [Parameter(Mandatory)][string] $Database
+    )
+    $failed = [pscustomobject]@{ Ok = $false; PasswordSet = $false; Backends = @() }
+    $passwordSql = "SELECT CASE WHEN rolpassword IS NULL THEN 'NONE' ELSE 'SET' END FROM pg_authid WHERE rolname = 'postgres';"
+    $pw = Invoke-PgQuery -Psql $Psql -Port $Port -HostAddress $Address -Database $Database -Sql $passwordSql
+    $pwText = "$($pw.StdOut)".Trim()
+    if ($pw.ExitCode -ne 0 -or ($pwText -cne 'NONE' -and $pwText -cne 'SET')) {
+        Write-Log -Message (Format-ShortText -Text "Could not read whether the postgres role has a password (exit $($pw.ExitCode)): $($pw.StdErr)" -MaxLength 400) -Level WARN
+        return $failed
+    }
+    $backendSql = "SELECT COALESCE(json_agg(json_build_object('pid', pid, 'usename', usename, 'datname', datname, 'client_addr', host(client_addr), 'start_ms', (extract(epoch FROM backend_start) * 1000)::bigint) ORDER BY pid)::text, '[]') FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid();"
+    $be = Invoke-PgQuery -Psql $Psql -Port $Port -HostAddress $Address -Database $Database -Sql $backendSql
+    if ($be.ExitCode -ne 0) {
+        Write-Log -Message (Format-ShortText -Text "Could not read pg_stat_activity (exit $($be.ExitCode)): $($be.StdErr)" -MaxLength 400) -Level WARN
+        return $failed
+    }
+    try {
+        $items = @(ConvertFrom-JsonArrayText -Text "$($be.StdOut)".Trim())
+    } catch {
+        Write-Log -Message (Format-ShortText -Text "Could not parse pg_stat_activity output: $($_.Exception.Message)" -MaxLength 400) -Level WARN
+        return $failed
+    }
+    $epoch = New-Object DateTime 1970, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc)
+    $backends = New-Object System.Collections.ArrayList
+    foreach ($item in $items) {
+        if ($null -eq $item) { continue }
+        $ms = Get-CfgValue -Object $item -Name 'start_ms' -Default $null
+        $start = New-Object DateTime 1, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc)
+        if ($null -ne $ms -and "$ms" -ne '') { $start = $epoch.AddMilliseconds([double]$ms) }
+        [void]$backends.Add([pscustomobject]@{
+            Pid             = [int](Get-CfgValue -Object $item -Name 'pid' -Default 0)
+            UseName         = "$(Get-CfgValue -Object $item -Name 'usename' -Default '')"
+            DatName         = "$(Get-CfgValue -Object $item -Name 'datname' -Default '')"
+            ClientAddr      = "$(Get-CfgValue -Object $item -Name 'client_addr' -Default '')"
+            BackendStartUtc = $start
+        })
+    }
+    return [pscustomobject]@{
+        Ok          = $true
+        PasswordSet = ($pwText -ceq 'SET')
+        Backends    = $backends.ToArray()
+    }
+}
+
+# Spec 7.6 Path B step 13: login roles other than postgres that still have a
+# password. rolpassword is only a filter here. On a failed query the list is empty
+# and a warning is logged, because this list is information only.
+function Get-OtherPasswordRoles {
+    param(
+        [Parameter(Mandatory)][string] $Psql,
+        [Parameter(Mandatory)][int]    $Port,
+        [Parameter(Mandatory)][string] $Address,
+        [Parameter(Mandatory)][string] $Database
+    )
+    $sql = "SELECT COALESCE(json_agg(rolname ORDER BY rolname)::text, '[]') FROM pg_authid WHERE rolcanlogin AND rolname <> 'postgres' AND rolpassword IS NOT NULL;"
+    $res = Invoke-PgQuery -Psql $Psql -Port $Port -HostAddress $Address -Database $Database -Sql $sql
+    if ($res.ExitCode -ne 0) {
+        Write-Log -Message (Format-ShortText -Text "Could not list other login roles with a password (exit $($res.ExitCode)): $($res.StdErr)" -MaxLength 400) -Level WARN
+        return [string[]]@()
+    }
+    try {
+        $names = @(ConvertFrom-JsonArrayText -Text "$($res.StdOut)".Trim())
+    } catch {
+        Write-Log -Message (Format-ShortText -Text "Could not parse the list of other login roles with a password: $($_.Exception.Message)" -MaxLength 400) -Level WARN
+        return [string[]]@()
+    }
+    return [string[]]@($names | Where-Object { $null -ne $_ } | ForEach-Object { "$_" })
+}
+
+# Spec 7.10: remove the postgres password. The ALTER goes through stdin, then a
+# fresh session checks "rolpassword IS NULL". psql -f - can exit 0 after an SQL
+# error, so only the re-check proves the result.
+function Clear-PostgresPassword {
+    param(
+        [Parameter(Mandatory)][string] $Psql,
+        [Parameter(Mandatory)][int]    $Port,
+        [Parameter(Mandatory)][string] $Address,
+        [Parameter(Mandatory)][string] $Database
+    )
+    $alter = Invoke-PgQuery -Psql $Psql -Port $Port -HostAddress $Address -Database $Database -Sql 'ALTER ROLE postgres PASSWORD NULL;' -ViaStdin
+    if ($alter.ExitCode -ne 0) {
+        $detail = Format-ShortText -Text "ALTER ROLE failed (exit $($alter.ExitCode)): $($alter.StdErr)" -MaxLength 400
+        Write-Log -Message $detail -Level WARN
+        return [pscustomobject]@{ Ok = $false; Detail = $detail }
+    }
+    $checkSql = "SELECT CASE WHEN rolpassword IS NULL THEN 'NONE' ELSE 'SET' END FROM pg_authid WHERE rolname = 'postgres';"
+    $check = Invoke-PgQuery -Psql $Psql -Port $Port -HostAddress $Address -Database $Database -Sql $checkSql
+    $state = "$($check.StdOut)".Trim()
+    if ($check.ExitCode -eq 0 -and $state -ceq 'NONE') {
+        Write-Log -Message 'The postgres role has no password now' -Level OK
+        return [pscustomobject]@{ Ok = $true; Detail = 'The postgres role has no password' }
+    }
+    $detail = Format-ShortText -Text "The postgres password is still set or could not be checked (check '$state', exit $($check.ExitCode)) $($check.StdErr) $($alter.StdErr)" -MaxLength 400
+    Write-Log -Message $detail -Level WARN
+    return [pscustomobject]@{ Ok = $false; Detail = $detail }
+}
 #endregion Psql
 
 #region State

@@ -2733,6 +2733,346 @@ veeam   "svc_veeam@VBR-PILOT01"   postgres
         Check 'T10 single-decision checks ran without an error' $_.Exception.Message ''
     }
 }
+# --- Task 11: psql runner, SSPI test and live queries ---
+try {
+    & {
+        $dir = New-TestFolder 'psql'
+        $fakePsql = Join-Path $dir 'psql.cmd'
+        # Fake psql: writes each argument on its own line, the libpq variables it
+        # sees, and stdin when it is called with "-f -". Host ::1 fails like a
+        # refused login (exit 2, message on stderr); any other host prints 1.
+        $fakeText = @'
+@echo off
+setlocal EnableExtensions DisableDelayedExpansion
+set "OUT=%~dp0"
+set "HOSTARG=%~4"
+>"%OUT%env.txt" echo PGPASSFILE=[%PGPASSFILE%]
+>>"%OUT%env.txt" echo PGCONNECT_TIMEOUT=[%PGCONNECT_TIMEOUT%]
+>>"%OUT%env.txt" echo PGPASSWORD=[%PGPASSWORD%]
+>>"%OUT%env.txt" echo PGUSER=[%PGUSER%]
+>>"%OUT%env.txt" echo PGHOST=[%PGHOST%]
+>>"%OUT%env.txt" echo PGSERVICE=[%PGSERVICE%]
+>>"%OUT%env.txt" echo PGSSLMODE=[%PGSSLMODE%]
+type nul >"%OUT%args.txt"
+if exist "%OUT%stdin.txt" del "%OUT%stdin.txt"
+set "READSTDIN="
+:next
+if "%~1"=="" goto done
+>>"%OUT%args.txt" echo(%~1
+if "%~1"=="-f" if "%~2"=="-" set "READSTDIN=1"
+shift
+goto next
+:done
+if defined READSTDIN findstr "^" >"%OUT%stdin.txt"
+if "%HOSTARG%"=="::1" goto refuse
+echo 1
+exit /b 0
+:refuse
+>&2 echo psql: error: connection to server at "::1", port 5432 failed: FATAL:  no pg_hba.conf entry for host "::1", user "postgres", database "VeeamBackup", no encryption
+exit /b 2
+'@
+        # cmd.exe needs CRLF line ends for labels and goto to work reliably.
+        [IO.File]::WriteAllText($fakePsql, ($fakeText -replace "`r?`n", "`r`n"), [Text.Encoding]::ASCII)
+        $argsFile  = Join-Path $dir 'args.txt'
+        $envFile   = Join-Path $dir 'env.txt'
+        $stdinFile = Join-Path $dir 'stdin.txt'
+
+        $pgNames = @('PGPASSFILE', 'PGCONNECT_TIMEOUT', 'PGPASSWORD', 'PGUSER', 'PGHOST', 'PGSERVICE', 'PGSSLMODE')
+        $before = @{}
+        foreach ($n in $pgNames) { $before[$n] = [Environment]::GetEnvironmentVariable($n, 'Process') }
+        try {
+            $old = @{ PGPASSFILE = 'C:\old\pgpass.conf'; PGCONNECT_TIMEOUT = $null; PGPASSWORD = 'old-secret-sentinel'; PGUSER = 'olduser'; PGHOST = 'oldhost'; PGSERVICE = 'oldservice'; PGSSLMODE = 'require' }
+            foreach ($n in $pgNames) { [Environment]::SetEnvironmentVariable($n, $old[$n], 'Process') }
+            $expectedDuring   = 'PGPASSFILE=[nul];PGCONNECT_TIMEOUT=[10];PGPASSWORD=[];PGUSER=[];PGHOST=[];PGSERVICE=[];PGSSLMODE=[]'
+            $expectedRestored = 'PGPASSFILE=[C:\old\pgpass.conf];PGCONNECT_TIMEOUT=[];PGPASSWORD=[old-secret-sentinel];PGUSER=[olduser];PGHOST=[oldhost];PGSERVICE=[oldservice];PGSSLMODE=[require]'
+            $currentEnv = { (@($pgNames | ForEach-Object { "$_=[$([Environment]::GetEnvironmentVariable($_, 'Process'))]" })) -join ';' }
+
+            $r = Invoke-PgQuery -Psql $fakePsql -Port 5432 -HostAddress '127.0.0.1' -Database 'VeeamBackup' -Sql 'SELECT 1;'
+            Check 'psql: exit code of a good call'                    $r.ExitCode 0
+            Check 'psql: stdout of a good call'                       $r.StdOut '1'
+            Check 'psql: -c call arguments in order'                  (@(Get-Content -LiteralPath $argsFile) -join ' ') '-X -w -h 127.0.0.1 -p 5432 -U postgres -d VeeamBackup -t -A -c SELECT 1;'
+            Check 'psql: libpq environment during a -c call'          (@(Get-Content -LiteralPath $envFile) -join ';') $expectedDuring
+            Check 'psql: nothing read from stdin for a -c call'       (Test-Path -LiteralPath $stdinFile) 'False'
+            Check 'psql: old environment restored after a -c call'    (& $currentEnv) $expectedRestored
+            Check 'psql: PGCONNECT_TIMEOUT absent again'              (Test-Path Env:\PGCONNECT_TIMEOUT) 'False'
+
+            $r = Invoke-PgQuery -Psql $fakePsql -Port 5433 -HostAddress '127.0.0.1' -Database 'VeeamBackup' -Sql 'ALTER ROLE postgres PASSWORD NULL;' -ViaStdin
+            Check 'psql: exit code of a stdin call'                   $r.ExitCode 0
+            Check 'psql: stdin call arguments end with -f -'          (@(Get-Content -LiteralPath $argsFile) -join ' ') '-X -w -h 127.0.0.1 -p 5433 -U postgres -d VeeamBackup -t -A -f -'
+            Check 'psql: SQL arrives on stdin'                        ((@(Get-Content -LiteralPath $stdinFile) -join '').Trim()) 'ALTER ROLE postgres PASSWORD NULL;'
+            Check 'psql: libpq environment during a stdin call'       (@(Get-Content -LiteralPath $envFile) -join ';') $expectedDuring
+            Check 'psql: old environment restored after a stdin call' (& $currentEnv) $expectedRestored
+
+            $r = Invoke-PgQuery -Psql $fakePsql -Port 5432 -HostAddress '::1' -Database 'VeeamBackup' -Sql 'SELECT 1;'
+            Check 'psql: failing exit code returned'                  $r.ExitCode 2
+            Check 'psql: failing stderr returned'                     ($r.StdErr -match 'no pg_hba\.conf entry') 'True'
+            Check 'psql: failing stdout is empty'                     $r.StdOut ''
+            Check 'psql: old environment restored after a failure'    (& $currentEnv) $expectedRestored
+
+            & {
+                function Invoke-Native {
+                    [CmdletBinding()] param([string] $FilePath, [string[]] $Arguments, [string] $StdinText)
+                    throw 'simulated psql start failure'
+                }
+                Throws 'psql: a runner exception propagates' { Invoke-PgQuery -Psql 'missing-psql.exe' -Port 5432 -HostAddress '127.0.0.1' -Database 'VeeamBackup' -Sql 'SELECT 1;' }
+                Check 'psql: old environment restored after an exception' (& $currentEnv) $expectedRestored
+            }
+        } finally {
+            foreach ($n in $pgNames) { [Environment]::SetEnvironmentVariable($n, $before[$n], 'Process') }
+        }
+    }
+} catch {
+    Check 'Task 11: Invoke-PgQuery tests ran to the end' $_.Exception.Message ''
+}
+
+try {
+    & {
+        $cases = [ordered]@{
+            'psql: error: connection to server at "127.0.0.1", port 5432 failed: FATAL:  SSPI authentication failed for user "postgres"' = 'AUTH'
+            'FATAL:  no pg_hba.conf entry for host "::1", user "postgres", database "VeeamBackup", no encryption' = 'AUTH'
+            'FATAL:  no match in usermap "veeam" for user "postgres" authenticated as "Administrator@VBR01"' = 'AUTH'
+            'FATAL:  password authentication failed for user "postgres"' = 'AUTH'
+            'fe_sendauth: no password supplied' = 'AUTH'
+            'FATAL:  28000: Benutzerzuordnung fehlgeschlagen' = 'AUTH'
+            'FATAL:  28P01: Passwort-Authentifizierung fehlgeschlagen' = 'AUTH'
+            'NOTICE:  copied 28000 rows' = 'OTHER'
+            'connection to server at "::1", port 5432 failed: Connection refused (0x0000274D/10061)' = 'CONNECT'
+            'could not connect to server: Connection timed out' = 'CONNECT'
+            'psql: error: timeout expired' = 'CONNECT'
+            'ERROR:  relation "pg_ident_file_mappings" does not exist' = 'OTHER'
+            'server closed the connection unexpectedly' = 'OTHER'
+        }
+        $i = 0
+        foreach ($text in @($cases.Keys)) {
+            $i++
+            Check "psql failure kind $i is $($cases[$text])" (Get-PsqlFailureKind -StdErr $text) $cases[$text]
+        }
+        Check 'psql failure kind of empty stderr is OTHER' (Get-PsqlFailureKind -StdErr '') 'OTHER'
+        Check 'psql failure kind of null stderr is OTHER'  (Get-PsqlFailureKind -StdErr $null) 'OTHER'
+    }
+} catch {
+    Check 'Task 11: Get-PsqlFailureKind tests ran to the end' $_.Exception.Message ''
+}
+
+try {
+    & {
+        $calls = New-Object System.Collections.ArrayList
+        function Invoke-PgQuery {
+            param([string] $Psql, [int] $Port, [string] $HostAddress, [string] $Database, [string] $Sql, [switch] $ViaStdin)
+            [void]$calls.Add("$HostAddress|$Port|$Database|$Sql|$ViaStdin")
+            if ($HostAddress -eq '::1') {
+                return [pscustomobject]@{ ExitCode = 2; StdOut = ''; StdErr = 'connection to server at "::1", port 5432 failed: Connection refused (0x0000274D/10061)' }
+            }
+            if ($HostAddress -eq '127.0.0.2') {
+                return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+            }
+            return [pscustomobject]@{ ExitCode = 0; StdOut = '1'; StdErr = '' }
+        }
+
+        $t = Test-PgSspiLogin -Psql 'psql.exe' -Port 5432 -Addresses @('127.0.0.1') -Database 'VeeamBackup'
+        Check 'sspi test: passes when every address returns 1' $t.Passed 'True'
+        Check 'sspi test: one result per address'              @($t.Results).Count 1
+        Check 'sspi test: result kind OK'                      $t.Results[0].Kind 'OK'
+        Check 'sspi test: runs SELECT 1 on the VBR database'   $calls[0] '127.0.0.1|5432|VeeamBackup|SELECT 1;|False'
+
+        $t = Test-PgSspiLogin -Psql 'psql.exe' -Port 5432 -Addresses @('127.0.0.1', '::1') -Database 'VeeamBackup'
+        Check 'sspi test: one refused address fails the test'  $t.Passed 'False'
+        Check 'sspi test: both addresses tested'               @($t.Results).Count 2
+        Check 'sspi test: refused address recorded'            $t.Results[1].Address '::1'
+        Check 'sspi test: refused address exit code'           $t.Results[1].ExitCode 2
+        Check 'sspi test: refused address kind'                $t.Results[1].Kind 'CONNECT'
+        Check 'sspi test: refused address stderr kept'         ($t.Results[1].StdErr -match '10061') 'True'
+
+        $t = Test-PgSspiLogin -Psql 'psql.exe' -Port 5432 -Addresses @('127.0.0.2') -Database 'VeeamBackup'
+        Check 'sspi test: exit 0 without 1 fails'              $t.Passed 'False'
+        Check 'sspi test: exit 0 without 1 is OTHER'           $t.Results[0].Kind 'OTHER'
+
+        $t = Test-PgSspiLogin -Psql 'psql.exe' -Port 5432 -Addresses @() -Database 'VeeamBackup'
+        Check 'sspi test: no address is not a pass'            $t.Passed 'False'
+    }
+} catch {
+    Check 'Task 11: Test-PgSspiLogin tests ran to the end' $_.Exception.Message ''
+}
+
+try {
+    & {
+        Check 'path compare: forward slashes become backslashes, lower case' (ConvertTo-ComparablePath -Path 'C:/Program Files/PostgreSQL/15/data/pg_hba.conf') 'c:\program files\postgresql\15\data\pg_hba.conf'
+        Check 'path compare: trailing backslash removed'          (ConvertTo-ComparablePath -Path 'C:\PG\data\') 'c:\pg\data'
+        Check 'path compare: empty path stays empty'              (ConvertTo-ComparablePath -Path '') ''
+        Check 'path compare: SHOW hba_file form equals edited path' (Test-SamePath -Left 'C:/Program Files/PostgreSQL/15/data/pg_hba.conf' -Right 'C:\Program Files\PostgreSQL\15\DATA\pg_hba.conf') 'True'
+        Check 'path compare: dot-dot segments resolved'           (Test-SamePath -Left 'C:/PG/data/../data/pg_ident.conf' -Right 'C:\PG\data\pg_ident.conf') 'True'
+        Check 'path compare: different file is not the same'      (Test-SamePath -Left 'C:/PG/data/pg_hba.conf' -Right 'C:\PG\data\pg_ident.conf') 'False'
+        Check 'path compare: empty paths are not the same'        (Test-SamePath -Left '' -Right '') 'False'
+    }
+} catch {
+    Check 'Task 11: path compare tests ran to the end' $_.Exception.Message ''
+}
+
+try {
+    & {
+        $calls = New-Object System.Collections.ArrayList
+        $answer = @{ Hba = '0'; Ident = '0'; HbaFile = 'C:/PG/15/data/pg_hba.conf'; IdentFile = 'C:/PG/15/data/pg_ident.conf'; FailOn = '' }
+        function Invoke-PgQuery {
+            param([string] $Psql, [int] $Port, [string] $HostAddress, [string] $Database, [string] $Sql, [switch] $ViaStdin)
+            [void]$calls.Add($Sql)
+            if ($answer.FailOn -ne '' -and $Sql -match $answer.FailOn) {
+                return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR:  simulated failure' }
+            }
+            $out = 'unexpected query'
+            switch -Regex ($Sql) {
+                'pg_hba_file_rules'      { $out = $answer.Hba; break }
+                'pg_ident_file_mappings' { $out = $answer.Ident; break }
+                '^SHOW hba_file'         { $out = $answer.HbaFile; break }
+                '^SHOW ident_file'       { $out = $answer.IdentFile; break }
+            }
+            return [pscustomobject]@{ ExitCode = 0; StdOut = $out; StdErr = '' }
+        }
+        $health = { param([int] $Major) Test-PgConfigHealth -Psql 'psql.exe' -Port 5432 -Address '127.0.0.1' -Database 'VeeamBackup' -Major $Major -HbaPath 'C:\PG\15\data\pg_hba.conf' -IdentPath 'C:\PG\15\data\pg_ident.conf' }
+
+        $h = & $health 15
+        Check 'config health: clean files on PG 15 pass'         $h.Ok 'True'
+        Check 'config health: PG 15 runs four queries'           $calls.Count 4
+        Check 'config health: PG 15 checks pg_ident errors'      (@($calls | Where-Object { $_ -match 'pg_ident_file_mappings' }).Count) 1
+        Check 'config health: hba error query'                   $calls[0] 'SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL;'
+
+        $calls.Clear()
+        $h = & $health 14
+        Check 'config health: clean files on PG 14 pass'         $h.Ok 'True'
+        Check 'config health: PG 14 skips pg_ident_file_mappings' (@($calls | Where-Object { $_ -match 'pg_ident_file_mappings' }).Count) 0
+
+        $answer.Hba = '2'
+        $h = & $health 15
+        Check 'config health: hba parse errors fail'             $h.Ok 'False'
+        Check 'config health: hba error named in Detail'         ($h.Detail -match 'pg_hba_file_rules') 'True'
+        $answer.Hba = '0'
+
+        $answer.Ident = '1'
+        $h = & $health 15
+        Check 'config health: ident parse errors fail'           $h.Ok 'False'
+        $answer.Ident = '0'
+
+        $answer.HbaFile = 'D:/Other/data/pg_hba.conf'
+        $h = & $health 15
+        Check 'config health: another live hba_file fails'       $h.Ok 'False'
+        Check 'config health: hba_file named in Detail'          ($h.Detail -match 'hba_file') 'True'
+        $answer.HbaFile = 'C:/PG/15/data/pg_hba.conf'
+
+        $answer.FailOn = '^SHOW ident_file'
+        $h = & $health 15
+        Check 'config health: failed query fails'                $h.Ok 'False'
+        Check 'config health: failed query named in Detail'      ($h.Detail -match 'ident_file') 'True'
+    }
+} catch {
+    Check 'Task 11: Test-PgConfigHealth tests ran to the end' $_.Exception.Message ''
+}
+
+try {
+    & {
+        $calls = New-Object System.Collections.ArrayList
+        $answer = @{
+            Password = [pscustomobject]@{ ExitCode = 0; StdOut = 'SET'; StdErr = '' }
+            Backends = [pscustomobject]@{ ExitCode = 0; StdOut = '[{"pid":4100,"usename":"postgres","datname":"VeeamBackup","client_addr":"127.0.0.1","start_ms":1791799200000},{"pid":4200,"usename":"pg_native_admin","datname":"postgres","client_addr":null,"start_ms":1791799260500}]'; StdErr = '' }
+        }
+        function Invoke-PgQuery {
+            param([string] $Psql, [int] $Port, [string] $HostAddress, [string] $Database, [string] $Sql, [switch] $ViaStdin)
+            [void]$calls.Add($Sql)
+            if ($Sql -match 'pg_authid') { return $answer.Password }
+            if ($Sql -match 'pg_stat_activity') { return $answer.Backends }
+            return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'unexpected query' }
+        }
+        $live = { Get-PgLiveState -Psql 'psql.exe' -Port 5432 -Address '127.0.0.1' -Database 'VeeamBackup' }
+
+        $s = & $live
+        Check 'live state: Ok'                                  $s.Ok 'True'
+        Check 'live state: password set'                        $s.PasswordSet 'True'
+        Check 'live state: two backends'                        @($s.Backends).Count 2
+        Check 'live state: backend pid'                         $s.Backends[0].Pid 4100
+        Check 'live state: backend role'                        $s.Backends[0].UseName 'postgres'
+        Check 'live state: backend database'                    $s.Backends[0].DatName 'VeeamBackup'
+        Check 'live state: backend address'                     $s.Backends[0].ClientAddr '127.0.0.1'
+        Check 'live state: backend start in UTC'                $s.Backends[0].BackendStartUtc.ToString('yyyy-MM-ddTHH:mm:ss.fff') '2026-10-12T10:00:00.000'
+        Check 'live state: backend start kind is Utc'           $s.Backends[0].BackendStartUtc.Kind 'Utc'
+        Check 'live state: milliseconds kept'                   $s.Backends[1].BackendStartUtc.ToString('HH:mm:ss.fff') '10:01:00.500'
+        Check 'live state: null client address becomes empty'   $s.Backends[1].ClientAddr ''
+        Check 'live state: password query reads only IS NULL'   (($calls[0] -match 'rolpassword IS NULL') -and ($calls[0] -notmatch 'SELECT\s+rolpassword')) 'True'
+        Check 'live state: backends exclude the own session'    ($calls[1] -match "backend_type = 'client backend' AND pid <> pg_backend_pid\(\)") 'True'
+        Check 'live state: no double quote in any SQL'          (@($calls | Where-Object { $_.Contains('"') }).Count) 0
+
+        $answer.Password = [pscustomobject]@{ ExitCode = 0; StdOut = 'NONE'; StdErr = '' }
+        $answer.Backends = [pscustomobject]@{ ExitCode = 0; StdOut = '[{"pid":5,"usename":"postgres","datname":"VeeamBackup","client_addr":"::1","start_ms":1791799200000}]'; StdErr = '' }
+        $s = & $live
+        Check 'live state: no password'                         $s.PasswordSet 'False'
+        Check 'live state: a one-item JSON array is one backend' @($s.Backends).Count 1
+        Check 'live state: IPv6 loopback address kept'          $s.Backends[0].ClientAddr '::1'
+
+        $answer.Backends = [pscustomobject]@{ ExitCode = 0; StdOut = '[]'; StdErr = '' }
+        $s = & $live
+        Check 'live state: no backends is still Ok'             $s.Ok 'True'
+        Check 'live state: empty backend list'                  @($s.Backends).Count 0
+
+        $answer.Backends = [pscustomobject]@{ ExitCode = 2; StdOut = ''; StdErr = 'FATAL:  SSPI authentication failed for user "postgres"' }
+        $s = & $live
+        Check 'live state: failed backend query is not Ok'      $s.Ok 'False'
+
+        $answer.Backends = [pscustomobject]@{ ExitCode = 0; StdOut = '[]'; StdErr = '' }
+        $answer.Password = [pscustomobject]@{ ExitCode = 2; StdOut = ''; StdErr = 'FATAL:  SSPI authentication failed for user "postgres"' }
+        $s = & $live
+        Check 'live state: failed password query is not Ok'     $s.Ok 'False'
+        Check 'live state: failure does not claim a password'   $s.PasswordSet 'False'
+    }
+} catch {
+    Check 'Task 11: Get-PgLiveState tests ran to the end' $_.Exception.Message ''
+}
+
+try {
+    & {
+        $calls = New-Object System.Collections.ArrayList
+        $answer = @{ Roles = [pscustomobject]@{ ExitCode = 0; StdOut = '["pg_native_admin","zabbix"]'; StdErr = '' }; AlterExit = 0; Check = 'NONE' }
+        function Invoke-PgQuery {
+            param([string] $Psql, [int] $Port, [string] $HostAddress, [string] $Database, [string] $Sql, [switch] $ViaStdin)
+            [void]$calls.Add([pscustomobject]@{ Sql = $Sql; ViaStdin = [bool]$ViaStdin })
+            if ($Sql -match 'rolcanlogin') { return $answer.Roles }
+            if ($Sql -match '^ALTER ROLE') {
+                if ($answer.AlterExit -ne 0) { return [pscustomobject]@{ ExitCode = $answer.AlterExit; StdOut = ''; StdErr = 'ERROR:  permission denied' } }
+                return [pscustomobject]@{ ExitCode = 0; StdOut = 'ALTER ROLE'; StdErr = '' }
+            }
+            return [pscustomobject]@{ ExitCode = 0; StdOut = $answer.Check; StdErr = '' }
+        }
+
+        $roles = @(Get-OtherPasswordRoles -Psql 'psql.exe' -Port 5432 -Address '127.0.0.1' -Database 'VeeamBackup')
+        Check 'other roles: names returned'                     ($roles -join ',') 'pg_native_admin,zabbix'
+        Check 'other roles: login roles with a password, not postgres' (($calls[0].Sql -match 'rolcanlogin') -and ($calls[0].Sql -match "rolname <> 'postgres'") -and ($calls[0].Sql -match 'rolpassword IS NOT NULL')) 'True'
+        Check 'other roles: the hash is never selected'         ($calls[0].Sql -notmatch 'SELECT\s+rolpassword') 'True'
+        $answer.Roles = [pscustomobject]@{ ExitCode = 0; StdOut = '[]'; StdErr = '' }
+        Check 'other roles: none'                               @(Get-OtherPasswordRoles -Psql 'psql.exe' -Port 5432 -Address '127.0.0.1' -Database 'VeeamBackup').Count 0
+        $answer.Roles = [pscustomobject]@{ ExitCode = 2; StdOut = ''; StdErr = 'FATAL:  SSPI authentication failed' }
+        Check 'other roles: failed query gives no names'        @(Get-OtherPasswordRoles -Psql 'psql.exe' -Port 5432 -Address '127.0.0.1' -Database 'VeeamBackup').Count 0
+        Check 'other roles: failed query logs a warning'        (@($script:LogLines | Where-Object { $_ -like '`[WARN`]*other login roles*' }).Count -ge 1) 'True'
+
+        $calls.Clear()
+        $c = Clear-PostgresPassword -Psql 'psql.exe' -Port 5432 -Address '127.0.0.1' -Database 'VeeamBackup'
+        Check 'clear password: Ok when the re-check says NONE'  $c.Ok 'True'
+        Check 'clear password: ALTER ROLE text'                 $calls[0].Sql 'ALTER ROLE postgres PASSWORD NULL;'
+        Check 'clear password: ALTER ROLE goes through stdin'   $calls[0].ViaStdin 'True'
+        Check 'clear password: re-check reads only IS NULL'     ($calls[1].Sql -match 'rolpassword IS NULL') 'True'
+        Check 'clear password: re-check runs with -c'           $calls[1].ViaStdin 'False'
+
+        $answer.Check = 'SET'
+        $c = Clear-PostgresPassword -Psql 'psql.exe' -Port 5432 -Address '127.0.0.1' -Database 'VeeamBackup'
+        Check 'clear password: still set fails'                 $c.Ok 'False'
+        Check 'clear password: still set named in Detail'       ($c.Detail -match 'still set') 'True'
+
+        $answer.Check = 'NONE'
+        $answer.AlterExit = 1
+        $calls.Clear()
+        $c = Clear-PostgresPassword -Psql 'psql.exe' -Port 5432 -Address '127.0.0.1' -Database 'VeeamBackup'
+        Check 'clear password: failed ALTER fails'              $c.Ok 'False'
+        Check 'clear password: failed ALTER named in Detail'    ($c.Detail -match 'ALTER ROLE failed') 'True'
+        Check 'clear password: no re-check after a failed ALTER' $calls.Count 1
+    }
+} catch {
+    Check 'Task 11: password role tests ran to the end' $_.Exception.Message ''
+}
 # ===================== RESULT =====================
 foreach ($testFolder in @($script:TestFolders)) {
     Remove-Item -LiteralPath $testFolder -Recurse -Force -ErrorAction SilentlyContinue
