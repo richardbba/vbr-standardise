@@ -606,6 +606,33 @@ function Get-PreflightContextIssue {
     return $null
 }
 
+# True when this process runs as LocalSystem (S-1-5-18), the account RMM uses.
+function Test-IsLocalSystem {
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    return [bool]($null -ne $identity.User -and $identity.User.Value -eq 'S-1-5-18')
+}
+
+# Pure decision for spec 7.1 step 3a: -Apply runs as SYSTEM only. The VBR services log
+# in to PostgreSQL as SYSTEM, and the SSPI test in sections 7.6 and 7.9 proves that login
+# by logging in as the account that runs the script. Run as an administrator, the test
+# logs in as that administrator instead; -Apply removes that account from the veeam map
+# (decision D6), so the test fails and the change is undone (exit 40). AUDIT and
+# -CreateServiceAccount on its own may run as any administrator.
+function Get-ApplyIdentityIssue {
+    param(
+        [bool] $Apply,
+        [bool] $IsSystem,
+        [string] $UserName = ''
+    )
+    if (-not $Apply -or $IsSystem) { return $null }
+    return [pscustomobject]@{
+        Code     = 'APPLY_NOT_SYSTEM'
+        ExitCode = 20
+        Detail   = "-Apply must run as SYSTEM, the account RMM uses and the VBR services use for PostgreSQL. This run is '$UserName'. Nothing was changed."
+        Action   = 'Run -Apply from RMM, or from a SYSTEM prompt: in an elevated Command Prompt run psexec -s -i powershell.exe, then run the script in the new window'
+    }
+}
+
 # Single instance (spec 7.1 step 1). The updater uses the same name, so the two
 # scripts never run at the same time. An abandoned mutex (a run that was killed)
 # still grants ownership and counts as acquired.
@@ -5214,6 +5241,12 @@ if ($null -eq $script:RunLock) {
 $contextIssue = Get-PreflightContextIssue -PSEdition "$($PSVersionTable.PSEdition)" -IsAdmin (Test-IsAdministrator) -Is64BitOS ([Environment]::Is64BitOperatingSystem) -Is64BitProcess ([Environment]::Is64BitProcess) -LanguageMode "$($ExecutionContext.SessionState.LanguageMode)"
 if ($null -ne $contextIssue) {
     Complete-Run -ExitCode ([int]$contextIssue.ExitCode) -Code "$($contextIssue.Code)" -Detail "$($contextIssue.Detail)" -Action "$($contextIssue.Action)"
+}
+
+# 7.1 step 3a: -Apply runs as SYSTEM only, before anything is written or created.
+$identityIssue = Get-ApplyIdentityIssue -Apply ([bool]$Apply) -IsSystem (Test-IsLocalSystem) -UserName "$([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+if ($null -ne $identityIssue) {
+    Complete-Run -ExitCode ([int]$identityIssue.ExitCode) -Code "$($identityIssue.Code)" -Detail "$($identityIssue.Detail)" -Action "$($identityIssue.Action)"
 }
 
 # 7.1 step 4: the work folder. Nothing is written there before it passes.

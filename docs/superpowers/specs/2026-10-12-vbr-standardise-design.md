@@ -90,7 +90,7 @@ The script is the first part of a wider standardisation script. Write each check
 | 5 | ACTION_NEEDED | Soft error. AUDIT found drift, or a fix needs a person or a flag. `ActionRequired` says what to do. |
 | 10 | RETRY | Another run holds the lock, a job is running, or a service did not stop before any change. Try again later. |
 | 11 | UNSUPPORTED | The server is outside the scope in section 3, or its PostgreSQL setup is not one the script can edit safely. |
-| 20 | PREFLIGHT | Wrong PowerShell, not elevated, 32-bit host, Constrained Language Mode, VBR or PostgreSQL not found, or the WorkRoot is not safe. |
+| 20 | PREFLIGHT | Wrong PowerShell, not elevated, 32-bit host, Constrained Language Mode, -Apply not run as SYSTEM, VBR or PostgreSQL not found, or the WorkRoot is not safe. |
 | 40 | ESCALATE | A change failed. The script restored the server and checked that VBR works. |
 | 50 | ESCALATE_NOW | A change failed and the restore also failed, or a marker from an unfinished run exists. VBR may be down. |
 
@@ -100,7 +100,7 @@ If a run finds more than one issue, the highest exit code wins. `IssueCode` is t
 
 | Area | Codes |
 |---|---|
-| Preflight | `CONCURRENT_RUN`, `WRONG_POWERSHELL`, `NOT_ELEVATED`, `HOST_32BIT`, `CONSTRAINED_LANGUAGE`, `WORKROOT_UNSAFE`, `MARKER_PRESENT`, `DOMAIN_CONTROLLER`, `VBR_NOT_FOUND`, `VBR_DB_NOT_POSTGRES`, `STACKED_VBR_VB365`, `REMOTE_DB`, `NO_PG_FOUND`, `MULTIPLE_PG`, `PG_NOT_RUNNING`, `PG_INSTANCE_MISMATCH`, `PG_NOT_LISTENING`, `PG_CONF_OVERRIDE`, `PG_HBA_INCLUDE`, `PG_IDENT_LOCALISED` |
+| Preflight | `CONCURRENT_RUN`, `WRONG_POWERSHELL`, `NOT_ELEVATED`, `HOST_32BIT`, `CONSTRAINED_LANGUAGE`, `APPLY_NOT_SYSTEM`, `WORKROOT_UNSAFE`, `MARKER_PRESENT`, `DOMAIN_CONTROLLER`, `VBR_NOT_FOUND`, `VBR_DB_NOT_POSTGRES`, `STACKED_VBR_VB365`, `REMOTE_DB`, `NO_PG_FOUND`, `MULTIPLE_PG`, `PG_NOT_RUNNING`, `PG_INSTANCE_MISMATCH`, `PG_NOT_LISTENING`, `PG_CONF_OVERRIDE`, `PG_HBA_INCLUDE`, `PG_IDENT_LOCALISED` |
 | Account | `SVC_ACCOUNT_MISSING`, `SVC_PASSWORD_REQUIRED`, `SVC_PASSWORD_POLICY`, `SVC_NAME_IN_USE`, `SVC_NOT_ADMIN`, `SVC_FLAGS_DRIFT`, `SVC_DISABLED`, `SVC_LOCKED_OUT`, `SVC_PASSWORD_EXPIRED` |
 | Database state | `DB_NATIVE_AUTH`, `DB_AUTH_UNKNOWN`, `DB_HOST_NOT_LOCAL`, `DB_WINDOWS_ROLE_NOT_POSTGRES`, `PG_HBA_NOT_STANDARD`, `PG_IDENT_NOT_STANDARD`, `PG_POSTGRES_PASSWORD_SET`, `SERVICE_ACCOUNT_UNRESOLVED` |
 | Blockers | `PG_PASSWORD_CONSUMER`, `PG_REMOTE_CONSUMER`, `VEEAM_BUSY`, `VEEAM_BUSY_PERSISTENT`, `SERVICE_DEPENDENT_OUTSIDE_SET`, `PATH_B_PREVIOUS_FAILURE`, `VBR_SERVICE_NOT_RUNNING`, `SERVICE_DISABLED_RUNNING` |
@@ -126,6 +126,7 @@ Run in this order. The first failure ends the run, except where it says "drift".
 1. Take the `Global\VeeamPgUpdate` mutex. If another process holds it: exit 10 `CONCURRENT_RUN`. Check nothing else.
 2. `$PSVersionTable.PSEdition -eq 'Desktop'`. Otherwise exit 20 `WRONG_POWERSHELL`. `ActionRequired`: "Run %SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe".
 3. Elevated, 64-bit process, FullLanguage mode. Otherwise exit 20 (`NOT_ELEVATED`, `HOST_32BIT`, `CONSTRAINED_LANGUAGE`).
+3a. With `-Apply`, the process runs as SYSTEM (`S-1-5-18`). Otherwise exit 20 `APPLY_NOT_SYSTEM`, before anything is written or created. Reason: the SSPI test (sections 7.6 and 7.9) logs in as the account that runs the script, to prove the SYSTEM login the VBR services use. Run as an administrator, it would test that administrator, whose `pg_ident.conf` line `-Apply` removes (D6), so the test would fail and the change would be undone. AUDIT and `-CreateServiceAccount` on its own may run as any administrator. (Added 2026-10-13 after the first pilot run, which ran `-Apply` as `Administrator` and ended in exit 40.)
 4. WorkRoot passes the ACL and trust checks (copy the updater's). Otherwise exit 20 `WORKROOT_UNSAFE`.
 5. Markers. Any of these files exists: exit 50 `MARKER_PRESENT`, with the path in `Detail`.
    - This script's `<WorkRoot>\CHANGES-IN-PROGRESS.marker`.

@@ -43,7 +43,7 @@ Run the script as **SYSTEM**, with **64-bit Windows PowerShell 5.1**:
 
 - Do not use `pwsh.exe` (PowerShell 7). The script exits 20 `WRONG_POWERSHELL`. Under PowerShell 7 the LocalAccounts cmdlets run in a compatibility session, so their errors cannot be mapped to issue codes.
 - If the RMM agent is a 32-bit process, use `%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe`. A 32-bit host exits 20 `HOST_32BIT`.
-- The script never prompts. It runs only from RMM.
+- The script never prompts. `-Apply` runs only as SYSTEM: from RMM, or by hand from a SYSTEM prompt (see [Running by hand](#running-by-hand)). Run as any other account, `-Apply` stops at once with exit 20 `APPLY_NOT_SYSTEM` and changes nothing.
 
 ### Timeout: 45 minutes or more
 
@@ -61,6 +61,39 @@ The `svc_veeam` password comes from an RMM **secure variable** named `VEEAM_SVC_
 - The script never resets the password of an account that already exists.
 - If the password does not meet the Windows password policy, nothing is created and the run reports `SVC_PASSWORD_POLICY`.
 
+### Running by hand
+
+AUDIT (no flags) and `-CreateServiceAccount` on its own run from any elevated Windows PowerShell 5.1 window. **`-Apply` must run as SYSTEM**, like RMM. A window opened with "Run as administrator" is still your own account (`whoami` shows `HOST\Administrator`), so `-Apply` refuses to run there (`APPLY_NOT_SYSTEM`).
+
+Why: after the change, the script proves that SYSTEM (the account the Veeam services use) can still log in to PostgreSQL, by logging in as the account that runs it. `-Apply` removes every account except SYSTEM and `svc_veeam` from `pg_ident.conf`, so a run as Administrator would lock itself out, fail its own test and undo the change (exit 40).
+
+**Option 1: PsExec** (Sysinternals). In an elevated Command Prompt:
+
+```
+psexec -accepteula -s -i powershell.exe
+```
+
+In the new window, `whoami` must print `nt authority\system`. Then:
+
+```
+cd C:\Temp\VbrStd
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Invoke-VbrStandardise.ps1 -Apply
+```
+
+**Option 2: a one-off scheduled task as SYSTEM** (no extra tools). In an elevated Windows PowerShell window:
+
+```powershell
+$a = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\Temp\VbrStd\Invoke-VbrStandardise.ps1 -Apply'
+Register-ScheduledTask -TaskName 'VbrStandardise-Apply' -Action $a -User 'NT AUTHORITY\SYSTEM' -RunLevel Highest -Force | Out-Null
+Start-ScheduledTask -TaskName 'VbrStandardise-Apply'; Start-Sleep -Seconds 5
+while ((Get-ScheduledTask -TaskName 'VbrStandardise-Apply').State -eq 'Running') { Start-Sleep -Seconds 5 }
+"Exit code: $((Get-ScheduledTaskInfo -TaskName 'VbrStandardise-Apply').LastTaskResult)"
+Get-Content C:\ProgramData\VeeamStandardise\logs\last-result.json
+Unregister-ScheduledTask -TaskName 'VbrStandardise-Apply' -Confirm:$false
+```
+
+The full output is in the newest `C:\ProgramData\VeeamStandardise\logs\VbrStandardise_*.log`.
+
 ### Schedules
 
 - **AUDIT** (no flags) is safe to run at any time, for example daily. It changes nothing.
@@ -73,7 +106,7 @@ The `svc_veeam` password comes from an RMM **secure variable** named `VEEAM_SVC_
 | Parameter | Effect |
 |---|---|
 | (none) | AUDIT. The script reads and reports. It changes nothing. `Mode=AUDIT`. |
-| `-Apply` | APPLY. The script fixes every item except a missing account. `Mode=APPLY`. |
+| `-Apply` | APPLY. The script fixes every item except a missing account. `Mode=APPLY`. Runs as SYSTEM only (`APPLY_NOT_SYSTEM` otherwise). |
 | `-CreateServiceAccount` | Creates `svc_veeam` if it is missing, with the three flags set, and adds it to Administrators. Needs `VEEAM_SVC_PASSWORD`. It can run alone or together with `-Apply`. Alone, it creates the account and then audits the rest (`Mode=AUDIT`). |
 | `-WorkRoot <path>` | The work folder. The default is `C:\ProgramData\VeeamStandardise`. It must be an absolute path on a local drive that only SYSTEM and Administrators control. |
 
@@ -94,7 +127,7 @@ In this order. The first failure ends the run. One exception: Constrained Langua
 
 1. Take the `Global\VeeamPgUpdate` lock (`CONCURRENT_RUN`, exit 10).
 2. Windows PowerShell 5.1 Desktop (`WRONG_POWERSHELL`).
-3. Elevated, 64-bit, FullLanguage (`NOT_ELEVATED`, `HOST_32BIT`, `CONSTRAINED_LANGUAGE`).
+3. Elevated, 64-bit, FullLanguage (`NOT_ELEVATED`, `HOST_32BIT`, `CONSTRAINED_LANGUAGE`). With `-Apply`, the process is SYSTEM (`APPLY_NOT_SYSTEM`).
 4. The WorkRoot passes its owner, ACL and reparse-point checks (`WORKROOT_UNSAFE`). Only after this does the transcript start.
 5. No change marker from an unfinished run: this script's `<WorkRoot>\CHANGES-IN-PROGRESS.marker`, the updater's `C:\ProgramData\VeeamPgUpdate\CHANGES-IN-PROGRESS.marker`, or the updater's trusted legacy `C:\temp\VeeamPgUpdate\CHANGES-IN-PROGRESS.marker` (`MARKER_PRESENT`, exit 50).
 6. Not a domain controller.
@@ -183,7 +216,7 @@ The idle gate catches running jobs, but it cannot see Instant Recovery or publis
 | 5 | ACTION_NEEDED | AUDIT found drift, or a fix needs a person or a flag. `ActionRequired` says what to do. | Ticket. Follow `ActionRequired`. |
 | 10 | RETRY | Another run holds the lock, a job is running, or a service did not stop before any change. | Retry later, automatically. |
 | 11 | UNSUPPORTED | The server is outside the scope, or its PostgreSQL setup is not one the script can edit safely. | Exclude the server, or standardise it by hand. |
-| 20 | PREFLIGHT | Wrong PowerShell, not elevated, 32-bit host, Constrained Language Mode, VBR or PostgreSQL not found, or the WorkRoot is not safe. | Fix the RMM job or the server, then re-run. |
+| 20 | PREFLIGHT | Wrong PowerShell, not elevated, 32-bit host, Constrained Language Mode, -Apply not run as SYSTEM, VBR or PostgreSQL not found, or the WorkRoot is not safe. | Fix the RMM job or the server, then re-run. |
 | 40 | ESCALATE | A change failed. The script restored the server and checked that VBR works. | Escalate. Read the run folder and the transcript before another `-Apply`. |
 | 50 | ESCALATE_NOW | A change failed and the restore also failed, or a marker from an unfinished run exists. VBR may be down. | Page an operator now. |
 
@@ -198,6 +231,7 @@ If a run finds more than one issue, the highest exit code wins. `IssueCode` is t
 | `CONCURRENT_RUN` | 10 | This script or `Update-VeeamPostgres.ps1` is already running. | Retry later. |
 | `WRONG_POWERSHELL` | 20 | Not Windows PowerShell 5.1. | Run `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`. |
 | `NOT_ELEVATED` | 20 | Not running as SYSTEM or elevated. | Run the RMM job as SYSTEM. |
+| `APPLY_NOT_SYSTEM` | 20 | `-Apply` was run as an account other than SYSTEM, for example from a "Run as administrator" window. Nothing was changed. | Run `-Apply` from RMM, or by hand from a SYSTEM prompt (see [Running by hand](#running-by-hand)). |
 | `HOST_32BIT` | 20 | 32-bit PowerShell on 64-bit Windows. | Use the 64-bit `powershell.exe` (`Sysnative` from a 32-bit agent). |
 | `CONSTRAINED_LANGUAGE` | 20 | PowerShell runs in Constrained Language Mode. | Allow the script in AppLocker or WDAC for the RMM agent. |
 | `WORKROOT_UNSAFE` | 20 | The WorkRoot is not an absolute local path, is a reparse point, or has an untrusted owner or ACL. | Use a folder only SYSTEM and Administrators control, or the default. |

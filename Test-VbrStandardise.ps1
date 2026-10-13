@@ -562,6 +562,19 @@ Check 'preflight context: elevation is checked before bitness' $t3I.Code 'NOT_EL
 $t3I = Get-PreflightContextIssue -PSEdition 'Desktop' -IsAdmin $true -Is64BitOS $true -Is64BitProcess $false -LanguageMode 'ConstrainedLanguage'
 Check 'preflight context: bitness is checked before language mode' $t3I.Code 'HOST_32BIT'
 
+# Test-IsLocalSystem / Get-ApplyIdentityIssue (spec 7.1 step 3a): -Apply runs as SYSTEM only
+$t3ExpectSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
+Check 'Test-IsLocalSystem: returns a bool' ((Test-IsLocalSystem) -is [bool]) 'True'
+Check 'Test-IsLocalSystem: matches the process token' (Test-IsLocalSystem) "$t3ExpectSystem"
+Check 'apply identity: AUDIT as an administrator gives no issue' ($null -eq (Get-ApplyIdentityIssue -Apply $false -IsSystem $false -UserName 'VBR01\Administrator')) 'True'
+Check 'apply identity: -Apply as SYSTEM gives no issue' ($null -eq (Get-ApplyIdentityIssue -Apply $true -IsSystem $true -UserName 'NT AUTHORITY\SYSTEM')) 'True'
+$t3A = Get-ApplyIdentityIssue -Apply $true -IsSystem $false -UserName 'VBR01\Administrator'
+Check 'apply identity: -Apply as an administrator is APPLY_NOT_SYSTEM' $t3A.Code 'APPLY_NOT_SYSTEM'
+Check 'apply identity: APPLY_NOT_SYSTEM exits 20' $t3A.ExitCode 20
+Check 'apply identity: Detail names the account and says nothing changed' ($t3A.Detail -like "*'VBR01\Administrator'*Nothing was changed*") 'True'
+Check 'apply identity: Action says how to get a SYSTEM prompt' ($t3A.Action -like '*psexec -s -i powershell.exe*') 'True'
+Check 'apply identity: issue shape' (@($t3A.PSObject.Properties | ForEach-Object { $_.Name }) -join ',') 'Code,ExitCode,Detail,Action'
+
 # Enter-RunLock / Exit-RunLock (a Local\ test name, so no elevation is needed)
 Check 'Enter-RunLock: default name is the updater mutex' (& $t3ParamDefault 'Enter-RunLock' 'Name') "'Global\VeeamPgUpdate'"
 $t3LockName = "Local\VbrStdTest-$PID"
@@ -4825,7 +4838,7 @@ Check 'T18 main body never calls exit itself' (@($ScriptAst.FindAll({ param($n) 
 Check 'T18 mode string is APPLY or AUDIT' ($t18MainText -match '\$runMode = if \(\$Apply\) \{ ''APPLY'' \} else \{ ''AUDIT'' \}') 'True'
 Check 'T18 lock name' ($t18MainText.Contains("Enter-RunLock -Name 'Global\VeeamPgUpdate'")) 'True'
 Check 'T18 transcript file name' ($t18MainText.Contains("'logs\VbrStandardise_{0}_{1}-{2}.log' -f `$env:COMPUTERNAME, `$runStamp, `$PID")) 'True'
-$t18Order = @('Enter-RunLock', 'Get-PreflightContextIssue', 'Initialize-WorkRoot', 'Start-Transcript', 'Find-ChangeMarkers', 'Remove-OldRunData',
+$t18Order = @('Enter-RunLock', 'Get-PreflightContextIssue', 'Get-ApplyIdentityIssue', 'Initialize-WorkRoot', 'Start-Transcript', 'Find-ChangeMarkers', 'Remove-OldRunData',
               'Test-IsDomainController', 'Get-VbrInstall', 'Get-VbrDbConfig', 'Test-Vb365Installed', 'Get-DbHostClass', 'Find-PgInstall',
               'Test-PostmasterLive', 'Test-PgConfOverride', 'Test-PgHbaHasInclude', 'Test-PgIdentHasInclude', 'Get-ListeningLoopback', 'Get-SystemMapNames',
               'Invoke-ServiceAccountStep', 'Get-AuditState', 'Select-ApplyPath', 'Invoke-PathA', 'Invoke-PathB', 'Complete-Run @finish')
@@ -5254,6 +5267,30 @@ if ($t18Pwsh.Count -eq 0) {
     Check 'T18 child under pwsh: exit 20' $t18PwshChild.ExitCode 20
     Check 'T18 child under pwsh: IssueCode WRONG_POWERSHELL' ($t18PwshChild.Output -match 'IssueCode=WRONG_POWERSHELL(;|\s|$)') 'True'
     Check 'T18 child under pwsh: nothing written' (Test-Path -LiteralPath $t18PwshWorkRoot) 'False'
+}
+
+# -Apply outside SYSTEM (spec 7.1 step 3a) is refused before anything is written. Never
+# run on a VBR server, and skipped when the tests themselves run as SYSTEM.
+$t18ApplyWorkRoot = Join-Path $env:ProgramData "vbrstd-t18apply-$PID"
+[void]$script:TestFolders.Add($t18ApplyWorkRoot)
+if (-not (Test-IsAdministrator)) {
+    Skip 'T18 child -Apply outside SYSTEM exits 20 APPLY_NOT_SYSTEM' 'not elevated'
+} elseif (Test-IsLocalSystem) {
+    Skip 'T18 child -Apply outside SYSTEM exits 20 APPLY_NOT_SYSTEM' 'the tests run as SYSTEM'
+} elseif ($t18VbrCorePath) {
+    Skip 'T18 child -Apply outside SYSTEM exits 20 APPLY_NOT_SYSTEM' 'this machine has a VBR server'
+} else {
+    $t18ApplyPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { $t18ApplyPowerShell = Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe' }
+    $t18ApplyChild = & {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $t18ApplyPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $t18ScriptPath -Apply -WorkRoot $t18ApplyWorkRoot 2>&1 | Out-String)
+        [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
+    }
+    Check 'T18 child -Apply outside SYSTEM: exit 20' $t18ApplyChild.ExitCode 20
+    Check 'T18 child -Apply outside SYSTEM: IssueCode APPLY_NOT_SYSTEM' ($t18ApplyChild.Output -match 'IssueCode=APPLY_NOT_SYSTEM(;|\s|$)') 'True'
+    Check 'T18 child -Apply outside SYSTEM: Mode=APPLY' ($t18ApplyChild.Output -match 'Mode=APPLY') 'True'
+    Check 'T18 child -Apply outside SYSTEM: nothing written' (Test-Path -LiteralPath $t18ApplyWorkRoot) 'False'
 }
 
 # Constrained Language Mode (spec 7.1 step 3). A wrapper switches its own session to
