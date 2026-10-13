@@ -358,6 +358,20 @@ Check 'T2 tie goes to the earliest issue' $t2Tie.IssueCode 'PG_IDENT_NOT_STANDAR
 Check 'T2 winner Action is used' $t2Tie.ActionRequired 'Custom action'
 $t2Hash = Resolve-RunOutcome -Issues @(@{ Code = 'MARKER_PRESENT'; ExitCode = 50; Detail = 'C:\ProgramData\VeeamStandardise\CHANGES-IN-PROGRESS.marker' })
 Check 'T2 hashtable issues are accepted' ('{0} {1}' -f $t2Hash.ExitCode, $t2Hash.IssueCode) '50 MARKER_PRESENT'
+# The issue that ended the run (Complete-Run -Code) wins a tie: on a server with drift,
+# a blocker found later must still be the IssueCode and the action RMM shows.
+$t2Stop = @(
+    [pscustomobject]@{ Code = 'DB_NATIVE_AUTH'; ExitCode = 5; Detail = 'native'; Action = 'Re-run with -Apply in a maintenance window' },
+    [pscustomobject]@{ Code = 'PG_HBA_NOT_STANDARD'; ExitCode = 5; Detail = ''; Action = '' },
+    [pscustomobject]@{ Code = 'VEEAM_BUSY_PERSISTENT'; ExitCode = 5; Detail = 'old task'; Action = 'Pause log backup or CDP jobs' }
+)
+$t2Pref = Resolve-RunOutcome -Issues $t2Stop -PreferIndex 2
+Check 'T2 preferred issue wins a tie' ('{0}|{1}|{2}' -f $t2Pref.ExitCode, $t2Pref.IssueCode, $t2Pref.ActionRequired) '5|VEEAM_BUSY_PERSISTENT|Pause log backup or CDP jobs'
+Check 'T2 preferred issue keeps Detail in order' $t2Pref.Detail 'DB_NATIVE_AUTH: native | PG_HBA_NOT_STANDARD | VEEAM_BUSY_PERSISTENT: old task'
+Check 'T2 without a preference the earliest still wins' (Resolve-RunOutcome -Issues $t2Stop).IssueCode 'DB_NATIVE_AUTH'
+$t2PrefLow = Resolve-RunOutcome -Issues @($t2Issues[1], $t2Stop[2]) -PreferIndex 1
+Check 'T2 a preferred issue with a lower exit code does not win' ('{0}|{1}' -f $t2PrefLow.ExitCode, $t2PrefLow.IssueCode) '10|VEEAM_BUSY'
+Check 'T2 an out-of-range preference is ignored' (Resolve-RunOutcome -Issues $t2Stop -PreferIndex 7).IssueCode 'DB_NATIVE_AUTH'
 
 # Format-RmmSummary
 $t2Sum = [ordered]@{ Computer = 'HOST1'; Mode = 'AUDIT'; ExitCode = 5; IssueCode = 'PG_HBA_NOT_STANDARD'; ActionRequired = 'Run with -Apply'; Detail = "line one`r`n   line two" }
@@ -421,6 +435,11 @@ switch ($Scenario) {
     'bare' {
         Complete-Run -ExitCode 20 -Code 'VBR_NOT_FOUND' -Detail 'No VBR server install found'
     }
+    'tie' {
+        $script:Report = New-RunReport -Mode 'APPLY'
+        Add-RunIssue -Code 'DB_NATIVE_AUTH' -ExitCode 5 -Detail 'native' -Action 'Re-run with -Apply in a maintenance window'
+        Complete-Run -ExitCode 5 -Code 'VEEAM_BUSY_PERSISTENT' -Detail 'old task' -Action 'Pause log backup or CDP jobs'
+    }
     'clean' {
         $script:Report = New-RunReport -Mode 'AUDIT'
         $script:WorkRootReady = $true
@@ -479,6 +498,15 @@ Check 'T2 bare: RMM ISSUE line' (@($t2BLines | Where-Object { $_ -ceq 'RMM ISSUE
 Check 'T2 bare: no last-result.json without a ready WorkRoot' ('{0}|{1}' -f $t2B.ExitCode, (Test-Path -LiteralPath (Join-Path $t2RootB 'logs\last-result.json'))) '20|False'
 Check 'T2 bare: no lock to release' ('{0}|{1}' -f $t2B.ExitCode, (Test-Path -LiteralPath (Join-Path $t2RootB 'lock-released.txt'))) '20|False'
 Check 'T2 bare: Complete-Run exits and does not return' ('{0}|{1}' -f $t2B.ExitCode, ($t2B.StdOut -clike '*AFTER-COMPLETE-RUN*')) '20|False'
+
+# Scenario 'tie': drift first, then the blocker that ends the run, both exit 5.
+$t2RootT = New-TestFolder 't2tie'
+$t2T = Invoke-Native -FilePath $t2PowerShell -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $t2DriverPath, '-Scenario', 'tie', '-Root', $t2RootT)
+$t2TLines = @($t2T.StdOut -split "`r?`n")
+$t2TSummary = @($t2TLines | Where-Object { $_ -clike 'Computer=*' })
+Check 'T2 tie: exit code 5' $t2T.ExitCode 5
+Check 'T2 tie: the blocker is the IssueCode and Outcome' (@($t2TSummary | Where-Object { $_ -clike '*; Outcome=VEEAM_BUSY_PERSISTENT; ExitCode=5; IssueCode=VEEAM_BUSY_PERSISTENT; ActionRequired=Pause log backup or CDP jobs; *' }).Count) 1
+Check 'T2 tie: RMM ACTION is the blocker action' (@($t2TLines | Where-Object { $_ -ceq 'RMM ACTION: Pause log backup or CDP jobs' }).Count) 1
 
 # Scenario 'clean': no issues.
 $t2RootC = New-TestFolder 't2clean'

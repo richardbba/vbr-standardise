@@ -94,7 +94,7 @@ The script is the first part of a wider standardisation script. Write each check
 | 40 | ESCALATE | A change failed. The script restored the server and checked that VBR works. |
 | 50 | ESCALATE_NOW | A change failed and the restore also failed, or a marker from an unfinished run exists. VBR may be down. |
 
-If a run finds more than one issue, the highest exit code wins. `IssueCode` is the issue with that code. `Detail` lists every issue. One exception: if the mutex is held, the script exits 10 at once and checks nothing else, so a normal updater run never shows as 50.
+If a run finds more than one issue, the highest exit code wins. `IssueCode` is the issue that ended the run when it has that code (for example the blocker that stopped `-Apply`; changed 2026-10-13 after the second pilot showed the first drift issue instead), otherwise the first issue with that code. `Detail` lists every issue. One exception: if the mutex is held, the script exits 10 at once and checks nothing else, so a normal updater run never shows as 50.
 
 ### 6.3 Issue codes
 

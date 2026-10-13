@@ -220,7 +220,7 @@ The idle gate catches running jobs, but it cannot see Instant Recovery or publis
 | 40 | ESCALATE | A change failed. The script restored the server and checked that VBR works. | Escalate. Read the run folder and the transcript before another `-Apply`. |
 | 50 | ESCALATE_NOW | A change failed and the restore also failed, or a marker from an unfinished run exists. VBR may be down. | Page an operator now. |
 
-If a run finds more than one issue, the highest exit code wins. `IssueCode` is the first issue with that code. `Detail` lists every issue as `CODE: detail`, joined by ` | `. One exception: if the lock is held, the script exits 10 at once and checks nothing else, so a normal updater run never shows as 50.
+If a run finds more than one issue, the highest exit code wins. `IssueCode` is the issue that ended the run when it has that code (for example the blocker that stopped `-Apply`), otherwise the first issue with that code. `ActionRequired` comes from the same issue. `Detail` lists every issue as `CODE: detail`, joined by ` | `. One exception: if the lock is held, the script exits 10 at once and checks nothing else, so a normal updater run never shows as 50.
 
 ## Issue codes
 

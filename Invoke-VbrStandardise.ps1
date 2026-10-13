@@ -380,15 +380,22 @@ function Get-RmmActionForExitCode {
     }
 }
 
-# Picks the run result from all issues: the highest ExitCode wins, and on a tie the
-# earliest issue wins. Detail lists every issue as 'CODE: detail' (just 'CODE' when
-# the issue has no detail), joined by ' | '. Issues may be objects or hashtables.
+# Picks the run result from all issues: the highest ExitCode wins. On a tie, the issue
+# at PreferIndex wins when it has that highest ExitCode (Complete-Run passes the issue
+# that ended the run, so a blocker found after the audit's drift is the IssueCode RMM
+# shows); otherwise the earliest issue wins. Detail lists every issue in the order they
+# were added, as 'CODE: detail' (just 'CODE' when the issue has no detail), joined by
+# ' | '. Issues may be objects or hashtables.
 function Resolve-RunOutcome {
-    param([AllowNull()][AllowEmptyCollection()][object[]] $Issues = @())
+    param(
+        [AllowNull()][AllowEmptyCollection()][object[]] $Issues = @(),
+        [int] $PreferIndex = -1
+    )
     $winner = $null
     $winnerCode = -1
     $parts = New-Object System.Collections.ArrayList
-    foreach ($issue in @($Issues)) {
+    $all = @($Issues)
+    foreach ($issue in $all) {
         if ($null -eq $issue) { continue }
         $code = [string](Get-CfgValue -Object $issue -Name 'Code' -Default '')
         $exitCode = [int](Get-CfgValue -Object $issue -Name 'ExitCode' -Default 0)
@@ -398,6 +405,10 @@ function Resolve-RunOutcome {
             $winner = $issue
             $winnerCode = $exitCode
         }
+    }
+    if ($PreferIndex -ge 0 -and $PreferIndex -lt $all.Count -and $null -ne $all[$PreferIndex]) {
+        $preferred = $all[$PreferIndex]
+        if ([int](Get-CfgValue -Object $preferred -Name 'ExitCode' -Default 0) -eq $winnerCode) { $winner = $preferred }
     }
     if ($null -eq $winner) {
         return [pscustomobject]@{ ExitCode = 0; IssueCode = ''; ActionRequired = 'None'; Detail = '' }
@@ -478,7 +489,10 @@ function Complete-Run {
     $issues = @()
     $issueList = Get-Variable -Name Issues -Scope Script -ValueOnly -ErrorAction SilentlyContinue
     if ($null -ne $issueList) { $issues = @($issueList) }
-    $outcome = Resolve-RunOutcome -Issues $issues
+    # The issue added from -Code is the reason the run ends; it wins a tie.
+    $preferIndex = -1
+    if ($Code) { $preferIndex = $issues.Count - 1 }
+    $outcome = Resolve-RunOutcome -Issues $issues -PreferIndex $preferIndex
     $finalCode = [int]$outcome.ExitCode
     $issueCode = [string]$outcome.IssueCode
     $actionText = [string]$outcome.ActionRequired
