@@ -330,6 +330,7 @@ One routine does every write and every restore (Path A, Path B, rollback, trap).
 ### 7.11 Idle gate
 
 - Busy if any of these processes runs: `Veeam.Backup.Manager.exe`, `VeeamAgent.exe`, `Veeam*Explorer*`.
+- Exception (added 2026-10-13 after the second pilot, where a rescan had hung for 4 days): a `Veeam.Backup.Manager.exe` whose task (its first command-line argument, read from `Win32_Process`) is `STARTINFRARESCAN` (infrastructure rescan) or `STARTCHECKPOINTREMOVAL` (checkpoint removal) is not busy. Stopping the services ends such a task and Veeam starts it again; Veeam also restarts it at once if it is ended by hand, so a hung one would block the fix forever. The script logs each ignored task. A manager whose command line cannot be read stays busy.
 - If the oldest busy process has run longer than `BusyPersistentHours` (for example a log backup or CDP job): exit 5 `VEEAM_BUSY_PERSISTENT`. `ActionRequired`: "Pause log backup or CDP jobs and re-run in a maintenance window".
 - Otherwise, if anything is busy: exit 10 `VEEAM_BUSY`.
 - The README says Path B stops vPower NFS, so Instant Recovery and published disks stop too. Run `-Apply` in a maintenance window.

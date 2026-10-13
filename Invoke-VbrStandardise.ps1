@@ -3447,13 +3447,20 @@ function Get-ConsumerIssues {
 # means the OLDEST busy process has run longer than PersistentHours, which is what a
 # SQL/Oracle log backup or a CDP policy looks like: waiting will never help there.
 # A process whose start time cannot be read is busy but never counts as persistent.
+# Background tasks: a Veeam.Backup.Manager that runs one of IgnoredManagerTasks (an
+# infrastructure rescan or a checkpoint removal) is not busy. Stopping the services
+# ends such a task and Veeam starts it again afterwards; a hung one would otherwise
+# block the fix forever. A manager whose task cannot be read (no command line) stays
+# busy. Ignored lists the ignored task names.
 function Get-BusyVeeamWork {
     param(
         [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][object[]] $Processes,
         [Parameter(Mandatory)][datetime] $Now,
-        [Parameter(Mandatory)][ValidateRange(0, 8760)][int] $PersistentHours
+        [Parameter(Mandatory)][ValidateRange(0, 8760)][int] $PersistentHours,
+        [AllowEmptyCollection()][string[]] $IgnoredManagerTasks = @('STARTINFRARESCAN', 'STARTCHECKPOINTREMOVAL')
     )
     $busyNames = New-Object System.Collections.ArrayList
+    $ignored = New-Object System.Collections.ArrayList
     $busy = $false
     $oldest = $null
     foreach ($proc in @($Processes | Where-Object { $null -ne $_ })) {
@@ -3462,6 +3469,15 @@ function Get-BusyVeeamWork {
         $name = "$($nameProp.Value)" -replace '(?i)\.exe$', ''
         $isBusy = ($name -ieq 'Veeam.Backup.Manager') -or ($name -ieq 'VeeamAgent') -or ($name -ilike 'Veeam*Explorer*')
         if (-not $isBusy) { continue }
+        if ($name -ieq 'Veeam.Backup.Manager') {
+            $cmdProp = $proc.PSObject.Properties['CommandLine']
+            $task = ''
+            if ($null -ne $cmdProp) { $task = Get-VeeamManagerTask -CommandLine ([string]$cmdProp.Value) }
+            if ($task -ne '' -and @($IgnoredManagerTasks) -icontains $task) {
+                if (-not ($ignored -icontains $task)) { [void]$ignored.Add($task) }
+                continue
+            }
+        }
         $busy = $true
         if (-not ($busyNames -icontains $name)) { [void]$busyNames.Add($name) }
         $start = $null
@@ -3476,10 +3492,47 @@ function Get-BusyVeeamWork {
     if ($busy -and $null -ne $oldest) { $persistent = (($Now - $oldest).TotalHours -gt $PersistentHours) }
     $sortedNames = [string[]]@($busyNames)
     [Array]::Sort($sortedNames, [System.StringComparer]::OrdinalIgnoreCase)
+    $sortedIgnored = [string[]]@($ignored)
+    [Array]::Sort($sortedIgnored, [System.StringComparer]::OrdinalIgnoreCase)
     return [pscustomobject]@{
         Busy       = $busy
         Persistent = $persistent
         Names      = $sortedNames
+        Ignored    = $sortedIgnored
+    }
+}
+
+# The task a Veeam.Backup.Manager process runs: its first argument after the program
+# path, upper-cased (for example STARTINFRARESCAN). '' when there is none.
+function Get-VeeamManagerTask {
+    param([AllowNull()][AllowEmptyString()][string] $CommandLine)
+    # A quoted program path is one token; an unquoted one cannot start with a quote, so
+    # '"C:\Program Files\...exe"' alone never yields 'Files' as the task.
+    $m = [regex]::Match("$CommandLine", '^\s*(?:"[^"]*"|[^"\s]\S*)\s+"?([A-Za-z]+)"?')
+    if (-not $m.Success) { return '' }
+    return $m.Groups[1].Value.ToUpperInvariant()
+}
+
+# Running Veeam processes for the idle gate: { Name; StartTime; CommandLine }.
+# Win32_Process gives the command line, which tells a background task from a job. If
+# the CIM query fails, Get-Process is the fallback: it has no command line, so every
+# Veeam.Backup.Manager then counts as busy (fail closed).
+function Get-VeeamProcessList {
+    try {
+        return @(Get-CimInstance -ClassName Win32_Process -Filter "Name LIKE 'Veeam%'" -ErrorAction Stop | ForEach-Object {
+            $started = $_.CreationDate
+            if ($null -eq $started) { $started = Get-Date }
+            [pscustomobject]@{ Name = "$($_.Name)"; StartTime = $started; CommandLine = $_.CommandLine }
+        })
+    } catch {
+        Write-Log -Message "Could not list Veeam processes with Win32_Process: $($_.Exception.Message). Using Get-Process; every job process counts as busy." -Level 'WARN'
+        return @(Get-Process -Name 'Veeam*' -ErrorAction SilentlyContinue | ForEach-Object {
+            $proc = $_
+            $started = $null
+            try { $started = $proc.StartTime } catch { $started = $null }
+            if ($null -eq $started) { $started = Get-Date }
+            [pscustomobject]@{ Name = "$($proc.ProcessName)"; StartTime = $started; CommandLine = $null }
+        })
     }
 }
 
@@ -4600,14 +4653,12 @@ function Invoke-PathB {
 
     # Spec 7.11 idle gate. Returns a result object when the server is busy, else $null.
     $idleGate = {
-        $processes = @(Get-Process -Name 'Veeam*' -ErrorAction SilentlyContinue | ForEach-Object {
-            $proc = $_
-            $started = $null
-            try { $started = $proc.StartTime } catch { $started = $null }
-            if ($null -eq $started) { $started = Get-Date }
-            [pscustomobject]@{ Name = "$($proc.ProcessName)"; StartTime = $started }
-        })
+        $processes = @(Get-VeeamProcessList)
         $busy = Get-BusyVeeamWork -Processes $processes -Now (Get-Date) -PersistentHours ([int]$cfg.BusyPersistentHours)
+        $ignoredTasks = @(Get-CfgValue -Object $busy -Name 'Ignored' -Default @())
+        if ($ignoredTasks.Count -gt 0) {
+            Write-Log -Message ("Ignoring background Veeam task(s) {0}: stopping the services ends them and Veeam starts them again." -f ($ignoredTasks -join ', ')) -Level 'INFO'
+        }
         $names = (@($busy.Names) -join ', ')
         if ($busy.Persistent) {
             return [pscustomobject]@{

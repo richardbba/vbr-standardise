@@ -3269,6 +3269,58 @@ $t13Empty = Get-BusyVeeamWork -Processes @() -Now $t13Now -PersistentHours 6
 Check 'T13 busy: no processes is idle' "$($t13Empty.Busy)/$($t13Empty.Persistent)" 'False/False'
 Check 'T13 busy: null process list is idle' (Get-BusyVeeamWork -Processes $null -Now $t13Now -PersistentHours 6).Busy $false
 
+# Background Veeam tasks (spec 7.11): an infrastructure rescan or a checkpoint removal
+# does not block the fix. Stopping the services ends them and Veeam starts them again.
+$t13Mgr = '"C:\Program Files\Veeam\Backup and Replication\Backup\Veeam.Backup.Manager.exe"'
+Check 'T13 task: quoted path and quoted task' (Get-VeeamManagerTask -CommandLine ($t13Mgr + ' "STARTINFRARESCAN" "11111111-2222-4333-8444-555555555555" "66666666-7777-4888-8999-aaaaaaaaaaaa"')) 'STARTINFRARESCAN'
+Check 'T13 task: unquoted task, upper-cased' (Get-VeeamManagerTask -CommandLine ($t13Mgr + ' startcheckpointremoval bbbbbbbb-cccc-4ddd-8eee-ffffffffffff')) 'STARTCHECKPOINTREMOVAL'
+Check 'T13 task: unquoted path' (Get-VeeamManagerTask -CommandLine 'Veeam.Backup.Manager.exe "STARTBACKUPJOB" "x"') 'STARTBACKUPJOB'
+Check 'T13 task: no argument gives empty' (Get-VeeamManagerTask -CommandLine $t13Mgr) ''
+Check 'T13 task: null gives empty' (Get-VeeamManagerTask -CommandLine $null) ''
+$t13Bg = @(
+    [pscustomobject]@{ Name = 'Veeam.Backup.Manager.exe'; StartTime = $t13Now.AddDays(-4); CommandLine = $t13Mgr + ' "STARTINFRARESCAN" "a" "b"' }
+    [pscustomobject]@{ Name = 'Veeam.Backup.Manager.exe'; StartTime = $t13Now.AddDays(-4); CommandLine = $t13Mgr + ' "STARTCHECKPOINTREMOVAL" "c"' }
+)
+$t13BgOnly = Get-BusyVeeamWork -Processes $t13Bg -Now $t13Now -PersistentHours 6
+Check 'T13 background: rescan and checkpoint removal alone are idle' "$($t13BgOnly.Busy)/$($t13BgOnly.Persistent)" 'False/False'
+Check 'T13 background: both are listed as ignored' (@($t13BgOnly.Ignored) -join ',') 'STARTCHECKPOINTREMOVAL,STARTINFRARESCAN'
+$t13Job = [pscustomobject]@{ Name = 'Veeam.Backup.Manager.exe'; StartTime = $t13Now.AddMinutes(-20); CommandLine = $t13Mgr + ' "STARTBACKUPJOB" "j"' }
+$t13Mixed = Get-BusyVeeamWork -Processes (@($t13Bg) + @($t13Job)) -Now $t13Now -PersistentHours 6
+Check 'T13 background: a real job is still busy' $t13Mixed.Busy $true
+Check 'T13 background: an old ignored task does not make it persistent' $t13Mixed.Persistent $false
+$t13NoCmd = Get-BusyVeeamWork -Processes @([pscustomobject]@{ Name = 'Veeam.Backup.Manager.exe'; StartTime = $t13Now.AddDays(-4); CommandLine = $null }) -Now $t13Now -PersistentHours 6
+Check 'T13 background: a manager with an unreadable task is busy and persistent' "$($t13NoCmd.Busy)/$($t13NoCmd.Persistent)" 'True/True'
+$t13Other = Get-BusyVeeamWork -Processes @([pscustomobject]@{ Name = 'Veeam.Backup.Manager.exe'; StartTime = $t13Now; CommandLine = $t13Mgr + ' "STARTRESTORESESSION" "r"' }) -Now $t13Now -PersistentHours 6
+Check 'T13 background: any other manager task is busy' $t13Other.Busy $true
+$t13Strict = Get-BusyVeeamWork -Processes $t13Bg -Now $t13Now -PersistentHours 6 -IgnoredManagerTasks @()
+Check 'T13 background: an empty ignore list makes them busy again' $t13Strict.Busy $true
+Check 'T13 background: an agent is never ignored' (Get-BusyVeeamWork -Processes @([pscustomobject]@{ Name = 'VeeamAgent'; StartTime = $t13Now; CommandLine = 'VeeamAgent.exe "STARTINFRARESCAN"' }) -Now $t13Now -PersistentHours 6).Busy $true
+Check 'T13 background: idle result has an empty ignore list' (@($t13Idle.Ignored).Count) 0
+
+# Get-VeeamProcessList: Win32_Process gives the command line; Get-Process is the fallback.
+& {
+    function Get-CimInstance {
+        param($ClassName, $Filter, $ErrorAction)
+        return @(
+            [pscustomobject]@{ Name = 'Veeam.Backup.Manager.exe'; CreationDate = (Get-Date -Year 2026 -Month 10 -Day 9); CommandLine = '"x\Veeam.Backup.Manager.exe" "STARTINFRARESCAN"' }
+            [pscustomobject]@{ Name = 'VeeamAgent.exe'; CreationDate = $null; CommandLine = $null }
+        )
+    }
+    $list = @(Get-VeeamProcessList)
+    Check 'T13 process list: one object per process' $list.Count 2
+    Check 'T13 process list: shape' (@($list[0].PSObject.Properties | ForEach-Object { $_.Name }) -join ',') 'Name,StartTime,CommandLine'
+    Check 'T13 process list: command line kept' $list[0].CommandLine '"x\Veeam.Backup.Manager.exe" "STARTINFRARESCAN"'
+    Check 'T13 process list: start time from CreationDate' ($list[0].StartTime.Day) 9
+}
+& {
+    function Get-CimInstance { param($ClassName, $Filter, $ErrorAction) throw 'CIM is broken' }
+    function Get-Process { param($Name, $ErrorAction) return @([pscustomobject]@{ ProcessName = 'Veeam.Backup.Manager'; StartTime = (Get-Date) }) }
+    $list = @(Get-VeeamProcessList)
+    Check 'T13 process list: CIM failure falls back to Get-Process' $list.Count 1
+    Check 'T13 process list: fallback has no command line, so a manager stays busy' (Get-BusyVeeamWork -Processes $list -Now (Get-Date) -PersistentHours 6).Busy $true
+}
+Check 'T13 Path B idle gate reads the process list with command lines' ($ScriptText -match '\$processes = @\(Get-VeeamProcessList\)') 'True'
+
 # Get-VeeamServiceSnapshot: shape, from a mocked Get-Service.
 & {
     $t13Calls = New-Object System.Collections.ArrayList
